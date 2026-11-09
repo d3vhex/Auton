@@ -1,0 +1,38 @@
+# Model-provider configuration, mounted into the agent (and later auton-ops).
+#
+# The agent reads these keys on EVERY request from a projected volume, so a
+# change made through scripts/set-provider.sh takes effect without a restart.
+#
+#   provider     ollama | openai | gemini | anthropic | custom
+#   base_url     API base (ollama: http://ollama-service:11434)
+#   model        model name/tag
+#   max_tokens   response cap for remote providers
+#   data_policy  redact (default) | allow | local-only
+#
+# data_policy=redact masks tokens/passwords/keys before anything is sent to a
+# remote provider. local-only refuses remote providers entirely.
+#
+# When provider != ollama the local Ollama model is NOT used (no fallback).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auton-model-config
+  namespace: auton
+data:
+  provider: "ollama"
+  base_url: "http://ollama-service:11434"
+  model: "qwen2.5-coder:7b-instruct"
+  max_tokens: "1024"
+  data_policy: "redact"
+---
+# The key is empty until scripts/set-provider.sh writes one. The mount is
+# optional so the pod also starts on a fresh cluster before a key exists.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auton-model
+  namespace: auton
+type: Opaque
+stringData:
+  api-key: ""

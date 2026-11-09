@@ -1,0 +1,210 @@
+# Auton: the coding-agent HTTP service.
+#
+# Namespace/service/deployment are all called "auton" (namespace names must be
+# lowercase DNS labels, so "Auton" is impossible there and we keep one name).
+# Reaches Ollama in-cluster via DNS (ollama-service:11434) — no port-forward.
+#
+# The agent also controls this namespace through kubectl (see auton-rbac.yaml) and
+# n8n through its REST API. Image is built locally and imported into k3d:
+#   docker build -t auton:local ./mcp && k3d image import auton:local -c ai-cluster
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-workspace
+  namespace: auton
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton
+  namespace: auton
+  labels:
+    app: auton
+    # The ops controller (P3) never repairs itself or its own namespace/SA.
+    auton.io/protect: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: auton
+  template:
+    metadata:
+      labels:
+        app: auton
+        auton.io/protect: "true"
+    spec:
+      serviceAccountName: auton-agent
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # local-path volumes do not get fsGroup chown applied by the kubelet, so
+      # the (root) init container fixes ownership of the existing workspace
+      # once. It uses the same image the pod already has (no extra pull).
+      initContainers:
+      - name: fix-workspace-owner
+        image: auton:local
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+            add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      containers:
+      - name: auton
+        image: auton:local
+        imagePullPolicy: IfNotPresent   # use the k3d-imported local image
+        ports:
+        - containerPort: 8080
+        securityContext:
+          runAsUser: 10001
+          runAsGroup: 10001
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: HOME
+          value: "/tmp"
+        - name: TMPDIR
+          value: "/tmp"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: OLLAMA_HOST
+          value: "http://ollama-service:11434"
+        - name: AGENT_MODEL
+          value: "qwen2.5-coder:7b-instruct"
+        - name: AGENT_WORKSPACE
+          value: "/workspace"
+        # Provider config is read per request from this projected volume.
+        - name: AGENT_MODEL_DIR
+          value: "/etc/auton-model"
+        - name: MAX_STEPS
+          value: "25"
+        # Context budget: ollama defaults to a small num_ctx, which truncates
+        # long tool schemas / observations. Give the loop room.
+        - name: AGENT_NUM_CTX
+          value: "16384"
+        - name: AGENT_MAX_OBSERVATION_CHARS
+          value: "8000"
+        - name: AGENT_MAX_HISTORY_CHARS
+          value: "60000"
+        # Jobs: one worker, FIFO. Sync /run still works for n8n.
+        - name: AGENT_MAX_QUEUE
+          value: "8"
+        - name: AGENT_JOB_TIMEOUT
+          value: "900"
+        # The container is the sandbox; bwrap is for host CLI runs.
+        - name: AGENT_SANDBOX
+          value: "off"
+        # --- Kubernetes access -------------------------------------------- #
+        # kubectl runs inside the pod as the auton-agent ServiceAccount; the
+        # namespace Role is the real boundary. AGENT_K8S_WRITE=0 makes the k8s
+        # tools read-only without touching RBAC.
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef: { fieldPath: metadata.namespace }
+        # The model can only target these namespaces (k8s_tools allowlist).
+        - name: AGENT_NAMESPACES
+          value: "auton,auton-apps"
+        # Write-ahead audit log; lives on the workspace PVC so it survives a
+        # pod restart and is readable through GET /audit.
+        - name: AGENT_AUDIT_DIR
+          value: "/workspace/.ops"
+        - name: AGENT_K8S_ENABLED
+          value: "1"
+        - name: AGENT_K8S_WRITE
+          value: "1"
+        # --- n8n access ---------------------------------------------------- #
+        - name: N8N_API_URL
+          value: "http://n8n.auton.svc.cluster.local:5678/api/v1"
+        - name: N8N_WEBHOOK_BASE
+          value: "http://n8n.auton.svc.cluster.local:5678/webhook"
+        # The key is read per request, so rotating the Secret needs no restart.
+        - name: N8N_API_KEY_FILE
+          value: "/etc/n8n-api/api-key"
+        # --- API auth ------------------------------------------------------ #
+        # Required by agent_service.py on /run and /jobs*; /health stays open.
+        - name: AGENT_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: auton-api-token
+              key: token
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: tmp
+          mountPath: /tmp
+        - name: model-config
+          mountPath: /etc/auton-model/config
+          readOnly: true
+        - name: model-secret
+          mountPath: /etc/auton-model/secret
+          readOnly: true
+        # optional: the agent starts even before the n8n API key exists.
+        - name: n8n-api
+          mountPath: /etc/n8n-api
+          readOnly: true
+        readinessProbe:
+          httpGet: { path: /health, port: 8080 }
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8080 }
+          initialDelaySeconds: 10
+          periodSeconds: 30
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: agent-workspace
+      - name: tmp
+        emptyDir: {}
+      - name: model-config
+        configMap:
+          name: auton-model-config
+      - name: model-secret
+        secret:
+          secretName: auton-model
+          optional: true
+      - name: n8n-api
+        secret:
+          secretName: n8n-api
+          optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auton
+  namespace: auton
+spec:
+  type: ClusterIP
+  selector:
+    app: auton
+  ports:
+  - port: 8080
+    targetPort: 8080

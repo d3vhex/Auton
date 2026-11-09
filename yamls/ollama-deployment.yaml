@@ -1,0 +1,91 @@
+# Ollama on k3s (k3d) with AMD GPU (RX 6600). Namespace: auton.
+# GPU path is Vulkan (Mesa RADV) in practice — full layer offload; HSA override
+# is kept but is redundant for the Vulkan path. Model persists on a local-path PVC.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: auton
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: auton
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO PVC + RollingUpdate would deadlock on restart
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+        env:
+        - name: HSA_OVERRIDE_GFX_VERSION
+          value: "10.3.0"
+        - name: OLLAMA_HOST
+          value: "0.0.0.0:11434"
+        - name: OLLAMA_KEEP_ALIVE
+          value: "30m"
+        # 8 GB card shared with the desktop: an f16 KV cache at 16k context
+        # pushes the model to a 80/20 CPU/GPU split (~5 tok/s). Flash attention
+        # plus a quantised KV cache keeps the whole model on the GPU.
+        - name: OLLAMA_FLASH_ATTENTION
+          value: "1"
+        - name: OLLAMA_KV_CACHE_TYPE
+          value: "q8_0"
+        - name: OLLAMA_NUM_PARALLEL
+          value: "1"
+        resources:
+          requests:
+            cpu: "1"
+            memory: "4Gi"
+          limits:
+            amd.com/gpu: 1
+            memory: "12Gi"
+        volumeMounts:
+        - name: ollama-storage
+          mountPath: /root/.ollama
+        readinessProbe:
+          httpGet: { path: /, port: 11434 }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /, port: 11434 }
+          initialDelaySeconds: 15
+          periodSeconds: 30
+      volumes:
+      - name: ollama-storage
+        persistentVolumeClaim:
+          claimName: ollama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: auton
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+  - port: 11434
+    targetPort: 11434

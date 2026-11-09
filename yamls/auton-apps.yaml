@@ -1,0 +1,50 @@
+# The namespace the agent is allowed to repair without being asked.
+#
+# Keep the autonomous blast radius small: apps that should be self-healing go
+# here, anything sensitive stays in "auton" (or another namespace the agent
+# cannot target). A ResourceQuota and a LimitRange make a runaway playbook
+# (e.g. "raise memory until it works") fail fast instead of eating the node.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auton-apps
+  labels:
+    app.kubernetes.io/part-of: auton
+    # Read by the ops controller (P3) to skip a namespace entirely.
+    auton.io/ops: "enabled"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: auton-apps-quota
+  namespace: auton-apps
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 4Gi
+    limits.cpu: "4"
+    limits.memory: 8Gi
+    pods: "20"
+    services: "5"
+    persistentvolumeclaims: "5"
+    count/deployments.apps: "10"
+    count/statefulsets.apps: "5"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: auton-apps-limits
+  namespace: auton-apps
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: "500m"
+      memory: 512Mi
+    defaultRequest:
+      cpu: "100m"
+      memory: 128Mi
+    max:
+      cpu: "2"
+      memory: 4Gi

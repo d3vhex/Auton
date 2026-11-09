@@ -1,0 +1,159 @@
+# Auton operations controller: the autonomous half of the system.
+#
+# It is a separate Deployment (not a thread in the API pod) so a long repair or
+# a crash cannot take /run down. It talks to the API over the cluster network
+# (http://auton:8080) and shares the workspace PVC so its audit log and
+# incident records are the same files `GET /audit` and `GET /incidents` read.
+#
+# The PVC is ReadWriteOnce; k3d runs a single node, where both pods can mount
+# it. On a multi-node cluster give this Deployment its own PVC and set
+# AGENT_INCIDENTS_DIR — the ingest endpoint makes the split transparent.
+#
+# Build/import the same image as the API:
+#   docker build -t auton:local ./mcp && k3d image import auton:local -c ai-cluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton-ops
+  namespace: auton
+  labels:
+    app: auton-ops
+    # Neither the 7B model nor the playbooks may "repair" the controller.
+    auton.io/protect: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: never run two pods at once
+  selector:
+    matchLabels:
+      app: auton-ops
+  template:
+    metadata:
+      labels:
+        app: auton-ops
+        auton.io/protect: "true"
+    spec:
+      serviceAccountName: auton-ops
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: fix-workspace-owner
+        image: auton:local
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+            add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      containers:
+      - name: ops
+        image: auton:local
+        imagePullPolicy: IfNotPresent
+        command: ["python", "ops_controller.py"]
+        securityContext:
+          runAsUser: 10001
+          runAsGroup: 10001
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: HOME
+          value: "/tmp"
+        - name: TMPDIR
+          value: "/tmp"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        # --- Kubernetes access -------------------------------------------- #
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef: { fieldPath: metadata.namespace }
+        # The k8s_tools allowlist. The ops allowlist below is narrower.
+        - name: AGENT_NAMESPACES
+          value: "auton,auton-apps"
+        # Where the controller may repair. Everything else is read-only.
+        - name: AGENT_OPS_NAMESPACES
+          value: "auton-apps"
+        - name: AGENT_K8S_ENABLED
+          value: "1"
+        - name: AGENT_K8S_WRITE
+          value: "1"
+        # Shared with the API pod: one audit log, one incident store.
+        - name: AGENT_AUDIT_DIR
+          value: "/workspace/.ops"
+        - name: AGENT_INCIDENTS_DIR
+          value: "/workspace/.ops/incidents"
+        # --- loop policy --------------------------------------------------- #
+        - name: AGENT_OPS_INTERVAL
+          value: "60"
+        - name: AGENT_OPS_COOLDOWN
+          value: "1800"
+        - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
+          value: "6"
+        - name: AGENT_OPS_MAX_MEMORY
+          value: "2Gi"
+        - name: AGENT_OPS_MAX_INCIDENTS
+          value: "500"
+        # Flip to "1" to detect and report without changing anything.
+        - name: AGENT_OPS_DRY_RUN
+          value: "0"
+        - name: AGENT_OPS_HEARTBEAT
+          value: "/tmp/ops-heartbeat"
+        # --- reporting ----------------------------------------------------- #
+        - name: AGENT_API_URL
+          value: "http://auton:8080"
+        - name: AGENT_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: auton-api-token
+              key: token
+        # UI host (Traefik) used in notification links. P5 adds the UI.
+        - name: AGENT_UI_URL
+          value: "http://auton.localhost"
+        # n8n workflow that forwards reports to Slack/Telegram. Point it at the
+        # generated `auton-ops` workflow; an inactive webhook only logs errors.
+        - name: N8N_OPS_WEBHOOK
+          value: "http://n8n.auton.svc.cluster.local:5678/webhook/auton-ops"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - |
+              import os, sys, time
+              path = "/tmp/ops-heartbeat"
+              sys.exit(0 if os.path.exists(path)
+                       and time.time() - os.path.getmtime(path) < 1800 else 1)
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          failureThreshold: 3
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: agent-workspace
+      - name: tmp
+        emptyDir: {}

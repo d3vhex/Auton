@@ -1,0 +1,9 @@
+.venv/
+workspace/
+__pycache__/
+*.pyc
+tests/
+eval/
+eval-workspace/
+.pytest_cache/
+.agent/

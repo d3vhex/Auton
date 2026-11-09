@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auton
+  labels:
+    app.kubernetes.io/part-of: auton
+    app.kubernetes.io/name: auton

@@ -1,0 +1,111 @@
+# n8n workflow automation in the auton namespace.
+# k8s translation of:
+#   docker volume create n8n_data
+#   docker run -p 5678:5678 -v n8n_data:/home/node/.n8n docker.n8n.io/n8nio/n8n
+# Inside the cluster it can call our services by DNS:
+#   http://auton:8080/run            (trigger the coding agent)
+#   http://ollama-service:11434/api  (talk to the model directly)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-data
+  namespace: auton
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: n8n
+  namespace: auton
+  labels:
+    app: n8n
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO PVC + SQLite: only one writer at a time
+  selector:
+    matchLabels:
+      app: n8n
+  template:
+    metadata:
+      labels:
+        app: n8n
+    spec:
+      securityContext:
+        fsGroup: 1000       # n8n runs as uid/gid 1000 (node); make the PVC writable
+      containers:
+      - name: n8n
+        image: docker.n8n.io/n8nio/n8n:latest
+        ports:
+        - containerPort: 5678
+        env:
+        - name: N8N_PORT
+          value: "5678"
+        - name: N8N_PROTOCOL
+          value: "http"
+        - name: N8N_SECURE_COOKIE
+          value: "false"    # allow the UI over plain HTTP (ingress / port-forward)
+        - name: N8N_RUNNERS_ENABLED
+          value: "true"
+        - name: GENERIC_TIMEZONE
+          value: "Europe/Istanbul"
+        - name: TZ
+          value: "Europe/Istanbul"
+        # Webhooks are emitted with this base URL. Inside the cluster the agent
+        # calls http://n8n.auton.svc.cluster.local:5678/webhook directly; the
+        # host-facing URL goes through Traefik.
+        - name: N8N_HOST
+          value: "n8n.localhost"
+        - name: WEBHOOK_URL
+          value: "http://n8n.localhost/"
+        - name: N8N_EDITOR_BASE_URL
+          value: "http://n8n.localhost/"
+        # The agent pipeline workflow sends its bearer token as
+        # {{$env.AGENT_API_TOKEN}}; n8n blocks $env in expressions by default.
+        - name: N8N_BLOCK_ENV_ACCESS_IN_NODE
+          value: "false"
+        - name: AGENT_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: auton-api-token
+              key: token
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            memory: "1Gi"
+        volumeMounts:
+        - name: n8n-data
+          mountPath: /home/node/.n8n
+        readinessProbe:
+          httpGet: { path: /healthz, port: 5678 }
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 5678 }
+          initialDelaySeconds: 40
+          periodSeconds: 30
+      volumes:
+      - name: n8n-data
+        persistentVolumeClaim:
+          claimName: n8n-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n
+  namespace: auton
+spec:
+  type: ClusterIP
+  selector:
+    app: n8n
+  ports:
+  - port: 5678
+    targetPort: 5678

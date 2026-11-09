@@ -1,0 +1,381 @@
+# RBAC for the Auton agent and the autonomous ops controller.
+#
+# Both pods run kubectl inside their own pod with the token of their
+# ServiceAccount. RBAC — not the Python code — is the real security boundary.
+# The agent can repair its own namespace; the ops controller is narrower: it
+# repairs only `auton-apps` and can only read `auton` (so a bug in a playbook
+# cannot touch the API, its PVC or its Deployment).
+#
+# Namespace scope (auton + auton-apps): the agent may repair workloads, which
+# is what "autonomous operations" needs. Deliberately NOT granted anywhere:
+#   - secrets               (a pod can still reference one by name; keep the
+#                            target namespaces free of long-lived credentials)
+#   - persistentvolumeclaims delete   (data loss is irreversible; the agent must
+#                            report and ask a human, and RBAC enforces it even
+#                            if the tool guard is bypassed)
+#   - serviceaccounts / roles / rolebindings   (no privilege escalation)
+#   - namespaces delete
+#
+# Cluster scope is read-only (auton-cluster-reader): nodes, PVs, CRDs and
+# storage classes are needed for diagnosis, never for mutation.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auton-agent
+  namespace: auton
+automountServiceAccountToken: true
+---
+# The ops controller runs as its own identity: repair rights in auton-apps,
+# read-only in auton. It never needs secrets, exec or PVC deletion.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auton-ops
+  namespace: auton
+automountServiceAccountToken: true
+---
+# --------------------------------------------------------------------------- #
+# Namespace role, applied to both target namespaces
+# --------------------------------------------------------------------------- #
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-agent
+  namespace: auton
+rules:
+# --- read (diagnosis) ------------------------------------------------------ #
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/log
+  - pods/status
+  - services
+  - endpoints
+  - configmaps
+  - persistentvolumeclaims
+  - events
+  - resourcequotas
+  - limitranges
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "networkpolicies"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch"]
+# --- repair (workloads) ---------------------------------------------------- #
+# PVCs may be created/updated but NOT deleted: no "delete" verb on purpose.
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "configmaps"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments/scale", "statefulsets/scale"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["create", "update", "patch", "delete"]
+# Ingress may be created by the installer (P4); delete stays a human decision.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["create", "update", "patch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-agent
+  namespace: auton-apps
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/log
+  - pods/status
+  - services
+  - endpoints
+  - configmaps
+  - persistentvolumeclaims
+  - events
+  - resourcequotas
+  - limitranges
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "networkpolicies"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "configmaps"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments/scale", "statefulsets/scale"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["create", "update", "patch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["create", "update", "patch", "delete"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-agent
+  namespace: auton
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-agent
+subjects:
+- kind: ServiceAccount
+  name: auton-agent
+  namespace: auton
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-agent
+  namespace: auton-apps
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-agent
+subjects:
+- kind: ServiceAccount
+  name: auton-agent
+  namespace: auton
+---
+# --------------------------------------------------------------------------- #
+# Cluster-scoped, read-only (diagnosis only)
+# --------------------------------------------------------------------------- #
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: auton-cluster-reader
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/status
+  - nodes/metrics
+  - namespaces
+  - persistentvolumes
+  - events
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources:
+  - storageclasses
+  - csidrivers
+  - csinodes
+  - volumeattachments
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apiregistration.k8s.io"]
+  resources: ["apiservices"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingressclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["scheduling.k8s.io"]
+  resources: ["priorityclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["node.k8s.io"]
+  resources: ["runtimeclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: auton-cluster-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: auton-cluster-reader
+subjects:
+- kind: ServiceAccount
+  name: auton-agent
+  namespace: auton
+# --------------------------------------------------------------------------- #
+# Ops controller (auton-ops) — narrow, playbook-shaped permissions.
+#
+# Read everything it diagnoses, delete pods (stuck/CrashLoop) and patch/scale
+# Deployments (OOM bump, rollout undo). No create, no configmaps, no exec,
+# no secrets, no PVC verbs at all.
+# --------------------------------------------------------------------------- #
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-ops
+  namespace: auton-apps
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/log
+  - pods/status
+  - services
+  - endpoints
+  - configmaps
+  - persistentvolumeclaims
+  - events
+  - resourcequotas
+  - limitranges
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "networkpolicies"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch"]
+# Repairs: restart a pod, raise memory, undo a rollout, restore replicas.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-ops
+  namespace: auton-apps
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-ops
+subjects:
+- kind: ServiceAccount
+  name: auton-ops
+  namespace: auton
+---
+# Read-only in `auton`: the controller may diagnose but never repair the API,
+# its PVC or its own Deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-ops-reader
+  namespace: auton
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/log
+  - pods/status
+  - services
+  - endpoints
+  - configmaps
+  - persistentvolumeclaims
+  - events
+  - resourcequotas
+  - limitranges
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "networkpolicies"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-ops-reader
+  namespace: auton
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-ops-reader
+subjects:
+- kind: ServiceAccount
+  name: auton-ops
+  namespace: auton
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: auton-ops-cluster-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: auton-cluster-reader
+subjects:
+- kind: ServiceAccount
+  name: auton-ops
+  namespace: auton
