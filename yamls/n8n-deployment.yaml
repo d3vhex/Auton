@@ -75,6 +75,27 @@ spec:
             secretKeyRef:
               name: auton-api-token
               key: token
+        # Optional targets for the generated ops reporting workflow. Create the
+        # Secret `n8n-notify` with only the keys you use; `optional: true`
+        # leaves the others empty instead of blocking the n8n pod.
+        - name: SLACK_OPS_WEBHOOK
+          valueFrom:
+            secretKeyRef:
+              name: n8n-notify
+              key: slack-webhook
+              optional: true
+        - name: TELEGRAM_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: n8n-notify
+              key: telegram-bot-token
+              optional: true
+        - name: TELEGRAM_CHAT_ID
+          valueFrom:
+            secretKeyRef:
+              name: n8n-notify
+              key: telegram-chat-id
+              optional: true
         resources:
           requests:
             cpu: "100m"

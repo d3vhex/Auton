@@ -48,15 +48,19 @@ host.
 
 | File | Purpose |
 |---|---|
-| `agent_server.py` | MCP server over stdio: registers the 32 tools below (plus a deprecated `run_command` alias) |
+| `agent_server.py` | MCP server over stdio: registers the 33 tools below (plus a deprecated `run_command` alias) |
 | `audit.py` | Write-ahead audit log: JSONL + SQLite, fail-closed, `begin`/`finish`/`record` |
 | `k8s_tools.py` | `kubectl` wrapper: 13 Kubernetes tools (diagnosis + audit-gated mutations) |
 | `llm.py` | Provider layer: `ollama`/`openai`/`gemini`/`anthropic`/`custom`, config read per request, redaction, no fallback |
-| `n8n_tools.py` | n8n public-API + webhook client: 5 tools, stdlib HTTP only |
+| `n8n_tools.py` | n8n public-API + webhook client: 6 tools, stdlib HTTP only |
+| `incidents.py` | Atomic incident records (`detected`…`failed`) + local report retry queue |
+| `playbooks.py` | Deterministic repairs: OOM memory bump, stuck pod, crashloop recreate, rollout undo, replica restore |
+| `ops_controller.py` | Autonomous loop: snapshot → rule-based findings → playbook → verify → incident/report |
 | `agent_core.py` | Agent loop: dual-path tool calling, observation caps, compaction, corrective retry, cancellation |
 | `agent_client.py` | CLI entry point (`python agent_client.py "task"`) |
-| `agent_service.py` | HTTP front end: bearer auth, sync `POST /run`, async `/jobs` API, SSE, cancel, `GET /audit` |
+| `agent_service.py` | HTTP front end: bearer auth, sync `POST /run`, async `/jobs`, SSE, cancel, `/audit`, `/incidents` |
 | `Dockerfile` | Builds `auton:local` (`python:3.11-slim` + git, ripgrep, bubblewrap, kubectl) |
+| `ui/index.html` | Single-page UI served at `/`: chat, incidents, audit, provider; no bundler or CDN |
 | `requirements.txt` | `mcp>=2.0,<3`, `ollama>=0.4.0`, `pathspec>=0.12` |
 | `tests/` | pytest suite (tools, loop helpers, MCP transport, HTTP service, auth, k8s/n8n) |
 | `eval/run_eval.py` | 8 coding tasks + 4 optional live tasks; needs a live Ollama |
@@ -222,6 +226,7 @@ file, restarts the Deployment only if the projection stalls, and finally calls
 | `n8n_executions` | `(workflow_id="", limit=20)` | Recent runs, newest first, status only |
 | `n8n_webhook` | `(path, payload="")` | POST JSON to `/webhook/<path>` and return the response (900 s timeout) |
 | `n8n_create_agent_pipeline` | `(name="Auton agent", path="auton-agent", activate=True)` | Create the webhook → async job → poll → respond template and activate it |
+| `n8n_create_ops_pipeline` | `(kind="both", name="Auton ops reports", path="auton-ops", activate=True)` | Create the incident → Slack/Telegram workflow (`kind=slack\|telegram\|both`) |
 
 `n8n_create_agent_pipeline` exists because asking a 7B model to hand-write n8n
 node JSON is a losing game: the graph is fixed and generated, only the name and
@@ -239,6 +244,21 @@ job finished and the raw job payload (status/error) otherwise. The workflow's
 `executionTimeout` is 3600 s. Both HTTP nodes send
 `Authorization: Bearer $env.AGENT_API_TOKEN`, and the base URL for the polls is
 `AGENT_BASE_URL` (derived from `AGENT_RUN_URL` by stripping `/run`).
+
+`n8n_create_ops_pipeline` generates the reporting graph: a webhook that accepts
+the ops notification payload and fans out to generic HTTP Request nodes.
+
+```
+Webhook (respond 200 immediately)
+   ├─→ Slack    POST $env.SLACK_OPS_WEBHOOK
+   └─→ Telegram POST api.telegram.org/bot$env.TELEGRAM_BOT_TOKEN/sendMessage
+```
+
+No n8n credential is needed: the Slack incoming-webhook URL and the Telegram
+bot token/chat id come from n8n environment variables (Secret `n8n-notify` in
+`yamls/n8n-deployment.yaml`). `kind="slack"` or `"telegram"` creates only that
+branch. The message is built from the payload fields (`severity`, `status`,
+`resource`, `namespace`, `summary`, `action`, `verification`, `url`).
 
 ### Ignoring files
 
@@ -363,9 +383,82 @@ local_model_enabled, api_key_set, api_key_hint}` — never the raw key.
 
 ---
 
+## Autonomous ops (`ops_controller.py`)
+
+The operations controller runs as Deployment `auton-ops` (not a thread in the
+API pod) with ServiceAccount `auton-ops`. It is deliberately **LLM-free**: the
+same `k8s_tools._collect` snapshot the model uses feeds a rule table, and a
+matching deterministic playbook runs. A 7B model explaining an OOMKill is
+useful; a 7B model choosing a kubectl patch is not.
+
+```
+every AGENT_OPS_INTERVAL (60s):
+  snapshot each namespace in AGENT_OPS_NAMESPACES (default auton-apps)
+    → findings()            rule-based symptoms → cause
+    → cooldown + budget      skip a flapping resource
+    → playbooks.fix_*()      audit-gated mutation + verify
+    → IncidentStore          one JSON record, status resolved/needs_human/failed
+    → POST /incidents/ingest + N8N_OPS_WEBHOOK (queued locally if the API is down)
+```
+
+| Symptom | Cause | Playbook |
+|---|---|---|
+| `OOMKilled` | `oom` | raise the Deployment memory limit 25% (min 32Mi, cap `AGENT_OPS_MAX_MEMORY`), roll out, verify |
+| pod stuck `Terminating` beyond `AGENT_OPS_TERMINATION_GRACE` | `stuck` | `delete --grace-period=0 --force`, verify gone |
+| `CrashLoopBackOff` with no config-shaped log evidence | `crashloop` | delete the pod so the ReplicaSet recreates it, verify Deployment Available |
+| `ProgressDeadlineExceeded` / `ReplicaFailure` | `rollout` | `rollout undo`, verify |
+| scale-to-zero | `replicas_zero` | scale 1, verify |
+| image / config / scheduling / PVC / StatefulSet / bare failed pod | (report only) | `needs_human` with the exact fix |
+
+Safety rules are enforced in `playbooks.py`, not only in RBAC: the namespace
+must be in `AGENT_OPS_NAMESPACES` **and** in the `k8s_tools` allowlist,
+`auton.io/protect=true` resources are skipped, and a missing/mismatched owner
+(no Deployment to patch or controller to recreate the pod) goes to a human.
+Every function re-reads the resource after acting, so "resolved" always means
+verified, not attempted.
+
+Each repair is wrapped in `k8s_tools.incident_scope(id)`; every audit record
+(`begin`/`end`) then carries that `incident_id`, and `/audit?incident_id=`
+returns the pair. The incident record keeps `actions`, `verification`,
+`audit_ids`, a deterministic `report`, and a `notified` flag. Cooldown
+(`AGENT_OPS_COOLDOWN`, 1800 s) and an hourly budget
+(`AGENT_OPS_MAX_ACTIONS_PER_HOUR`, 6) bound a flapping workload;
+`AGENT_OPS_DRY_RUN=1` records `detected` + `dry_run` and mutates nothing.
+
+Two graces keep normal Kubernetes churn out of the incident log:
+`AGENT_OPS_STARTUP_GRACE` (120 s) ignores a `Pending`/`NotReady` pod while its
+image is pulled or its container starts — `Unschedulable` is exempt and is
+reported immediately — and it also suppresses the pod's Deployment, so a
+rollout that is simply not Ready yet is not reported as "0 available".
+`AGENT_OPS_TERMINATION_GRACE` (120 s) means a `DeletionTimestamp` alone is not
+"stuck"; only a long termination is. A pod that reports several reasons gets
+**one** finding: `_primary_reason()` picks by `REASON_PRIORITY` (`OOMKilled`
+wins over `CrashLoopBackOff`), because two playbooks on one pod race — the
+crashloop playbook deletes the pod the OOM playbook is verifying.
+
+Run one pass from the host (needs a kubeconfig and the env in
+`yamls/auton-ops-deployment.yaml`):
+
+```bash
+AGENT_NAMESPACES=auton,auton-apps AGENT_OPS_NAMESPACES=auton-apps \
+AGENT_AUDIT_DIR=/tmp/auton-ops AGENT_OPS_DRY_RUN=1 AGENT_K8S_WRITE=1 \
+  python ops_controller.py --once
+```
+
+`--once` is also what the chaos tests use. The notification payload is flat so
+Slack/Telegram templates stay trivial:
+
+```json
+{"incident_id": "inc-…", "severity": "critical", "status": "resolved",
+ "namespace": "auton-apps", "resource": "pod/api-1", "summary": "OOMKilled",
+ "action": "raised memory 64Mi -> 96Mi", "verification": "ready=1/1",
+ "report": "…", "url": "http://auton.localhost/incidents/inc-…"}
+```
+
 ## HTTP API
 
-`/health` (and `/`) are open for probes. Everything else requires:
+`GET /` and `GET /ui` serve the UI (`ui/index.html`, one file, no build step);
+`GET /health` is the open JSON probe. Everything else requires:
 
 ```
 Authorization: Bearer <token from the auton-api-token Secret>
@@ -389,15 +482,39 @@ curl -s http://localhost:8080/run \
 
 # mutation audit trail (auth required; 503 if the log is unwritable)
 curl -s "http://localhost:8080/audit?limit=20" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/audit?incident_id=inc-..." -H "Authorization: Bearer $TOKEN"
+
+# incidents recorded by auton-ops (auth required; 503 if the store is unwritable)
+curl -s "http://localhost:8080/incidents?limit=20" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents?status=needs_human" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents/inc-..." -H "Authorization: Bearer $TOKEN"
 
 # active model provider (key masked) and a one-line round-trip
 curl -s http://localhost:8080/provider -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://localhost:8080/provider/test -H "Authorization: Bearer $TOKEN"
 ```
 
+| Endpoint | Purpose |
+|---|---|
+| `GET /audit?limit=&incident_id=` | JSONL-backed mutation records |
+| `GET /incidents?limit=&status=` | Newest-first incident list (`status` is a comma list) |
+| `GET /incidents/{id}` | One incident: observations, actions, verification, report, audit ids |
+| `POST /incidents/ingest` | What `auton-ops` calls; idempotent by `id`, validates the file name |
+
 Response: `{job_id, final, steps, stop_reason, elapsed}`. A missing `task`
 returns `400`; a queue overflow `429`; a failed job `500`; a sync wait that times
 out `504` (with the `job_id` to poll).
+
+### UI
+
+`ui/index.html` is served verbatim at `/` and `/ui`. It is intentionally a
+single dependency-free file (the cluster may have no egress) and uses only
+same-origin `fetch` with the bearer token the user pastes in; the token lives in
+`localStorage`. Tabs: **Chat** (`POST /run?async=1` + poll `/jobs/{id}`,
+cancel), **Incidents** (`GET /incidents`, `GET /incidents/{id}`), **Audit**
+(`GET /audit`) and **Provider** (`GET /provider`, `POST /provider/test`). The
+page itself is open because it contains no data; do not move secrets or records
+into the HTML.
 
 ### Async jobs
 
@@ -496,13 +613,17 @@ python -m pytest tests -q
 
 The suite covers workspace escape, unique-match editing, atomic patches,
 gitignore-aware search, background jobs, git tools, context compaction, the real
-MCP stdio transport (all 32 tools), the HTTP jobs API, bearer auth (401/503 and
+MCP stdio transport (all 33 tools), the HTTP jobs API, bearer auth (401/503 and
 fail-closed startup), the kubectl wrapper (namespace allowlist, validation,
 write gate, snapshot/diagnose/events/wait/exec), the write-ahead audit log
 (fail-closed, begin/end pairing, SQLite index), the provider layer
 (config precedence, both remote adapters, redaction, no fallback), the n8n
-client (mocked HTTP) and the RBAC manifests (`tests/test_rbac.py` fails if a
-Role ever grants secrets or PVC delete).
+client (mocked HTTP, generated agent/ops pipelines), the incident store
+(atomic writes, statuses, retry queue, pruning), the playbooks (OOM math,
+owner-chain and protect/namespace guards, report-only causes), the ops
+controller (rule table, cooldown, hourly budget, dry-run, report payload) and
+the RBAC manifests (`tests/test_rbac.py` fails if a Role ever grants secrets or
+PVC delete, and checks the ops identity is read-only in `auton`).
 
 ### Eval harness
 

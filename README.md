@@ -21,6 +21,32 @@ ingress or `kubectl port-forward`.
 
 ## Quick start
 
+The fastest path is the idempotent installer; it follows the runbook below and
+ends with a verification pass (RBAC, token, provider, incident store):
+
+```bash
+./scripts/install.sh --create-cluster   # or --verify to only run the checks
+```
+
+Installer options (all steps check first, so re-running is safe):
+
+| Flag | Effect |
+|---|---|
+| `--create-cluster` | Create the k3d cluster if it does not exist |
+| `--skip-build` | Do not build/import `auton:local`; use the image already in the cluster |
+| `--skip-model-pull` | Do not pull the Ollama model |
+| `--no-ingress` | Skip the Traefik Ingress |
+| `--verify` | Only run the verification checks (token, RBAC, provider, incidents) |
+| `--dry-run` | Print the commands without changing anything |
+| `--show-token` | Print the bearer token at the end |
+
+Environment: `AUTON_IMAGE` (deploy a registry image instead of building
+`auton:local`), `AUTON_CLUSTER` (default `ai-cluster`) and `AUTON_TOKEN`
+(reuse a token instead of generating one). `./scripts/install.sh --help`
+prints the same list.
+
+If you prefer to see every step, the manual sequence is:
+
 ```bash
 # 1. Cluster with GPU passthrough (80:80 is only needed for ingress)
 k3d cluster create ai-cluster \
@@ -34,7 +60,7 @@ kubectl apply -f yamls/k8s-ds-amdgpu-dp.yaml
 kubectl apply -f yamls/namespace.yaml
 kubectl apply -f yamls/auton-apps.yaml
 kubectl -n auton create secret generic auton-api-token \
-  --from-literal=token="$(openssl rand -hex 32)"
+  --from-literal=token="$(openssl rand -hex 24)"
 kubectl apply -f yamls/auton-rbac.yaml
 kubectl apply -f yamls/auton-model.yaml   # provider=ollama by default
 
@@ -43,14 +69,24 @@ kubectl apply -f yamls/ollama-deployment.yaml
 kubectl -n auton rollout status deploy/ollama
 kubectl -n auton exec deploy/ollama -- ollama pull qwen2.5-coder:7b-instruct
 
-# 5. Build + import the agent image, deploy it
+# 5. Build + import the agent image, deploy the API and the ops controller
 docker build -t auton:local ./mcp
 k3d image import auton:local -c ai-cluster
 kubectl apply -f yamls/agent-deployment.yaml
+kubectl apply -f yamls/auton-ops-deployment.yaml
+kubectl -n auton rollout status deploy/auton
+kubectl -n auton rollout status deploy/auton-ops
 
 # 6. n8n + ingress
 kubectl apply -f yamls/n8n-deployment.yaml
 kubectl apply -f yamls/ingress.yaml
+```
+
+The agent serves a UI at `/` (port-forward the service, paste the token):
+
+```bash
+kubectl -n auton port-forward svc/auton 8080:8080
+# open http://localhost:8080/  →  "Set token"
 ```
 
 > On many setups `docker`, `k3d` and `kubectl` need `sudo` (they talk to a
@@ -78,6 +114,36 @@ curl -s http://localhost:8080/run \
 
 ---
 
+## Helm (Docker Hub images)
+
+The same stack is packaged as a chart so it can be installed without this
+repository. Images and the chart are published under `d3vhex` on Docker Hub by
+`scripts/publish.sh` (`docker.io/d3vhex/auton`, plus
+`oci://registry-1.docker.io/d3vhex/charts/auton`):
+
+```bash
+helm install auton oci://registry-1.docker.io/d3vhex/charts/auton \
+  --version 0.1.0 --namespace auton --create-namespace \
+  --set agent.auth.token="$(openssl rand -hex 24)"
+```
+
+From a checkout, `helm install auton ./charts/auton ...` works the same way.
+The chart creates the `auton`/`auton-apps` namespaces, RBAC, the audit PVC, the
+agent + UI, the ops controller, and optionally Ollama (with a model-pull Job),
+n8n and ingress. `charts/auton/README.md` documents every value, remote-provider
+examples, multi-node claims and `--take-ownership` adoption of an existing k3d
+install.
+
+To publish your own build:
+
+```bash
+DOCKERHUB_USER=<user> DOCKERHUB_TOKEN=<token> ./scripts/publish.sh
+```
+
+`--no-push` only builds the image and packages the chart (`dist/`).
+
+---
+
 ## Architecture
 
 ```
@@ -101,6 +167,10 @@ curl -s http://localhost:8080/run \
   │                               │   ollama-service:11434            │  │
   │                               │   └─ PVC agent-workspace  5Gi     │  │
   │                               │                                   │  │
+  │                               │ auton-ops (same image, own SA)    │  │
+  │                               │   ops_controller ─▶ playbooks     │  │
+  │                               │   └─ audit + incidents (PVC)      │  │
+  │                               │                                   │  │
   │                               │ n8n :5678  (ClusterIP)            │  │
   │                               │   └─ PVC n8n-data  5Gi            │  │
   │                               └───────────────────────────────────┘  │
@@ -110,10 +180,14 @@ curl -s http://localhost:8080/run \
 
 The dependency chain is one-way: **n8n → auton → ollama → GPU**. Ollama has no
 dependency on the agent, so the GPU stack can be tested on its own.
+`auton-ops` watches `auton-apps`, repairs deterministic problems and reports to
+`auton` (`POST /incidents/ingest`) and n8n; it never calls the LLM.
 
 `auton` runs under ServiceAccount `auton-agent`, whose namespace-scoped Role is
 the real boundary for the Kubernetes tools. It deliberately cannot read
-`secrets`, manage `serviceaccounts`, or touch Roles/RoleBindings.
+`secrets`, manage `serviceaccounts`, or touch Roles/RoleBindings. The ops
+controller uses its own ServiceAccount `auton-ops`: repair rights in
+`auton-apps`, read-only in `auton`, cluster read-only.
 
 ---
 
@@ -124,9 +198,10 @@ the real boundary for the Kubernetes tools. It deliberately cannot read
 | `k8s-ds-amdgpu-dp.yaml` | `kube-system` | `amdgpu-device-plugin-daemonset` (registers `amd.com/gpu`) | `rocm/k8s-device-plugin` | — |
 | `gpu-test.yaml` | `auton` | One-shot `rocminfo` pod (GPU smoke test) | `rocm/rocm-terminal:latest` | — |
 | `namespace.yaml` | — | `auton` namespace | — | — |
-| `auton-rbac.yaml` | `auton` | SA `auton-agent` + Role + RoleBinding | — | — |
+| `auton-rbac.yaml` | `auton`, `auton-apps` | SAs `auton-agent`/`auton-ops` + Roles/Bindings + cluster read-only | — | — |
 | `ollama-deployment.yaml` | `auton` | Ollama Deployment + PVC + **ClusterIP** | `ollama/ollama:latest` | `ollama-service:11434` |
 | `agent-deployment.yaml` | `auton` | Auton Deployment + PVC + **ClusterIP** | `auton:local` (built from `mcp/`) | `auton:8080` |
+| `auton-ops-deployment.yaml` | `auton` | Autonomous ops controller (shares `agent-workspace`) | `auton:local` | — |
 | `n8n-deployment.yaml` | `auton` | n8n Deployment + PVC + **ClusterIP** | `docker.n8n.io/n8nio/n8n:latest` | `n8n:5678` |
 | `ingress.yaml` | `auton` | Traefik `IngressRoute` (`auton`/`agent`, `ollama`, `n8n`) | — | 80 |
 
@@ -139,7 +214,7 @@ mount the same volume in two pods).
 
 | Secret | Key | Used by | Notes |
 |---|---|---|---|
-| `auton-api-token` | `token` | Auton, n8n | Bearer token for `/run` and `/jobs*`; also passed to n8n so workflows can authenticate |
+| `auton-api-token` | `token` | Auton, auton-ops, n8n | Bearer token for `/run`, `/jobs*`, `/audit`, `/provider*`, `/incidents*`; also passed to n8n and the ops controller |
 | `n8n-api` | `api-key` | Auton | n8n public-API key; mounted at `/etc/n8n-api/api-key` and read **per call**, so rotation needs no restart (projected volume lags up to ~1 min; use `scripts/rotate-n8n-api-key.sh`) |
 | `auton-model` | `api-key` | Auton | Key for the active remote model provider (empty for local Ollama). Written by `scripts/set-provider.sh`, read per call |
 
@@ -167,20 +242,28 @@ provider settings.
 │   ├── ollama-deployment.yaml Ollama + GPU + model PVC + ClusterIP
 │   ├── ollama-deployment.yaml.orig  legacy pre-PVC version — do not apply
 │   ├── agent-deployment.yaml  Auton pod + workspace PVC + ClusterIP
+│   ├── auton-ops-deployment.yaml  autonomous ops controller (own SA)
 │   ├── n8n-deployment.yaml    n8n + data PVC + ClusterIP
 │   └── ingress.yaml           Traefik routes: auton/ollama/n8n.localhost
 ├── scripts/
+│   ├── install.sh             idempotent bootstrap + verification
+│   ├── publish.sh             build/push the Docker Hub image and chart
 │   ├── rotate-n8n-api-key.sh  Secret update + projected-volume wait + verify
 │   └── set-provider.sh        switch model provider + verify (no restart)
+├── charts/auton/              Helm chart (agent + ops + optional Ollama/n8n)
 ├── mcp/                       container for auton:local  (see mcp/README.md)
 │   ├── agent_server.py        MCP stdio server (fs/shell/git)
 │   ├── audit.py               write-ahead audit log (JSONL + SQLite)
 │   ├── llm.py                 provider layer (ollama/openai/gemini/anthropic/custom)
 │   ├── k8s_tools.py           kubectl wrapper (13 tools, audit-gated)
-│   ├── n8n_tools.py           n8n REST client (5 tools)
+│   ├── n8n_tools.py           n8n REST client (6 tools)
+│   ├── incidents.py           atomic incident records + retry queue
+│   ├── playbooks.py           deterministic repairs (OOM/stuck/rollout/replicas)
+│   ├── ops_controller.py      autonomous detect → repair → verify → report loop
 │   ├── agent_core.py          dual-path tool loop, context budget, cancellation
 │   ├── agent_client.py        CLI entry point
-│   ├── agent_service.py       HTTP front end (bearer auth, sync /run, jobs, /audit)
+│   ├── agent_service.py       HTTP front end (UI, /run, jobs, /audit, /incidents)
+│   ├── ui/index.html          single-page UI served at "/" (no build step)
 │   ├── Dockerfile             builds auton:local (git, ripgrep, bwrap, kubectl)
 │   ├── requirements.txt       mcp>=2,<3 · ollama>=0.4 · pathspec>=0.12
 │   ├── tests/                 pytest suite (tools, loop, HTTP, k8s/n8n, auth, RBAC)
@@ -222,6 +305,9 @@ harmless and helps if Ollama falls back to HIP.
 ---
 
 ## Full runbook
+
+`scripts/install.sh` runs the steps below in order and verifies the result;
+each section is kept here so a failure can be reproduced by hand.
 
 ### 1. Create the cluster
 
@@ -350,17 +436,24 @@ docker build -t auton:local ./mcp
 k3d image import auton:local -c ai-cluster
 kubectl apply -f yamls/agent-deployment.yaml
 kubectl -n auton rollout status deploy/auton
+
+# Autonomous ops controller (same image, own ServiceAccount).
+kubectl apply -f yamls/auton-ops-deployment.yaml
+kubectl -n auton rollout status deploy/auton-ops
 ```
 
-Rebuild + re-import + `kubectl rollout restart deploy/auton` whenever you change
-anything under `mcp/`. `imagePullPolicy: IfNotPresent` makes the pod use the
-imported image.
+Rebuild + re-import + `kubectl rollout restart deploy/auton deploy/auton-ops`
+whenever you change anything under `mcp/`. `imagePullPolicy: IfNotPresent`
+makes both pods use the imported image. `auton-ops` shares the
+`agent-workspace` PVC (single-node k3d), so the audit log and incident files it
+writes are exactly the ones the API serves.
 
 The image installs `git` (for `git_diff`/`git_status`), `ripgrep` (fast,
 gitignore-aware search), `bubblewrap` (optional host sandbox) and **kubectl
-v1.35.5** (matching the cluster's server minor) on top of the agent modules. New
-Python modules must be added to the `COPY` line in `mcp/Dockerfile`, or they
-will be missing inside the pod.
+v1.35.5** (matching the cluster's server minor) on top of the agent modules and
+the `ui/` page. New Python modules must be added to the `COPY` line in
+`mcp/Dockerfile` (and new pages under `ui/`), or they will be missing inside the
+pod.
 
 ### 6. Deploy n8n and create its API key
 
@@ -466,7 +559,7 @@ The routes are plain `Host(...)` matches on the Traefik `web` entrypoint.
 | Service | In-cluster DNS | Type | Ingress host | Health |
 |---|---|---|---|---|
 | Ollama | `ollama-service:11434` | ClusterIP | `ollama.localhost` | `GET /` |
-| Auton | `auton:8080` | ClusterIP | `auton.localhost` (alias `agent.localhost`) | `GET /health` |
+| Auton | `auton:8080` | ClusterIP | `auton.localhost` (alias `agent.localhost`) | `GET /health`, UI at `/` |
 | n8n | `n8n:5678` | ClusterIP | `n8n.localhost` | `GET /healthz` |
 
 ---
@@ -475,7 +568,8 @@ The routes are plain `Host(...)` matches on the Traefik `web` entrypoint.
 
 ### Authentication
 
-`/health` (and `/`) are open for probes. Everything else requires:
+`/health`, `/` and `/ui` are open (`/` and `/ui` serve the page, which holds no
+data). Every API call needs:
 
 ```
 Authorization: Bearer <token from the auton-api-token Secret>
@@ -486,6 +580,29 @@ The service **refuses to start** without `AGENT_API_TOKEN` unless
 no token configured the handler answers `503`. n8n receives the same token via
 its own `AGENT_API_TOKEN` env var (from the Secret) and the generated workflow
 sends it with the `$env.AGENT_API_TOKEN` expression.
+
+### UI (`/`)
+
+The service bundles a single-page UI (no build step, no CDN) for the common
+day-to-day work:
+
+- **Chat** — submit a task over `POST /run?async=1` and follow the steps and
+  the final answer while the job runs; cancel is cooperative.
+- **Incidents** — the records `auton-ops` writes, newest first, filterable by
+  status; click one for the full observation/actions/verification JSON.
+- **Audit** — the mutation log (`GET /audit`) with action, target, phase,
+  incident id and audit id.
+- **Provider** — the active provider with its masked key, plus a one-line
+  `POST /provider/test` round-trip.
+
+```bash
+kubectl -n auton port-forward svc/auton 8080:8080
+# http://localhost:8080/  →  "Set token" → paste the Secret value
+```
+
+The token is kept in `localStorage` in the browser and sent only to the same
+origin. The page is also reachable through the ingress at
+`http://auton.localhost/`.
 
 ### Model providers
 
@@ -548,7 +665,7 @@ curl -s -X POST http://localhost:8080/provider/test -H "Authorization: Bearer $T
 ```
 
 `/health` also reports `provider`, `model` and `local_model_enabled`, which is
-what the UI uses (P5) to show whether a remote provider is active. Remote
+what the UI uses to show whether a remote provider is active. Remote
 providers receive tool schemas as function definitions and their tool calls are
 normalised into the JSON-text format the loop already parses, so the
 assistant/tool history has one shape. A 7B model is not very reliable through
@@ -556,6 +673,9 @@ the OpenAI-compatible path either — use a stronger model when you pick a
 remote provider.
 
 ### HTTP API (`agent_service.py`)
+
+`GET /` and `GET /ui` serve the bundled UI; `GET /health` is the open JSON
+probe. Everything below needs the bearer token.
 
 Synchronous (default — this is what the n8n workflows call):
 
@@ -616,6 +736,55 @@ If the audit volume is not writable the endpoint answers `503` and every
 mutating Kubernetes tool refuses to run. That is deliberate: the log is a
 precondition, not a best-effort side effect.
 
+### Incidents (`/incidents`)
+
+`auton-ops` detects problems without being asked, repairs the deterministic
+ones, verifies the result and records what it did. Every incident is one atomic
+JSON file under `/workspace/.ops/incidents` (shared PVC), with a status of
+`detected`, `acting`, `resolved`, `needs_human` or `failed`:
+
+```bash
+# newest first; filter by one or more statuses
+curl -s "http://localhost:8080/incidents?limit=20" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+curl -s "http://localhost:8080/incidents?status=needs_human" \
+  -H "Authorization: Bearer $TOKEN"
+
+# one record: observation, evidence, actions, verification, report, audit ids
+curl -s "http://localhost:8080/incidents/inc-8173cfab0b" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`POST /incidents/ingest` is what the controller calls; it is idempotent by
+`id` and lets the ops Deployment move to its own PVC later without changing the
+API. The record also contains a ready-to-send `report` string (used by the UI
+and Slack/Telegram).
+
+The controller snapshots `auton-apps` every 60 s and runs **rule-based**
+detection — the LLM is not in this path:
+
+| Symptom | Cause | Action |
+|---|---|---|
+| `OOMKilled` (last state) on a Deployment pod | `oom` | raise the memory limit by 25% (min 32Mi, cap `AGENT_OPS_MAX_MEMORY=2Gi`), roll out, verify Available |
+| pod stuck `Terminating` for more than `AGENT_OPS_TERMINATION_GRACE` | `stuck` | one forced delete with grace 0 |
+| `CrashLoopBackOff`, no config-shaped log evidence | `crashloop` | delete the pod so its ReplicaSet recreates it, verify |
+| `ProgressDeadlineExceeded` / `ReplicaFailure` | `rollout` | `kubectl rollout undo`, verify |
+| Deployment scaled to zero | `replicas_zero` | scale to 1, verify |
+| `ImagePullBackOff` / bad image | `image` | **report only** (`needs_human`) |
+| missing ConfigMap/Secret, connection/auth failures | `config` | **report only** |
+| unschedulable / node capacity | `scheduling` | **report only** |
+| unbound PVC, StatefulSet, bare failed pod, not Ready | — | **report only** |
+
+Safety rails: only `AGENT_OPS_NAMESPACES` (default `auton-apps`) is repaired;
+`auton.io/protect=true` resources are skipped; every mutation goes through the
+audit gate and carries the incident id; a cooldown (1800 s per resource+cause)
+and an hourly action budget (6) stop flapping; `AGENT_OPS_DRY_RUN=1` reports
+without changing anything. `AGENT_OPS_STARTUP_GRACE` (120 s) ignores a young
+`Pending`/`NotReady` pod so an image pull is not an incident, and a pod that
+reports several reasons gets a single action (`OOMKilled` wins over
+`CrashLoopBackOff`). Secrets and PVC deletion are impossible in code and in
+RBAC, so the controller reports those cases and asks a human.
+
 ### Jobs API (long tasks)
 
 A 7B model can spend several minutes on 25 steps, which is longer than a
@@ -655,10 +824,10 @@ Jobs run **one at a time** through a single worker thread (one GPU), FIFO, with
 | Git | `git_status`, `git_diff` |
 | Housekeeping | `fs` (stat/mkdir/move/delete), `todo_write` |
 | Kubernetes | `k8s_get`, `k8s_describe`, `k8s_logs`, `k8s_snapshot`, `k8s_diagnose`, `k8s_events`, `k8s_wait`, `k8s_apply`, `k8s_patch`, `k8s_scale`, `k8s_rollout`, `k8s_delete`, `k8s_exec` |
-| n8n | `n8n_workflows`, `n8n_activate`, `n8n_executions`, `n8n_webhook`, `n8n_create_agent_pipeline` |
+| n8n | `n8n_workflows`, `n8n_activate`, `n8n_executions`, `n8n_webhook`, `n8n_create_agent_pipeline`, `n8n_create_ops_pipeline` |
 
-`run_command` remains as a deprecated alias for `bash`. There are 32 tools in
-total; descriptions are deliberately terse because 32 schemas cost prompt
+`run_command` remains as a deprecated alias for `bash`. There are 33 tools in
+total; descriptions are deliberately terse because 33 schemas cost prompt
 tokens on a 7B model.
 
 - `read_file` takes `start_line` / `end_line` and returns numbered lines, so a
@@ -724,11 +893,24 @@ records.
 | `n8n_executions(workflow_id, limit)` | Recent runs |
 | `n8n_webhook(path, payload)` | POST a JSON body to `/webhook/<path>` and return the response (900 s timeout) |
 | `n8n_create_agent_pipeline(name, path, activate)` | Create the webhook → async job → poll → respond template and activate it |
+| `n8n_create_ops_pipeline(kind, name, path, activate)` | Create the incident → Slack/Telegram notification workflow (`kind=slack\|telegram\|both`) |
 
 `n8n_create_agent_pipeline` exists because asking a 7B model to hand-write n8n
 node JSON is a losing game: the graph is fixed and generated, only the name and
 webhook path vary. It starts the task with `?async=1` and polls `/jobs/{id}`
 every 5 s, so the workflow is not limited by a single HTTP request timeout.
+
+`n8n_create_ops_pipeline` generates the reporting half: a webhook that accepts
+the ops notification payload and fans out to generic HTTP Request nodes. Slack
+uses an incoming-webhook URL (`SLACK_OPS_WEBHOOK`); Telegram uses
+`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; no n8n credential is needed. The
+workflow is inactive until activated, and the ops controller points at
+`/webhook/auton-ops` via `N8N_OPS_WEBHOOK`.
+
+```bash
+kubectl -n auton exec deploy/auton -- python -c \
+  'import n8n_tools; print(n8n_tools.n8n_create_ops_pipeline(kind="both"))'
+```
 
 ### n8n webhook
 
@@ -736,10 +918,18 @@ every 5 s, so the workflow is not limited by a single HTTP request timeout.
 curl -s -X POST http://localhost:5678/webhook/auton-agent \
   -H 'Content-Type: application/json' \
   -d '{"task":"Create hello_n8n.py that prints hi, and run it."}'
+
+# ops report (normally sent by auton-ops)
+curl -s -X POST http://localhost:5678/webhook/auton-ops \
+  -H 'Content-Type: application/json' \
+  -d '{"incident_id":"inc-1","severity":"critical","status":"resolved",
+       "namespace":"auton-apps","resource":"pod/api-1",
+       "summary":"OOMKilled","action":"raised memory 64Mi -> 96Mi",
+       "verification":"ready=1/1","url":"http://auton.localhost/incidents/inc-1"}'
 ```
 
 Enable the workflow first (toggle **Active** in the n8n UI, or use
-`n8n_activate` / `n8n_create_agent_pipeline`).
+`n8n_activate` / `n8n_create_*_pipeline`).
 
 ---
 
@@ -783,6 +973,7 @@ Enable the workflow first (toggle **Active** in the n8n UI, or use
 | `AGENT_NAMESPACE` | `auton` | Default namespace for the Kubernetes tools |
 | `AGENT_NAMESPACES` | `AGENT_NAMESPACE` | Comma list the tools may target; deployment sets `auton,auton-apps` |
 | `AGENT_AUDIT_DIR` | `$AGENT_WORKSPACE/.ops` | Write-ahead audit log + SQLite index; mutations refuse if unwritable |
+| `AGENT_INCIDENTS_DIR` | `$AGENT_AUDIT_DIR/incidents` | Incident JSON files (`/incidents*`) |
 | `AGENT_K8S_ENABLED` | `1` | `0` disables the Kubernetes tools |
 | `AGENT_K8S_WRITE` | `0` (image) / `1` (deployment) | Allows apply/patch/scale/rollout/delete/exec |
 | `N8N_API_URL` | `http://n8n:5678/api/v1` | n8n public API base |
@@ -792,6 +983,29 @@ Enable the workflow first (toggle **Active** in the n8n UI, or use
 | `N8N_API_TIMEOUT` | `30` | Public-API timeout, seconds |
 | `N8N_WEBHOOK_TIMEOUT` | `900` | Webhook timeout, seconds (agent runs are slow) |
 | `AGENT_RUN_URL` | `http://auton:8080/run` | URL baked into generated n8n pipelines |
+
+### Ops controller (`auton-ops`)
+
+| Variable | Default (manifest) | Meaning |
+|---|---|---|
+| `AGENT_OPS_NAMESPACES` | `auton-apps` | Namespaces the controller may **repair** (all others are read-only) |
+| `AGENT_OPS_INTERVAL` | `60` | Seconds between detection passes (minimum 10) |
+| `AGENT_OPS_COOLDOWN` | `1800` | Seconds before the same resource+cause is acted on again |
+| `AGENT_OPS_MAX_ACTIONS_PER_HOUR` | `6` | Hourly repair budget; further findings wait (report-only findings are unaffected) |
+| `AGENT_OPS_STARTUP_GRACE` | `120` | Seconds a `Pending`/`NotReady` pod is ignored after it starts (image pull/startup); `Unschedulable` is always reported, `0` disables the grace |
+| `AGENT_OPS_TERMINATION_GRACE` | `120` | Seconds a pod may stay `Terminating` before the controller calls it stuck |
+| `AGENT_OPS_MAX_MEMORY` | `2Gi` | Cap for automatic OOM limit increases |
+| `AGENT_OPS_MAX_INCIDENTS` | `500` | Records kept; older files are pruned |
+| `AGENT_OPS_DRY_RUN` | `0` | `1` detects and reports without mutating |
+| `AGENT_OPS_HEARTBEAT` | `/tmp/ops-heartbeat` | File the liveness probe checks |
+| `AGENT_OPS_DIR` | `AGENT_AUDIT_DIR` | Incident/audit root (the manifest shares `/workspace/.ops`) |
+| `AGENT_API_URL` | `http://auton:8080` | Where incidents are ingested |
+| `AGENT_API_TOKEN` | *(Secret)* | Bearer token for `/incidents/ingest` |
+| `AGENT_UI_URL` | `http://auton.localhost` | Base for incident links in notifications |
+| `N8N_OPS_WEBHOOK` | `/webhook/auton-ops` | Slack/Telegram relay; empty disables it |
+| `N8N_OPS_TOKEN` | `AGENT_API_TOKEN` | Bearer header sent to the webhook |
+| `AGENT_NAMESPACES` | `auton,auton-apps` | `k8s_tools` allowlist (must include the ops namespace) |
+| `AGENT_K8S_WRITE` | `1` | `0` makes every playbook refuse to mutate |
 
 ### Ollama
 
@@ -826,8 +1040,22 @@ kubectl -n auton exec deploy/ollama -- ollama ps
 | `N8N_HOST` | `n8n.localhost` | Host used in generated URLs |
 | `WEBHOOK_URL` | `http://n8n.localhost/` | Base for displayed/registered webhooks |
 | `N8N_EDITOR_BASE_URL` | `http://n8n.localhost/` | Editor links |
-| `N8N_BLOCK_ENV_ACCESS_IN_NODE` | `false` | Lets workflow expressions read `$env.AGENT_API_TOKEN` |
+| `N8N_BLOCK_ENV_ACCESS_IN_NODE` | `false` | Lets workflow expressions read `$env.AGENT_API_TOKEN` (and the ops targets) |
 | `AGENT_API_TOKEN` | from Secret | Token the workflow sends to `auton` |
+| `SLACK_OPS_WEBHOOK` | Secret `n8n-notify` (optional) | Slack incoming-webhook URL for ops reports |
+| `TELEGRAM_BOT_TOKEN` | Secret `n8n-notify` (optional) | Telegram bot token for ops reports |
+| `TELEGRAM_CHAT_ID` | Secret `n8n-notify` (optional) | Telegram chat/channel id |
+
+Create only the notification keys you need; the `secretKeyRef`s are
+`optional: true`, so n8n starts regardless:
+
+```bash
+kubectl -n auton create secret generic n8n-notify \
+  --from-literal=slack-webhook='https://hooks.slack.com/services/...' \
+  --from-literal=telegram-bot-token='123:ABC...' \
+  --from-literal=telegram-chat-id='-1001234567890'
+kubectl -n auton rollout restart deploy/n8n
+```
 
 ---
 
@@ -967,14 +1195,33 @@ ingress hosts.
 | Agent stops early: `(stopped after N steps)` | Task too large for one session | Raise `MAX_STEPS`, or split the task |
 | `k3d image import` succeeded but pod uses old code | `rollout restart` not done | `kubectl -n auton rollout restart deploy/auton` |
 | Second Ollama appears in `default` | Someone applied `ollama-deployment.yaml.orig` | `kubectl -n default delete deploy/ollama svc/ollama-service --ignore-not-found` |
+| Ops incident says `image`/`config`/`scheduling` and `needs_human` | Those causes are deliberately not auto-repaired | Fix the image/ConfigMap/capacity; the report names the exact deployment |
+| The same OOM deployment is bumped every 30 min | The app leaks or allocates more than the cap | Raise `AGENT_OPS_MAX_MEMORY` or fix the app; the cooldown is per resource+cause |
+| `auton-ops` restarts / liveness fails | A pass is wedged or the heartbeat file is not writable | `kubectl -n auton logs deploy/auton-ops --tail=100`; `/tmp` must be writable (it is an emptyDir) |
+| `/incidents` answers `503` | The shared workspace volume is not writable | Check `AGENT_AUDIT_DIR`/`AGENT_INCIDENTS_DIR` and the `agent-workspace` PVC |
+| Ops webhook returns `404` | The `auton-ops` workflow is not active | `n8n_create_ops_pipeline(...)` or activate it in the UI |
+| Slack/Telegram messages do not arrive but the webhook is 200 | `n8n-notify` Secret / env values are missing | Create the Secret, `rollout restart deploy/n8n`, check the workflow execution in n8n |
 
 Useful checks:
 
 ```bash
 kubectl -n auton get pods,pvc,svc
 kubectl -n auton logs deploy/auton --tail=100
+kubectl -n auton logs deploy/auton-ops --tail=100
 kubectl -n auton logs deploy/ollama --tail=100
 kubectl get nodes -o jsonpath='{.items[0].status.capacity}{"\n"}'
+```
+
+Incident and audit checks (with `TOKEN` and a port-forward on `:8080`):
+
+```bash
+curl -s "http://localhost:8080/incidents?limit=5" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents?status=needs_human" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/audit?incident_id=<id>" -H "Authorization: Bearer $TOKEN"
+kubectl -n auton exec deploy/auton-ops -- \
+  sh -c 'kubectl auth can-i patch deployments -n auton-apps;
+         kubectl auth can-i patch deployments -n auton;
+         kubectl auth can-i get secrets -n auton-apps'
 ```
 
 ---
@@ -989,6 +1236,19 @@ kubectl get nodes -o jsonpath='{.items[0].status.capacity}{"\n"}'
   ingresses can be created/updated but not deleted. Note that creating pods is
   inherently powerful: a pod spec can reference a Secret by name, so do not put
   long-lived credentials in these namespaces that the agent should never see.
+- **Autonomous repair uses a separate, narrower identity.** `auton-ops` can
+  delete pods and patch/scale Deployments only in `auton-apps`; in `auton` it is
+  read-only. It cannot read secrets, delete PVCs, create serviceaccounts or
+  touch its own Deployment, and every mutation is audit-gated. Image, config,
+  scheduling, PVC and StatefulSet problems are report-only. A per-resource
+  cooldown (30 min) and an hourly action budget (6) stop a flapping workload
+  from being patched forever. Run with `AGENT_OPS_DRY_RUN=1` to observe its
+  decisions before letting it change anything.
+- **The ops controller shares the workspace PVC.** On single-node k3d both
+  pods can mount the `ReadWriteOnce` volume, which is what makes `/audit` and
+  `/incidents` show the controller's records. On a multi-node cluster, give
+  `auton-ops` its own PVC and point `AGENT_INCIDENTS_DIR` at it; the ingest
+  endpoint keeps the API view complete.
 - **A remote model provider sees cluster evidence leave the host.** With
   `provider=ollama` nothing leaves the machine. With OpenAI/Gemini/Claude or a
   custom endpoint, prompts and tool outputs (manifests, events, log excerpts)

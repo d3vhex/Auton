@@ -21,7 +21,7 @@ EXPECTED = {
     "k8s_rollout", "k8s_delete", "k8s_exec",
     # n8n control
     "n8n_workflows", "n8n_activate", "n8n_executions", "n8n_webhook",
-    "n8n_create_agent_pipeline",
+    "n8n_create_agent_pipeline", "n8n_create_ops_pipeline",
 }
 
 

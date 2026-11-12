@@ -52,6 +52,9 @@ INTERVAL = max(10, int(os.environ.get("AGENT_OPS_INTERVAL", "60")))
 COOLDOWN = max(0, int(os.environ.get("AGENT_OPS_COOLDOWN", "1800")))
 MAX_ACTIONS_PER_HOUR = max(1, int(
     os.environ.get("AGENT_OPS_MAX_ACTIONS_PER_HOUR", "6")))
+STARTUP_GRACE = max(0, int(os.environ.get("AGENT_OPS_STARTUP_GRACE", "120")))
+TERMINATION_GRACE = max(0, int(
+    os.environ.get("AGENT_OPS_TERMINATION_GRACE", "120")))
 DRY_RUN = os.environ.get("AGENT_OPS_DRY_RUN", "0").strip().lower() in (
     "1", "true", "yes", "on")
 API_URL = os.environ.get("AGENT_API_URL", "http://auton:8080").rstrip("/")
@@ -105,6 +108,59 @@ REASONS = {
     "Error": ("failed_pod", "warning"),
     "NotReady": ("not_ready", "warning"),
 }
+
+# A pod can report several reasons at once (e.g. OOMKilled last state +
+# CrashLoopBackOff now). Running one playbook per reason on the same pod made
+# them race (the crashloop playbook deletes the pod while the oom playbook is
+# verifying its rollout), so only the most specific cause is acted on.
+REASON_PRIORITY = [
+    "OOMKilled",
+    "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
+    "CreateContainerConfigError", "CreateContainerError",
+    "RunContainerError", "ContainerCannotRun",
+    "Unschedulable", "Pending", "NotReady",
+    "CrashLoopBackOff",
+    "Error", "Failed",
+]
+
+
+def _primary_reason(reasons: list[str]) -> str:
+    for reason in REASON_PRIORITY:
+        if reason in reasons:
+            return reason
+    return next((r for r in reasons if r in REASONS), "")
+
+
+# A brand-new pod is Pending/NotReady for a few seconds while the image is
+# pulled and the container starts. Reporting that would page a human (and log
+# an incident) for a normal rollout, so these reasons are ignored until the pod
+# is older than AGENT_OPS_STARTUP_GRACE. Unschedulable is never suppressed.
+STARTUP_REASONS = {"Pending", "NotReady"}
+
+
+def _young(pod: dict) -> bool:
+    """True while a pod is still inside the startup grace window."""
+    age = pod.get("age_seconds")
+    if age is None or STARTUP_GRACE <= 0:
+        return False
+    try:
+        return float(age) < STARTUP_GRACE
+    except (TypeError, ValueError):
+        return False
+
+
+def _stuck_deleting(pod: dict) -> bool:
+    """A DeletionTimestamp alone is normal; only a long one is stuck."""
+    age = pod.get("deleting_seconds")
+    if age is None:
+        return True
+    if TERMINATION_GRACE <= 0:
+        return True
+    try:
+        return float(age) >= TERMINATION_GRACE
+    except (TypeError, ValueError):
+        return True
+
 
 REPORT_ONLY = {
     "image": ("Fix the image reference/tag (or the registry imagePullSecret), "
@@ -165,24 +221,34 @@ def findings(snapshot: dict) -> list[dict]:
         if pod.get("protected"):
             continue
         if pod["deleting"]:
+            if not _stuck_deleting(pod):
+                continue
             found.append(_finding(
                 "Pod", pod["name"], "stuck", "critical",
                 f"pod/{pod['name']} has been Terminating for "
                 f"{pod['deleting_age'] or 'unknown'}"))
             continue
-        for reason in pod["reasons"]:
-            mapped = REASONS.get(reason)
-            if not mapped:
-                continue
-            cause, severity = mapped
-            found.append(_finding(
-                "Pod", pod["name"], cause, severity,
-                f"pod/{pod['name']} reports {reason} "
-                f"(restarts={pod['restarts']}, phase={pod['phase']})"))
+        if (pod["reasons"] and _young(pod)
+                and all(reason in STARTUP_REASONS
+                        for reason in pod["reasons"])):
+            # Still starting: remember the workload so the rollout is not
+            # re-reported as "deployment has 0 available replicas" either.
             kind, name = _workload_for(pod, namespace)
             if kind == "Deployment" and name:
                 covered.add(name)
-
+            continue
+        reason = _primary_reason(pod["reasons"])
+        mapped = REASONS.get(reason)
+        if not mapped:
+            continue
+        cause, severity = mapped
+        found.append(_finding(
+            "Pod", pod["name"], cause, severity,
+            f"pod/{pod['name']} reports {reason} "
+            f"(restarts={pod['restarts']}, phase={pod['phase']})"))
+        kind, name = _workload_for(pod, namespace)
+        if kind == "Deployment" and name:
+            covered.add(name)
     for name, work in (("deployments", "Deployment"),
                        ("statefulsets", "StatefulSet")):
         for item in snapshot[name]:

@@ -102,6 +102,14 @@ spec:
           value: "1800"
         - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
           value: "6"
+        # Ignore Pending/NotReady for this long after a pod starts so a normal
+        # image pull/container start is not reported as an incident.
+        - name: AGENT_OPS_STARTUP_GRACE
+          value: "120"
+        # A pod with a DeletionTimestamp is only "stuck" after this long, so a
+        # normal kubectl delete/rollout is not reported as an incident.
+        - name: AGENT_OPS_TERMINATION_GRACE
+          value: "120"
         - name: AGENT_OPS_MAX_MEMORY
           value: "2Gi"
         - name: AGENT_OPS_MAX_INCIDENTS

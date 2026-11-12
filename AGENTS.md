@@ -1,10 +1,10 @@
 # AGENTS.md
 
 Infra/runbook repo for a single-host k3d + AMD GPU AI lab. There is no build
-system, linter, CI, or git repository here. The one automated check is the
-pytest suite under `mcp/tests/`. The root `README.md` is the authoritative
-runbook; `mcp/README.md` covers the agent internals. When they disagree with
-code or manifests, trust the code/manifests.
+system, linter or CI. The one automated check is the pytest suite under
+`mcp/tests/`. The root `README.md` is the authoritative runbook;
+`mcp/README.md` covers the agent internals. When they disagree with code or
+manifests, trust the code/manifests.
 
 ## Cluster shape
 
@@ -16,6 +16,11 @@ code or manifests, trust the code/manifests.
   image `auton:local`. Plus `ollama-service:11434` and `n8n:5678`.
   **All Services are ClusterIP**; Traefik hosts are
   `auton`/`agent`/`ollama`/`n8n`.localhost.
+- Deployment `auton-ops` runs `ops_controller.py` as ServiceAccount
+  `auton-ops`; it shares the `agent-workspace` PVC (single-node RWO) so its
+  audit log and incident files are the ones the API reads. It repairs only
+  `auton-apps` and is read-only in `auton`, so it cannot touch the API, Ollama,
+  n8n or its own Deployment.
 - Manifests live in `yamls/` (not the repo root).
 - PVCs use `local-path`: data survives pod restarts and a `k3d cluster
   stop`/`start` but **not** `k3d cluster delete`. The model is pulled onto the
@@ -48,7 +53,8 @@ code or manifests, trust the code/manifests.
 - Bootstrap order: `namespace.yaml` → `auton-apps.yaml` → Secret
   `auton-api-token` → `auton-rbac.yaml` → `auton-model.yaml` →
   `ollama-deployment.yaml` → pull the model → build/import `auton:local` →
-  `agent-deployment.yaml` → `n8n-deployment.yaml` → `ingress.yaml`.
+  `agent-deployment.yaml` → `auton-ops-deployment.yaml` →
+  `n8n-deployment.yaml` → `ingress.yaml`.
 - The agent image is local-only, not from a registry:
   ```bash
   docker build -t auton:local ./mcp
@@ -57,16 +63,36 @@ code or manifests, trust the code/manifests.
   kubectl -n auton rollout restart deploy/auton   # after any rebuild
   ```
   `imagePullPolicy: IfNotPresent` is why the imported image is used.
+- `scripts/install.sh` is the executable runbook (cluster → GPU plugin → Ollama
+  → model → image → agent/ops → n8n → ingress, then a verification pass). It
+  is idempotent, keeps an existing token/PVC, and `--verify` re-runs only the
+  checks. Use `AUTON_IMAGE` to deploy a registry image instead of `auton:local`.
 - `mcp/Dockerfile` explicitly `COPY`s the Python modules (currently
   `agent_core.py agent_server.py agent_client.py agent_service.py audit.py
-  k8s_tools.py llm.py n8n_tools.py`). Any new module must be added there or it
-  will be missing inside the pod. The image also installs `git`, `ripgrep`,
-  `bubblewrap` and **kubectl v1.35.5** (matches the server minor); `tests/` and
-  `.venv/` are excluded via `.dockerignore`.
+  incidents.py k8s_tools.py llm.py n8n_tools.py playbooks.py
+  ops_controller.py`) **and** the `ui/` directory. Any new module/page must be
+  added there or it will be missing inside the pod. The image also installs
+  `git`, `ripgrep`, `bubblewrap` and **kubectl v1.35.5** (matches the server
+  minor); `tests/` and `.venv/` are excluded via `.dockerignore`.
 - Never apply `yamls/ollama-deployment.yaml.orig`; it creates a second Ollama in
   the `default` namespace that competes for the GPU.
 - Do not change the Deployments' `strategy: Recreate` while PVCs are
   `ReadWriteOnce`; a rolling update would deadlock on the mounted volume.
+- The UI is `mcp/ui/index.html`, served by `agent_service.py` at `/` and `/ui`.
+  It is deliberately one file: no bundler, no CDN, no external assets (the pod
+  may have no egress). It keeps the bearer token in `localStorage` and talks to
+  the same origin only. Keep it that way; putting data in the page would make
+  the open route a leak.
+- `charts/auton` is the Helm equivalent of `yamls/` (agent + ops + RBAC + PVCs,
+  optional Ollama/n8n/ingress). Resource names are intentionally fixed
+  (`auton`, `auton-ops`) because docs and generated n8n workflows use
+  `auton:8080`; do not add a release-name prefix without changing them.
+  `scripts/publish.sh` builds/pushes `docker.io/d3vhex/auton` and the OCI chart
+  (`oci://registry-1.docker.io/d3vhex/charts/auton`); `--no-push` is the local
+  check. PVCs and the API-token Secret carry `helm.sh/resource-policy: keep`.
+  On this k3d cluster adopt the existing install with `--take-ownership` and
+  `--set agent.workspace.existingClaim=agent-workspace` (the bound PVC's
+  `storageClassName` is immutable).
 - `yamls/gpu-test.yaml` is a one-shot `rocminfo` smoke test. Delete the pod after
   use.
 - The model is not shipped in the Ollama image. After a fresh PVC or cluster
@@ -122,14 +148,15 @@ code or manifests, trust the code/manifests.
   fuzzy beyond quotes: silent wrong-place edits are worse than a retry.
 - `agent_server.py` uses `mcp.server.mcpserver.MCPServer`, a **v2-only** API.
   Keep `requirements.txt` at `mcp>=2,<3`; do not downgrade to MCP v1.
-  32 tools total: workspace (`list_directory`, `read_file`, `write_file`,
+  33 tools total: workspace (`list_directory`, `read_file`, `write_file`,
   `edit_file`, `apply_patch`), search (`grep`, `glob`), shell (`bash`, `job`,
   `run_tests`), git (`git_status`, `git_diff`), housekeeping (`fs`,
   `todo_write`), Kubernetes (`k8s_get`, `k8s_describe`, `k8s_logs`,
   `k8s_snapshot`, `k8s_diagnose`, `k8s_events`, `k8s_wait`, `k8s_apply`,
   `k8s_patch`, `k8s_scale`, `k8s_rollout`, `k8s_delete`, `k8s_exec`) and n8n
   (`n8n_workflows`, `n8n_activate`, `n8n_executions`, `n8n_webhook`,
-  `n8n_create_agent_pipeline`). `run_command` is a deprecated alias for `bash`.
+  `n8n_create_agent_pipeline`, `n8n_create_ops_pipeline`). `run_command` is a
+  deprecated alias for `bash`.
 - `audit.py` is the gate for **every** mutation: `k8s_tools._audited()` calls
   `audit.begin()` (JSONL append + fsync + SQLite index under `AGENT_AUDIT_DIR`,
   default `/workspace/.ops`) *before* kubectl runs, and returns an error without
@@ -151,7 +178,38 @@ code or manifests, trust the code/manifests.
   poll `/jobs/{id}` -> respond graph instead of asking the 7B model to write node
   JSON. The polling loop (Wait 5 s -> Get Job -> IF status in done/error/
   cancelled, false branch back to Wait) is why slow runs do not depend on one
-  long-lived HTTP request.
+  long-lived HTTP request. `n8n_create_ops_pipeline(kind="slack"|"telegram"|
+  "both")` generates webhook -> Slack/Telegram HTTP nodes using
+  `SLACK_OPS_WEBHOOK` / `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from `$env`
+  (no n8n credential setup).
+- **Autonomous ops** (`ops_controller.py`, `playbooks.py`, `incidents.py`):
+  `ops_controller` snapshots `AGENT_OPS_NAMESPACES` (default `auton-apps`) every
+  `AGENT_OPS_INTERVAL` (60 s) using the same `k8s_tools._collect` the model
+  uses, maps pod/deployment/PVC symptoms to deterministic causes (`oom`,
+  `crashloop`, `stuck`, `rollout`, `replicas_zero`), and runs the matching
+  playbook from `playbooks.py`. The LLM is **not** in this path: a 7B model
+  explaining an OOMKill is useful, a 7B model choosing a kubectl patch is not.
+  Image/config/scheduling/PVC problems are `report_only` -> `needs_human`.
+  Each repair is wrapped in `k8s_tools.incident_scope(id)` so audit records
+  carry the incident id; the playbook verifies its own result with a fresh
+  read. `incidents.py` stores one atomic JSON file per incident under
+  `AGENT_AUDIT_DIR/incidents` (shared with the API), statuses
+  `detected/acting/resolved/needs_human/failed`, plus a local retry queue.
+  Cooldown (`AGENT_OPS_COOLDOWN`, 1800 s) and an hourly action budget
+  (`AGENT_OPS_MAX_ACTIONS_PER_HOUR`, 6) stop a flapping workload from being
+  patched forever; `AGENT_OPS_DRY_RUN=1` reports without mutating.
+  `AGENT_OPS_STARTUP_GRACE` (120 s) suppresses `Pending`/`NotReady` for a young
+  pod (image pull/container start) and also keeps its Deployment from being
+  reported as unavailable; `Unschedulable` is always reported immediately.
+  `AGENT_OPS_TERMINATION_GRACE` (120 s) keeps a normal `kubectl delete` from
+  being reported as a stuck pod. A pod with several reasons gets **one**
+  finding (priority in `REASON_PRIORITY`; OOM beats CrashLoopBackOff) because
+  two playbooks on the same pod race (the crashloop playbook deletes it while
+  the OOM rollout is being verified).
+  Reports go to `POST /incidents/ingest` and to `N8N_OPS_WEBHOOK`. Resources
+  labelled `auton.io/protect=true` are never touched. Detection rules are in
+  `ops_controller.REASONS` / `REPORT_ONLY`; add a playbook and a test before
+  adding a cause there.
 - File/search tools are jailed to `AGENT_WORKSPACE` (default `./workspace`;
   container uses `/workspace`). `bash`/`run_tests`/`git` are deliberately not
   jailed and run a real shell; `AGENT_SANDBOX=bwrap` optionally wraps them.
@@ -160,7 +218,8 @@ code or manifests, trust the code/manifests.
   `PYTHONDONTWRITEBYTECODE=1`), and a root init container that `chown`s the
   workspace. `local-path` does not reliably apply `fsGroup`, so removing that
   init container leaves `/workspace` unwritable for the agent.
-- Auth: `/health` (and `/`) are open; `/run` and `/jobs*` require
+- Auth: `/health` (and `/`, `/ui`, which serve the bundled page) are open;
+  `/run`, `/jobs*`, `/audit`, `/provider*` and `/incidents*` require
   `Authorization: Bearer $AGENT_API_TOKEN`. The service **fails closed**: it
   refuses to start without a token unless `AGENT_AUTH_DISABLED=1`, and an empty
   token answers `503`. No rate limiting. Do not expose the service publicly.
@@ -217,7 +276,7 @@ point at the system Python, so a Python upgrade leaves it broken.
 
 - Run the agent test suite before rebuilding the image:
   `cd mcp && python -m pytest tests -q` (no cluster or GPU needed; expect
-  `134 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
+  `221 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
   grants secrets or PVC delete.
 - To measure real model behaviour, run the eval harness against a live Ollama:
   `cd mcp && python eval/run_eval.py` (or `--list`, `--only N`, `--verbose`).
@@ -239,6 +298,17 @@ point at the system Python, so a Python upgrade leaves it broken.
   `{"final": ..., "steps": [...], "stop_reason": ...}`. Long tasks:
   `POST /run?async=1`, then poll `/jobs/{id}`. Without a token expect `401`;
   with no token configured expect `503`.
+- UI: `curl -s http://localhost:8080/ | head` returns the HTML page and
+  `curl -s http://localhost:8080/ui` the same (both open); `/health` must still
+  return JSON. In the browser, Chat → Incidents → Audit → Provider must each
+  load with the token and show `401` feedback without one.
+- Helm: `helm lint charts/auton` and
+  `helm template auton charts/auton -n auton | kubectl apply --dry-run=server -f -`.
+  On an existing install the agent PVC must be adopted
+  (`--set agent.workspace.existingClaim=agent-workspace`) or the dry run fails on
+  the immutable `storageClassName`.
+- `scripts/install.sh --verify` runs the token/RBAC/provider/incidents checks
+  and must print six `ok` lines on a healthy install.
 - Provider: `GET /provider` (auth) returns the active provider with a masked
   key; `POST /provider/test` sends one tiny completion and returns `ok`/`502`.
   `scripts/set-provider.sh --provider <name> ...` switches without a restart —
@@ -254,9 +324,31 @@ point at the system Python, so a Python upgrade leaves it broken.
   `k8s_diagnose(<pod>)` a `diagnosis:`/`suggested_action:` pair.
 - Audit: every mutation writes two lines to `/workspace/.ops/audit.jsonl`
   (`begin` then `end`); `GET /audit` with the bearer token returns them.
+  `GET /audit?incident_id=inc-...` returns the pair for one ops repair.
   Simulate a broken log by pointing `AGENT_AUDIT_DIR` at a file — the mutation
   must be refused with `refused ... audit log is not writable` and kubectl must
   not run.
+- Ops controller: `kubectl -n auton logs deploy/auton-ops` must show
+  `pass complete: {... "findings": N ...}` every interval (empty `auton-apps`
+  -> `findings: 0`). `GET /incidents` lists records and
+  `GET /incidents/{id}` one record. Live checks:
+  - OOM: create a Deployment in `auton-apps` that allocates more than its
+    `limits.memory`; expect an `incident ... oom` log, the limit raised by
+    25% (minimum 32Mi) in `kubectl get deploy -o jsonpath`, the pod Available,
+    the record `resolved`, and `/audit?incident_id=` returning the
+    `k8s_patch` begin/end pair.
+  - Report-only: a Deployment with a missing image must become
+    `needs_human` with action `report_only` and **no** audit rows.
+  - `AGENT_OPS_DRY_RUN=1` must record `detected` + `dry_run` without changing
+    the Deployment.
+  - From the ops pod, `kubectl auth can-i` must say `no` for
+    `delete persistentvolumeclaims`, `get secrets`, and
+    `patch deployments -n auton`, and `yes` for `patch deployments` in
+    `auton-apps`.
+- n8n ops reports: `n8n_create_ops_pipeline(kind="both")` creates and activates
+  `/webhook/auton-ops`. Set `SLACK_OPS_WEBHOOK` and/or
+  `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in n8n; POSTing the notification
+  payload must answer `200` immediately even if a downstream node fails.
 - n8n tools: `kubectl -n auton exec deploy/auton -- python -c 'import
   n8n_tools; print(n8n_tools.n8n_workflows("list"))'`.
 - End-to-end: activate the generated webhook workflow and call

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: auton
+description: Auton — an autonomous Kubernetes operation agent (LLM chat, audit-gated tools, rule-based repairs, incident reports).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - kubernetes
+  - ai
+  - agent
+  - operations
+  - ollama
+home: https://github.com/d3vhex/Auton
+sources:
+  - https://github.com/d3vhex/Auton
+maintainers:
+  - name: auton
+annotations:
+  category: AI

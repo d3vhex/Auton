@@ -430,8 +430,142 @@ def n8n_create_agent_pipeline(name: str = "Auton agent", path: str = "auton-agen
             '\'{"task": "..."}\').')
 
 
+# --------------------------------------------------------------------------- #
+# Ops notification template (incident -> Slack / Telegram)
+# --------------------------------------------------------------------------- #
+
+def _ops_message() -> str:
+    """JS expression for the human-readable notification body."""
+    return (
+        "'[' + ($json.severity || 'info') + '] ' + ($json.status || '') + ' ' + "
+        "($json.resource || '') + ' (' + ($json.namespace || '') + ')"
+        " + '\\n' + ($json.summary || '')"
+        " + ($json.action ? '\\nAction: ' + $json.action : '')"
+        " + ($json.verification ? '\\nVerified: ' + $json.verification : '')"
+        " + ($json.url ? '\\n' + $json.url : '')"
+    )
+
+
+def _ops_workflow(name: str, path: str, kind: str) -> dict:
+    """Webhook -> Slack and/or Telegram HTTP node.
+
+    The ops controller POSTs a flat payload
+    ``{incident_id, severity, status, namespace, resource, summary, action,
+    verification, report, url}``. Generic HTTP Request nodes are used instead of
+    the Slack/Telegram n8n nodes so no credential has to be configured in the
+    UI: the webhook URL / bot token live in n8n environment variables
+    (``SLACK_OPS_WEBHOOK``, ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID``).
+    """
+    nodes = [{
+        "id": str(uuid.uuid4()),
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [-260, 0],
+        "webhookId": str(uuid.uuid4()),
+        "parameters": {
+            "path": path,
+            "httpMethod": "POST",
+            # Acknowledge immediately; the ops controller retries on failure.
+            "responseMode": "onReceived",
+            "options": {},
+        },
+    }]
+    targets = []
+    if kind in ("slack", "both"):
+        nodes.append({
+            "id": str(uuid.uuid4()),
+            "name": "Slack",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [40, -120],
+            "parameters": {
+                "method": "POST",
+                "url": "={{ $env.SLACK_OPS_WEBHOOK }}",
+                "sendBody": True,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify({ text: "
+                            + _ops_message() + " }) }}",
+                "options": {"timeout": 15000},
+            },
+        })
+        targets.append("Slack")
+    if kind in ("telegram", "both"):
+        nodes.append({
+            "id": str(uuid.uuid4()),
+            "name": "Telegram",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [40, 120],
+            "parameters": {
+                "method": "POST",
+                "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}"
+                       "/sendMessage",
+                "sendBody": True,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify({ chat_id: "
+                            "$env.TELEGRAM_CHAT_ID, text: " + _ops_message()
+                            + ", disable_web_page_preview: true }) }}",
+                "options": {"timeout": 15000},
+            },
+        })
+        targets.append("Telegram")
+    return {
+        "name": name,
+        "settings": {"executionOrder": "v1", "executionTimeout": 120},
+        "nodes": nodes,
+        "connections": {
+            "Webhook": {"main": [[
+                {"node": target, "type": "main", "index": 0}
+                for target in targets
+            ]]},
+        },
+    }
+
+
+def n8n_create_ops_pipeline(kind: str = "both", name: str = "Auton ops reports",
+                            path: str = "auton-ops",
+                            activate: bool = True) -> str:
+    """Create the incident -> Slack/Telegram notification workflow.
+
+    ``kind`` is ``slack``, ``telegram`` or ``both``. The generated workflow is
+    inactive until activated (the ops controller points at
+    ``/webhook/<path>``). Required n8n environment variables:
+    ``SLACK_OPS_WEBHOOK`` and/or ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID``.
+    """
+    kind = (kind or "both").strip().lower()
+    if kind not in ("slack", "telegram", "both"):
+        return _err(f"invalid kind {kind!r}",
+                    "Use 'slack', 'telegram' or 'both'.")
+    path = (path or "").strip().lstrip("/")
+    if not path or not _PATH_RE.match(path):
+        return _err(f"invalid webhook path {path!r}",
+                    "Use lowercase letters, digits, '-', '_' and '/'.")
+    body = _ops_workflow(name.strip() or "Auton ops reports", path, kind)
+    text = _api("POST", "/workflows", body)
+    if text.startswith('{"ok": false'):
+        return text
+    try:
+        workflow_id = json.loads(text).get("id")
+    except (json.JSONDecodeError, AttributeError):
+        return _clip(text)
+    result = f"Created workflow {workflow_id} ({body['name']})."
+    if activate:
+        activation = _api("POST", f"/workflows/{workflow_id}/activate")
+        if activation.startswith('{"ok": false'):
+            return result + f"\nActivation failed: {activation}"
+        result += " Activated."
+    needed = []
+    if kind in ("slack", "both"):
+        needed.append("SLACK_OPS_WEBHOOK")
+    if kind in ("telegram", "both"):
+        needed.append("TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+    return (result + f"\nWebhook: /webhook/{path} (POST the ops payload)."
+            + "\nSet in n8n: " + "; ".join(needed) + ".")
+
+
 TOOLS = [n8n_workflows, n8n_activate, n8n_executions, n8n_webhook,
-         n8n_create_agent_pipeline]
+         n8n_create_agent_pipeline, n8n_create_ops_pipeline]
 
 
 def register(mcp) -> None:

@@ -1,0 +1,17 @@
+# Build artifacts
+dist/
+*.tgz
+charts/*/charts/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+mcp/eval-workspace/
+mcp/workspace/
+mcp/.agent/
+
+# Local tooling
+.DS_Store
+*.swp

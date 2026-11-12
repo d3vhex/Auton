@@ -1,0 +1,70 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    {{- with .Values.namespaceLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    helm.sh/resource-policy: keep
+{{- end }}
+{{- if .Values.appsNamespace.create }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "auton.appsNamespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    {{- with .Values.namespaceLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    # Read by the ops controller.
+    auton.io/ops: "enabled"
+  annotations:
+    helm.sh/resource-policy: keep
+{{- end }}
+---
+# Keep the repair target small: a runaway playbook ("raise memory until it
+# works") should fail fast instead of eating the node.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: auton-apps-quota
+  namespace: {{ include "auton.appsNamespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 4Gi
+    limits.cpu: "4"
+    limits.memory: 8Gi
+    pods: "20"
+    services: "5"
+    persistentvolumeclaims: "5"
+    count/deployments.apps: "10"
+    count/statefulsets.apps: "5"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: auton-apps-limits
+  namespace: {{ include "auton.appsNamespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "2"
+        memory: 4Gi

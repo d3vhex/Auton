@@ -35,6 +35,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY agent_core.py agent_server.py agent_client.py agent_service.py \
      audit.py incidents.py k8s_tools.py llm.py n8n_tools.py \
      playbooks.py ops_controller.py ./
+COPY ui ./ui
 
 ENV AGENT_WORKSPACE=/workspace \
     AGENT_PORT=8080 \

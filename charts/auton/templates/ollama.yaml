@@ -1,0 +1,109 @@
+{{- if .Values.ollama.enabled }}
+{{- $resources := deepCopy .Values.ollama.resources }}
+{{- if .Values.ollama.gpu.enabled }}
+{{- $limits := default dict $resources.limits }}
+{{- $_ := set $limits .Values.ollama.gpu.resourceName .Values.ollama.gpu.count }}
+{{- $_ := set $resources "limits" $limits }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: ollama
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO PVC + RollingUpdate would deadlock
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        {{- include "auton.labels" . | nindent 8 }}
+        app: ollama
+    spec:
+      securityContext:
+        fsGroup: 0
+      containers:
+        - name: ollama
+          image: {{ .Values.ollama.image }}
+          imagePullPolicy: {{ .Values.ollama.imagePullPolicy }}
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_HOST
+              value: 0.0.0.0:11434
+            {{- range $key, $value := .Values.ollama.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml $resources | nindent 12 }}
+          volumeMounts:
+            - name: ollama-storage
+              mountPath: /root/.ollama
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: ollama-storage
+          persistentVolumeClaim:
+            claimName: {{ default "ollama-models" .Values.ollama.persistence.existingClaim }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: ollama
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: 11434
+{{- if .Values.ollama.pullModel }}
+---
+# Idempotent: `ollama pull` re-verifies an existing model instead of failing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: auton-pull-model
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pull
+          image: {{ .Values.ollama.image }}
+          command: ["ollama", "pull", {{ .Values.ollama.model | quote }}]
+          env:
+            - name: OLLAMA_HOST
+              value: http://ollama-service:11434
+          resources: {}
+{{- end }}
+{{- end }}

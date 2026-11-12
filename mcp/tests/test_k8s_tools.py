@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -267,6 +268,30 @@ def kubectl_json(monkeypatch):
     monkeypatch.setattr(k8s_tools, "WRITE", True)
     monkeypatch.setattr(k8s_tools, "NAMESPACES", ("auton",))
     return calls
+
+
+def test_pod_summary_exposes_age_seconds():
+    """The ops controller needs a numeric age to apply the startup grace."""
+    pod = json.loads(json.dumps(POD))
+    stamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=40)
+    pod["status"]["startTime"] = stamp.isoformat().replace("+00:00", "Z")
+    pod["metadata"]["deletionTimestamp"] = stamp.isoformat().replace(
+        "+00:00", "Z")
+    summary = k8s_tools._pod_summary(pod)
+    assert 35 <= summary["age_seconds"] <= 90
+    assert 35 <= summary["deleting_seconds"] <= 90
+    assert summary["started"].endswith("s")
+
+
+def test_pod_summary_age_falls_back_to_creation_timestamp():
+    pod = json.loads(json.dumps(POD))
+    del pod["status"]["startTime"]
+    stamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
+    pod["metadata"]["creationTimestamp"] = stamp.isoformat().replace(
+        "+00:00", "Z")
+    summary = k8s_tools._pod_summary(pod)
+    assert summary["started"] == "5m"
+    assert summary["age_seconds"] >= 295
 
 
 def test_snapshot_summarises_problems(kubectl_json):

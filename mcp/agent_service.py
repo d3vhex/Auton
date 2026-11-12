@@ -2,6 +2,8 @@
 """HTTP front-end for the coding agent, meant to run as a pod.
 
 Endpoints:
+  GET  /                        -> single-page UI (open; it holds no data)
+  GET  /ui                      -> same UI
   GET  /health                  -> {"status":"ok", ...} plus queue depth (open)
   POST /run  {"task": ""}       -> synchronous result (kept for n8n back-compat)
   POST /run?async=1             -> 202 {"job_id": ...} and poll /jobs/{id}
@@ -16,7 +18,8 @@ Endpoints:
   GET  /provider                -> active model provider (key masked)
   POST /provider/test           -> one tiny completion against the provider
 
-Everything except /health requires `Authorization: Bearer $AGENT_API_TOKEN`.
+`/` and `/ui` serve the bundled page; `/health` stays open (probes);
+everything else requires `Authorization: Bearer $AGENT_API_TOKEN`.
 The service refuses to start without a token unless AGENT_AUTH_DISABLED=1.
 
 One worker thread owns the GPU: jobs run FIFO, so two tasks never fight over
@@ -45,6 +48,8 @@ from agent_core import MODEL, OLLAMA_HOST, run_agent
 import audit
 import incidents
 import llm
+
+UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 
 BIND = os.environ.get("AGENT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("AGENT_PORT", "8080"))
@@ -241,6 +246,38 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'unsafe-inline'; "
+                         "script-src 'unsafe-inline'; connect-src 'self'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _serve_ui(self) -> None:
+        """Serve the bundled single-page UI.
+
+        The page itself is open (it contains no data), while every fetch it
+        makes uses the bearer token the user pastes in. If the file is missing
+        (e.g. a slim custom image) answer with a one-line hint instead of a
+        stack trace.
+        """
+        try:
+            with open(os.path.join(UI_DIR, "index.html"), encoding="utf-8") as fh:
+                self._send_html(200, fh.read())
+        except OSError:
+            self._send_html(200, "<h1>Auton</h1><p>UI bundle is missing; the "
+                                 "JSON API is still available at "
+                                 "<code>/health</code>.</p>")
+
     def _check_auth(self) -> bool:
         """True if the caller may proceed; otherwise send 401/503 and return False."""
         if AUTH_DISABLED:
@@ -318,7 +355,10 @@ class Handler(BaseHTTPRequestHandler):
     # -- GET -------------------------------------------------------------- #
     def do_GET(self):  # noqa: N802
         path, _ = self._route()
-        if path in ("/", "/health"):
+        if path in ("/", "/ui"):
+            self._serve_ui()
+            return
+        if path == "/health":
             with JOBS_LOCK:
                 running = sum(1 for j in JOBS.values() if j.status == "running")
             info = llm.provider_info()

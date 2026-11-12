@@ -472,21 +472,28 @@ _BAD_REASONS = {
 }
 
 
-def _fmt_age(when: str | None) -> str:
-    """Kubernetes timestamp -> compact age ("3m", "2h"); '' when unknown."""
+def _age_seconds(when: str | None) -> float | None:
+    """Kubernetes timestamp -> age in seconds; None when unknown."""
     if not when:
-        return ""
+        return None
     raw = when.replace("Z", "+00:00")
     try:
         then = _dt.datetime.fromisoformat(raw)
     except ValueError:
-        return ""
+        return None
     now = _dt.datetime.now(_dt.timezone.utc)
     if then.tzinfo is None:
         then = then.replace(tzinfo=_dt.timezone.utc)
-    seconds = int((now - then).total_seconds())
-    if seconds < 0:
-        return "0s"
+    seconds = (now - then).total_seconds()
+    return 0.0 if seconds < 0 else seconds
+
+
+def _fmt_age(when: str | None) -> str:
+    """Kubernetes timestamp -> compact age ("3m", "2h"); '' when unknown."""
+    seconds = _age_seconds(when)
+    if seconds is None:
+        return ""
+    seconds = int(seconds)
     for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
         if seconds >= size:
             return f"{seconds // size}{unit}"
@@ -545,6 +552,7 @@ def _pod_summary(pod: dict) -> dict:
     if status.get("phase") == "Pending" and not reasons:
         reasons.append("Pending")
     kind, owner = _owner(pod)
+    started = status.get("startTime") or meta.get("creationTimestamp")
     return {
         "name": meta.get("name", ""),
         "phase": status.get("phase", "Unknown"),
@@ -553,9 +561,11 @@ def _pod_summary(pod: dict) -> dict:
         "reasons": list(dict.fromkeys(reasons)),
         "owner": f"{kind}/{owner}" if owner else "",
         "node": (pod.get("spec") or {}).get("nodeName", ""),
-        "started": _fmt_age(status.get("startTime")),
+        "started": _fmt_age(started),
+        "age_seconds": _age_seconds(started),
         "deleting": bool(meta.get("deletionTimestamp")),
         "deleting_age": _fmt_age(meta.get("deletionTimestamp")),
+        "deleting_seconds": _age_seconds(meta.get("deletionTimestamp")),
         "last_terminated": last_terminated,
         "protected": _protected(meta),
     }

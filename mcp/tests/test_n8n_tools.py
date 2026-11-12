@@ -169,3 +169,58 @@ def test_workflow_delete_surfaces_api_errors(monkeypatch):
     monkeypatch.setattr(n8n_tools, "_api",
                         lambda *a, **k: '{"ok": false, "error": "boom"}')
     assert "boom" in n8n_tools.n8n_workflows("delete", workflow_id="wf1")
+
+
+# --------------------------------------------------------------------------- #
+# Ops notification pipeline
+# --------------------------------------------------------------------------- #
+
+def test_ops_pipeline_slack_only(api):
+    out = n8n_tools.n8n_create_ops_pipeline(kind="slack", name="Ops slack")
+    assert "Created workflow wf1" in out and "Activated" in out
+    body = api[0]["body"]
+    nodes = {node["name"]: node for node in body["nodes"]}
+    assert set(nodes) == {"Webhook", "Slack"}
+    slack = nodes["Slack"]["parameters"]
+    assert "SLACK_OPS_WEBHOOK" in slack["url"]
+    assert "severity" in slack["jsonBody"] and "resource" in slack["jsonBody"]
+    assert body["connections"]["Webhook"]["main"][0] == [
+        {"node": "Slack", "type": "main", "index": 0}]
+    assert "SLACK_OPS_WEBHOOK" in out
+
+
+def test_ops_pipeline_telegram_only(api):
+    n8n_tools.n8n_create_ops_pipeline(kind="telegram")
+    body = api[0]["body"]
+    nodes = {node["name"]: node for node in body["nodes"]}
+    assert set(nodes) == {"Webhook", "Telegram"}
+    telegram = nodes["Telegram"]["parameters"]
+    assert "TELEGRAM_BOT_TOKEN" in telegram["url"]
+    assert "/sendMessage" in telegram["url"]
+    assert "chat_id" in telegram["jsonBody"]
+    assert "disable_web_page_preview" in telegram["jsonBody"]
+
+
+def test_ops_pipeline_both_fans_out(api):
+    out = n8n_tools.n8n_create_ops_pipeline(kind="both")
+    body = api[0]["body"]
+    nodes = {node["name"] for node in body["nodes"]}
+    assert nodes == {"Webhook", "Slack", "Telegram"}
+    targets = [item["node"]
+               for item in body["connections"]["Webhook"]["main"][0]]
+    assert targets == ["Slack", "Telegram"]
+    assert "TELEGRAM_CHAT_ID" in out
+
+
+def test_ops_pipeline_can_be_created_inactive(api):
+    out = n8n_tools.n8n_create_ops_pipeline(kind="slack", path="alerts",
+                                            activate=False)
+    assert len(api) == 1
+    assert "Activated" not in out
+    assert "/webhook/alerts" in out
+
+
+def test_ops_pipeline_validates_kind_and_path(api):
+    assert "kind" in _err(n8n_tools.n8n_create_ops_pipeline(kind="email"))["error"]
+    assert _err(n8n_tools.n8n_create_ops_pipeline(path="../etc/passwd"))
+    assert api == []

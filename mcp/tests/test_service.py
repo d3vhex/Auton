@@ -72,6 +72,21 @@ def test_health(server):
     assert "queue_depth" in payload and "model" in payload
 
 
+def test_ui_is_served_without_auth(server, secured):
+    # The page is open (it holds no data); its fetches carry the token.
+    for path in ("/", "/ui"):
+        req = urllib.request.Request(f"{server}{path}")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"].startswith("text/html")
+            html = response.read().decode("utf-8")
+        assert "<title>Auton" in html
+        assert "/incidents" in html and "/audit" in html
+
+    status, payload = _request("GET", f"{server}/health")
+    assert status == 200 and payload["status"] == "ok"
+
+
 def test_sync_run_returns_result(server):
     status, payload = _request("POST", f"{server}/run", {"task": "say hi"})
     assert status == 200

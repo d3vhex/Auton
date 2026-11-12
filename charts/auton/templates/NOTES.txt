@@ -1,0 +1,46 @@
+Auton {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+The API is a ClusterIP service; the UI is served at "/":
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/auton 8080:8080
+  open http://localhost:8080/
+
+Paste the bearer token into the UI ("Set token"):
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ default "auton-api-token" .Values.agent.auth.existingSecret }} \
+    -o jsonpath='{.data.token}' | base64 -d
+
+Check the autonomous ops controller:
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/auton-ops --tail=50
+  kubectl -n {{ .Release.Namespace }} get incidents   # no CRD: use GET /incidents
+
+{{- if .Values.ops.dryRun }}
+NOTE: ops is in DRY RUN mode (reports, never mutates). Disable with
+      --set ops.dryRun=false when you trust the findings.
+{{- end }}
+
+{{- if not .Values.ollama.enabled }}
+Ollama is not managed by this release. The agent expects a provider at
+{{ .Values.provider.baseUrl }} (provider={{ .Values.provider.name }}).
+{{- else if .Values.ollama.pullModel }}
+The model {{ .Values.ollama.model }} is pulled by the auton-pull-model Job:
+  kubectl -n {{ .Release.Namespace }} logs job/auton-pull-model -f
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+Ingress hosts:
+{{- range .Values.ingress.hosts }}
+  http://{{ .host }}/
+{{- end }}
+{{- end }}
+
+{{- if not .Values.n8n.enabled }}
+n8n is not managed by this release. Point N8N_API_URL / N8N_WEBHOOK_BASE at
+your instance and create Secret {{ default "n8n-api" .Values.n8n.apiKey.existingSecret }}
+with key api-key.
+{{- end }}
+
+PVCs are annotated helm.sh/resource-policy=keep, so `helm uninstall` preserves
+the workspace (audit log, incidents) and any model data. Delete them manually
+if you really want a clean slate.

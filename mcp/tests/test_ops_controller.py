@@ -10,7 +10,8 @@ import ops_controller
 
 
 def _pod(name="api-1", reasons=(), deleting=False, protected=False,
-         restarts=0, phase="Running", deleting_age=""):
+         restarts=0, phase="Running", deleting_age="", age_seconds=300,
+         deleting_seconds=None):
     return {
         "name": name,
         "phase": phase,
@@ -20,8 +21,10 @@ def _pod(name="api-1", reasons=(), deleting=False, protected=False,
         "owner": "ReplicaSet/api-rs",
         "node": "node-0",
         "started": "5m",
+        "age_seconds": age_seconds,
         "deleting": deleting,
         "deleting_age": deleting_age,
+        "deleting_seconds": deleting_seconds,
         "last_terminated": {},
         "protected": protected,
     }
@@ -73,10 +76,33 @@ def test_findings_maps_pod_reasons(no_workload):
     assert "odd-pod" not in by_name
 
 
+def test_findings_acts_on_one_cause_per_pod(no_workload):
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("crashing", ["CrashLoopBackOff", "OOMKilled"], restarts=5),
+    ]))
+    assert [(item["name"], item["cause"]) for item in found] == [
+        ("crashing", "oom")]
+
+
 def test_findings_reports_stuck_terminating_pods(no_workload):
     found = ops_controller.findings(_snapshot(pods=[
         _pod("stuck", deleting=True, deleting_age="17m")]))
     assert found[0]["cause"] == "stuck"
+
+
+def test_findings_ignores_a_normal_termination(no_workload):
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("shutting-down", deleting=True, deleting_age="4s",
+             deleting_seconds=4)]))
+    assert found == []
+
+
+def test_findings_reports_a_long_termination(no_workload):
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("stuck", deleting=True, deleting_age="17m",
+             deleting_seconds=1020)]))
+    assert [(item["name"], item["cause"]) for item in found] == [
+        ("stuck", "stuck")]
     assert "17m" in found[0]["observation"]
 
 
@@ -126,6 +152,50 @@ def test_findings_deduplicate_repeated_reasons(no_workload):
     found = ops_controller.findings(_snapshot(pods=[
         _pod("api-1", ["CrashLoopBackOff", "CrashLoopBackOff"])]))
     assert len(found) == 1
+
+
+def test_findings_ignores_pods_inside_startup_grace(no_workload):
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("starting", ["Pending"], phase="Pending", age_seconds=3),
+        _pod("warming", ["NotReady"], age_seconds=90),
+    ]))
+    assert found == []
+
+
+def test_findings_reports_pods_after_startup_grace(no_workload):
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("stuck", ["Pending"], phase="Pending"),
+        _pod("unready", ["NotReady"]),
+    ]))
+    assert {item["name"]: item["cause"] for item in found} == {
+        "stuck": "scheduling", "unready": "not_ready"}
+
+
+def test_findings_unschedulable_is_reported_immediately(no_workload):
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("nosched", ["Unschedulable", "Pending"], phase="Pending",
+             age_seconds=2),
+    ]))
+    assert [(item["name"], item["cause"]) for item in found] == [
+        ("nosched", "scheduling")]
+
+
+def test_findings_young_pod_does_not_flag_its_deployment(monkeypatch):
+    monkeypatch.setattr(ops_controller, "_workload_for",
+                        lambda pod, namespace: ("Deployment", "api"))
+    found = ops_controller.findings(_snapshot(
+        pods=[_pod("api-1", ["Pending"], phase="Pending", age_seconds=4)],
+        deployments=[_deploy("api", ["Unavailable"])],
+    ))
+    assert found == []
+
+
+def test_findings_startup_grace_can_be_disabled(no_workload, monkeypatch):
+    monkeypatch.setattr(ops_controller, "STARTUP_GRACE", 0)
+    found = ops_controller.findings(_snapshot(pods=[
+        _pod("starting", ["Pending"], phase="Pending", age_seconds=3)]))
+    assert [(item["name"], item["cause"]) for item in found] == [
+        ("starting", "scheduling")]
 
 
 # --------------------------------------------------------------------------- #

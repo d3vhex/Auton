@@ -1,0 +1,181 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: auton
+    auton.io/protect: "true"
+spec:
+  replicas: {{ .Values.agent.replicas }}
+  strategy:
+    type: Recreate          # RWO workspace PVC
+  selector:
+    matchLabels:
+      app: auton
+  template:
+    metadata:
+      labels:
+        {{- include "auton.labels" . | nindent 8 }}
+        app: auton
+        # The ops controller never repairs itself or its own namespace.
+        auton.io/protect: "true"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.agent.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # local-path does not apply fsGroup, so a root init container fixes the
+      # existing workspace once. Without it /workspace stays unwritable.
+      initContainers:
+        - name: fix-workspace-owner
+          image: {{ include "auton.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: auton
+          image: {{ include "auton.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- $env := dict
+            "HOME" "/tmp"
+            "TMPDIR" "/tmp"
+            "PYTHONDONTWRITEBYTECODE" "1"
+            "AGENT_WORKSPACE" "/workspace"
+            "AGENT_MODEL" .Values.agent.model
+            "AGENT_NUM_CTX" (toString .Values.agent.numCtx)
+            "MAX_STEPS" (toString .Values.agent.maxSteps)
+            "AGENT_MAX_OBSERVATION_CHARS" (toString .Values.agent.maxObservationChars)
+            "AGENT_MAX_HISTORY_CHARS" (toString .Values.agent.maxHistoryChars)
+            "AGENT_MAX_QUEUE" (toString .Values.agent.maxQueue)
+            "AGENT_JOB_TIMEOUT" (toString .Values.agent.jobTimeout)
+            "AGENT_SANDBOX" "off"
+            "AGENT_MODEL_DIR" "/etc/auton-model"
+            "OLLAMA_HOST" .Values.provider.baseUrl
+            "AGENT_NAMESPACES" (printf "%s,%s" (include "auton.namespace" .) (include "auton.appsNamespace" .))
+            "AGENT_AUDIT_DIR" "/workspace/.ops"
+            "AGENT_K8S_ENABLED" "1"
+            "AGENT_K8S_WRITE" "1"
+            "N8N_API_URL" (printf "%s/api/v1" (include "auton.n8nUrl" .))
+            "N8N_WEBHOOK_BASE" (printf "%s/webhook" (include "auton.n8nUrl" .))
+            "N8N_API_KEY_FILE" "/etc/n8n-api/api-key"
+          }}
+          {{- range $key, $value := .Values.agent.env }}
+          {{- $_ := set $env $key (toString $value) }}
+          {{- end }}
+          env:
+            # valueFrom entries cannot live in the map above.
+            - name: AGENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AGENT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "auton.tokenSecretName" .) .Values.agent.auth.existingSecret }}
+                  key: token
+            {{- range $key, $value := $env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+            - name: model-config
+              mountPath: /etc/auton-model/config
+              readOnly: true
+            - name: model-secret
+              mountPath: /etc/auton-model/secret
+              readOnly: true
+            - name: n8n-api
+              mountPath: /etc/n8n-api
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: {{ include "auton.agentClaim" . }}
+        - name: tmp
+          emptyDir: {}
+        - name: model-config
+          configMap:
+            name: auton-model-config
+        - name: model-secret
+          secret:
+            secretName: {{ default (include "auton.modelSecretName" .) .Values.provider.existingSecret }}
+            optional: true
+        - name: n8n-api
+          secret:
+            secretName: {{ default .Values.n8n.apiKey.secretName .Values.n8n.apiKey.existingSecret }}
+            optional: true
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auton
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: auton
+spec:
+  type: {{ .Values.agent.service.type }}
+  selector:
+    app: auton
+  ports:
+    - name: http
+      port: {{ .Values.agent.service.port }}
+      targetPort: 8080

@@ -1,0 +1,154 @@
+{{- if .Values.ops.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton-ops
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: auton-ops
+    auton.io/protect: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: never run two pods at once
+  selector:
+    matchLabels:
+      app: auton-ops
+  template:
+    metadata:
+      labels:
+        {{- include "auton.labels" . | nindent 8 }}
+        app: auton-ops
+        auton.io/protect: "true"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.ops.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: fix-workspace-owner
+          image: {{ include "auton.opsImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: ops
+          image: {{ include "auton.opsImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "ops_controller.py"]
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: AGENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AGENT_NAMESPACES
+              value: {{ printf "%s,%s" (include "auton.namespace" .) (include "auton.appsNamespace" .) | quote }}
+            - name: AGENT_OPS_NAMESPACES
+              value: {{ join "," .Values.ops.namespaces | quote }}
+            - name: AGENT_K8S_ENABLED
+              value: "1"
+            - name: AGENT_K8S_WRITE
+              value: "1"
+            - name: AGENT_AUDIT_DIR
+              value: /workspace/.ops
+            - name: AGENT_INCIDENTS_DIR
+              value: /workspace/.ops/incidents
+            - name: AGENT_OPS_INTERVAL
+              value: {{ .Values.ops.interval | quote }}
+            - name: AGENT_OPS_COOLDOWN
+              value: {{ .Values.ops.cooldown | quote }}
+            - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
+              value: {{ .Values.ops.maxActionsPerHour | quote }}
+            - name: AGENT_OPS_STARTUP_GRACE
+              value: {{ .Values.ops.startupGrace | quote }}
+            - name: AGENT_OPS_TERMINATION_GRACE
+              value: {{ .Values.ops.terminationGrace | quote }}
+            - name: AGENT_OPS_MAX_MEMORY
+              value: {{ .Values.ops.maxMemory | quote }}
+            - name: AGENT_OPS_MAX_INCIDENTS
+              value: {{ .Values.ops.maxIncidents | quote }}
+            - name: AGENT_OPS_DRY_RUN
+              value: {{ ternary "1" "0" .Values.ops.dryRun | quote }}
+            - name: AGENT_OPS_HEARTBEAT
+              value: {{ .Values.ops.heartbeat | quote }}
+            - name: AGENT_API_URL
+              value: {{ .Values.ops.apiUrl | quote }}
+            - name: AGENT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (include "auton.tokenSecretName" .) .Values.agent.auth.existingSecret }}
+                  key: token
+            - name: AGENT_UI_URL
+              value: {{ .Values.ops.uiUrl | quote }}
+            - name: N8N_OPS_WEBHOOK
+              value: {{ .Values.ops.n8nWebhook | quote }}
+          resources:
+            {{- toYaml .Values.ops.resources | nindent 12 }}
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, sys, time
+                  path = "{{ .Values.ops.heartbeat }}"
+                  sys.exit(0 if os.path.exists(path)
+                           and time.time() - os.path.getmtime(path) < 1800 else 1)
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            failureThreshold: 3
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: {{ include "auton.opsClaim" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.ops.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ops.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ops.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

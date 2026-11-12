@@ -1,0 +1,228 @@
+# Default values for the Auton chart.
+#
+# The chart mirrors yamls/ in the repository, but is meant to be installable
+# from Docker Hub images without a local build:
+#
+#   helm install auton oci://registry-1.docker.io/d3vhex/charts/auton \
+#     --namespace auton --create-namespace \
+#     --set agent.auth.token="$(openssl rand -hex 24)"
+#
+# Everything the agent needs to be safe (RBAC, audit PVC, namespace split) is
+# created by the chart. Ollama and n8n are optional so the chart also works on
+# a cluster that already has them.
+
+# Fixed resource names are intentional: the agent's own docs, the generated n8n
+# workflow and the ops controller all address "auton:8080" by DNS.
+nameOverride: ""
+
+namespace:
+  # Create the application namespace. Set to false when installing with
+  # --create-namespace or into an existing namespace.
+  create: true
+  name: auton
+
+appsNamespace:
+  # Namespace the operation agent may repair without being asked. Keep it
+  # separate from the control plane namespace so a bad repair cannot take the
+  # API down.
+  create: true
+  name: auton-apps
+
+image:
+  repository: docker.io/d3vhex/auton
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  # IfNotPresent is right for a pinned tag; use Always with a moving tag.
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+agent:
+  replicas: 1
+  service:
+    type: ClusterIP
+    port: 8080
+  auth:
+    # Either point at a Secret you manage (it must have key `token`) or let the
+    # chart generate/keep one. A generated token is stable across upgrades.
+    existingSecret: ""
+    secretName: auton-api-token
+    token: ""
+  workspace:
+    # Use a claim you already have (e.g. a RWX volume on a multi-node cluster).
+    existingClaim: ""
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 5Gi
+    # Keep the PVC on `helm uninstall`: it holds the audit log, incidents and
+    # the agent's workspace.
+    keep: true
+  # Agent loop tuning (see mcp/README.md).
+  model: qwen2.5-coder:7b-instruct
+  numCtx: 16384
+  maxSteps: 25
+  maxObservationChars: 8000
+  maxHistoryChars: 60000
+  maxQueue: 8
+  jobTimeout: 900
+  # Extra env vars, e.g. AGENT_K8S_WRITE: "0" for a read-only install.
+  env: {}
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+ops:
+  enabled: true
+  # Defaults to the agent image when empty.
+  image: {}
+  interval: 60
+  cooldown: 1800
+  maxActionsPerHour: 6
+  # Seconds a Pending/NotReady pod is ignored after it starts, so image pulls
+  # and container startup are not reported as incidents. 0 disables it.
+  startupGrace: 120
+  # Seconds a pod may stay Terminating before it is treated as stuck.
+  terminationGrace: 120
+  maxMemory: 2Gi
+  maxIncidents: 500
+  dryRun: false
+  # Namespaces the controller may repair. RBAC is created for appsNamespace
+  # only; add namespaces here together with your own Role if you extend it.
+  namespaces:
+    - auton-apps
+  heartbeat: /tmp/ops-heartbeat
+  apiUrl: http://auton:8080
+  uiUrl: http://auton.localhost
+  # n8n webhook that fans reports out to Slack/Telegram. Empty disables it.
+  n8nWebhook: ""
+  workspace:
+    # On a multi-node cluster give the controller its own RWO claim; the
+    # ingest endpoint keeps the API view complete.
+    existingClaim: ""
+    create: false
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 5Gi
+    keep: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+provider:
+  name: ollama            # ollama | openai | gemini | anthropic | custom
+  baseUrl: http://ollama-service:11434
+  model: qwen2.5-coder:7b-instruct
+  maxTokens: 1024
+  dataPolicy: redact      # redact | allow | local-only
+  # Create Secret auton-model from apiKey, or reuse an existing Secret with
+  # key `api-key`. An empty key is valid for ollama.
+  existingSecret: ""
+  secretName: auton-model
+  apiKey: ""
+
+ollama:
+  enabled: false
+  image: ollama/ollama:latest
+  imagePullPolicy: IfNotPresent
+  model: qwen2.5-coder:7b-instruct
+  # Pull the model into the PVC after install/upgrade. This is idempotent.
+  pullModel: true
+  gpu:
+    enabled: true
+    resourceName: amd.com/gpu
+    count: 1
+  env:
+    HSA_OVERRIDE_GFX_VERSION: "10.3.0"
+    OLLAMA_KEEP_ALIVE: 30m
+    OLLAMA_FLASH_ATTENTION: "1"
+    OLLAMA_KV_CACHE_TYPE: q8_0
+    OLLAMA_NUM_PARALLEL: "1"
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 20Gi
+    keep: true
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      memory: 12Gi
+
+n8n:
+  enabled: false
+  image: docker.n8n.io/n8nio/n8n:latest
+  imagePullPolicy: IfNotPresent
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 5Gi
+    keep: true
+  # Public-API key used by the agent's n8n tools. Create it in the n8n UI and
+  # either set it here or point at a Secret you manage; the mount is optional,
+  # so an absent key only makes the n8n tools return a clear error.
+  apiKey:
+    existingSecret: ""
+    secretName: n8n-api
+    value: ""
+  notify:
+    # Optional ops notification targets (n8n environment variables). Leave
+    # empty to skip the Secret; the generated workflow then logs an error.
+    existingSecret: ""
+    secretName: n8n-notify
+    slackWebhook: ""
+    telegramBotToken: ""
+    telegramChatId: ""
+  host: n8n.localhost
+  env:
+    GENERIC_TIMEZONE: Europe/Istanbul
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+ingress:
+  enabled: false
+  className: traefik
+  annotations: {}
+  hosts:
+    - host: auton.localhost
+      service: auton
+      port: 8080
+    - host: agent.localhost
+      service: auton
+      port: 8080
+  tls: []
+
+rbac:
+  create: true
+  # Cluster-scoped read-only access for diagnosis (nodes, PVs, CRDs, ...).
+  clusterReader: true
+
+serviceAccount:
+  agent:
+    create: true
+    name: auton-agent
+  ops:
+    create: true
+    name: auton-ops
+
+# Namespace labels applied to both created namespaces (the standard
+# app.kubernetes.io/* labels are added by the helpers).
+namespaceLabels: {}
