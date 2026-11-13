@@ -82,6 +82,13 @@ def test_ui_is_served_without_auth(server, secured):
             html = response.read().decode("utf-8")
         assert "<title>Auton" in html
         assert "/incidents" in html and "/audit" in html
+        # The token flow explains itself instead of a bare prompt().
+        assert "auton-api-token" in html and "localStorage" in html
+        assert "auth-banner" in html and "auth-modal" in html
+        # Provider settings are editable from the page.
+        for field in ("p-provider", "p-base", "p-model", "p-tokens",
+                      "p-policy", "p-key", "provider-save"):
+            assert field in html, field
 
     status, payload = _request("GET", f"{server}/health")
     assert status == 200 and payload["status"] == "ok"
@@ -360,3 +367,88 @@ def test_incidents_endpoints_require_a_token(server, secured, incident_store):
                          {"id": "inc-1"})
     assert status == 401
     assert _request("GET", f"{server}/incidents", headers=_auth())[0] == 200
+
+
+# --------------------------------------------------------------------------- #
+# Auth check + provider settings (UI write path)
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture()
+def provider_files(tmp_path, monkeypatch):
+    import llm
+
+    root = tmp_path / "model"
+    (root / "config").mkdir(parents=True)
+    (root / "secret").mkdir(parents=True)
+    (root / "config" / "provider").write_text("ollama\n")
+    (root / "config" / "base_url").write_text(llm.DEFAULT_BASE["ollama"] + "\n")
+    (root / "config" / "model").write_text(llm.DEFAULT_MODELS["ollama"] + "\n")
+    (root / "config" / "max_tokens").write_text("1024\n")
+    (root / "config" / "data_policy").write_text("redact\n")
+    monkeypatch.setenv("AGENT_MODEL_DIR", str(root))
+    monkeypatch.setenv("AGENT_PROVIDER_STORE", "files")
+    monkeypatch.delenv("AGENT_LLM_API_KEY", raising=False)
+    return root
+
+
+def test_auth_check_validates_the_token(server, secured):
+    status, payload = _request("GET", f"{server}/auth/check")
+    assert status == 401 and payload["error"] == "unauthorized"
+
+    status, payload = _request("GET", f"{server}/auth/check", headers=_auth())
+    assert status == 200 and payload["ok"] is True
+    assert payload["auth"] == "bearer"
+
+
+def test_unauthorized_response_advertises_bearer(server, secured):
+    request = urllib.request.Request(f"{server}/auth/check")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request, timeout=5)
+    assert exc.value.code == 401
+    assert exc.value.headers["WWW-Authenticate"].startswith("Bearer")
+
+
+def test_health_reports_the_auth_mode(server, secured):
+    payload = _request("GET", f"{server}/health")[1]
+    assert payload["auth"] == "bearer"
+
+
+def test_provider_settings_round_trip(server, provider_files, audit_dir):
+    status, payload = _request("POST", f"{server}/provider", {
+        "provider": "openai", "api_key": "sk-test-roundtrip-123",
+        "max_tokens": 2048,
+    })
+    assert status == 200
+    assert payload["provider"] == "openai"
+    assert payload["local_model_enabled"] is False
+    assert payload["api_key_change"] == "set"
+    assert "sk-test-roundtrip" not in json.dumps(payload)
+
+    assert (provider_files / "config" / "max_tokens").read_text().strip() == "2048"
+    assert (provider_files / "secret" / "api-key").read_text().strip() == \
+        "sk-test-roundtrip-123"
+
+    listed = _request("GET", f"{server}/provider")[1]
+    assert listed["provider"] == "openai"
+    assert listed["api_key_set"] is True
+    assert listed["editable"] is True
+
+    status, payload = _request("DELETE", f"{server}/provider/key")
+    assert status == 200 and payload["api_key_set"] is False
+    assert not (provider_files / "secret" / "api-key").exists()
+    assert "sk-test-roundtrip" not in (audit_dir / "audit.jsonl").read_text()
+
+
+def test_provider_settings_reject_invalid_payload(server, provider_files):
+    status, payload = _request("POST", f"{server}/provider",
+                               {"provider": "openai"})
+    assert status == 400 and "API key" in payload["error"]
+
+    status, payload = _request("POST", f"{server}/provider", {"nope": 1})
+    assert status == 400 and "unknown field" in payload["error"]
+
+
+def test_provider_write_requires_a_token(server, secured, provider_files):
+    assert _request("POST", f"{server}/provider",
+                    {"max_tokens": 2048})[0] == 401
+    assert _request("DELETE", f"{server}/provider/key")[0] == 401

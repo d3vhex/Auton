@@ -13,14 +13,33 @@ manifests, trust the code/manifests.
   asked); the AMD device plugin lives in `kube-system` and must exist before
   pods can request `amd.com/gpu`.
 - Workloads/services all named `auton`: Deployment `auton`, Service `auton:8080`,
-  image `auton:local`. Plus `ollama-service:11434` and `n8n:5678`.
-  **All Services are ClusterIP**; Traefik hosts are
+  image `auton:local`. Plus `ollama-service:11434`, `n8n:5678` and
+  `redis:6379`. **All Services are ClusterIP**; Traefik hosts are
   `auton`/`agent`/`ollama`/`n8n`.localhost.
-- Deployment `auton-ops` runs `ops_controller.py` as ServiceAccount
-  `auton-ops`; it shares the `agent-workspace` PVC (single-node RWO) so its
-  audit log and incident files are the ones the API reads. It repairs only
-  `auton-apps` and is read-only in `auton`, so it cannot touch the API, Ollama,
-  n8n or its own Deployment.
+- Five pod roles, four ServiceAccounts (`yamls/auton-rbac.yaml`):
+  - `auton` — HTTP API + UI, **producer only** under `auton-api` (may only
+    `patch` the named ConfigMap `auton-model-config` and Secret `auton-model`).
+  - `auton-scanner` ×2 — read-only detection under `auton-scanner`; snapshots
+    `auton-apps` and submits repair tasks to the queue.
+  - `auton-worker` ×2 — the playbooks, the only writers, under `auton-worker`
+    (read + pod delete + Deployment patch/scale in `auton-apps` only).
+  - `auton-ops` ×1 — the LLM executor (`agent_worker.py`) under `auton-agent`
+    (repair in both namespaces + cluster read-only).
+  - `redis` ×1 — one instance, AOF on `redis-data`, no ServiceAccount, no
+    password by default (ClusterIP only). It holds task hashes, streams, locks,
+    cooldowns, the hourly budget and the GPU slot — never a Secret value.
+- `AGENT_QUEUE` selects the backend: `memory` (default for local runs/tests) or
+  `redis` (the cluster manifests). **No silent fallback** — with `redis` and an
+  unreachable server the API refuses to start. The scanners/workers/executor
+  also fail closed rather than dropping work.
+- Two queues: `repair` (critical/normal streams) and `agent`. Different
+  resources run in parallel, the same resource is serialised by
+  `auton:lock:{ns}/{resource}`; a task lease (300 s) makes a crashed worker's
+  task recoverable (`TaskStore.recover()`), and repair retries reuse the same
+  incident.
+- `auton-worker`/`auton-ops` share the `agent-workspace` PVC (single-node RWO)
+  so their audit log and incident files are the ones the API reads. The scanner
+  deliberately does **not** mount it (`/tmp` emptyDir + a private incident dir).
 - Manifests live in `yamls/` (not the repo root).
 - PVCs use `local-path`: data survives pod restarts and a `k3d cluster
   stop`/`start` but **not** `k3d cluster delete`. The model is pulled onto the
@@ -44,6 +63,11 @@ manifests, trust the code/manifests.
   no PVC delete, no namespace delete. Cluster scope is read-only via the
   `auton-cluster-reader` ClusterRole (nodes, PVs, CRDs, storage classes,
   apiservices, metrics). `pods/exec` is granted because diagnosis needs it.
+- `auton-api` is the API pod's *narrow* identity (patch only ConfigMap
+  `auton-model-config` and Secret `auton-model`, by `resourceNames`). The API
+  Deployment now uses it: tool execution moved to `deployment/auton-ops`, so a
+  bug in the HTTP/UI layer cannot delete a pod. `tests/test_rbac.py` enforces
+  the shape of all four identities.
 
 ## Deploying changes
 
@@ -53,27 +77,36 @@ manifests, trust the code/manifests.
 - Bootstrap order: `namespace.yaml` → `auton-apps.yaml` → Secret
   `auton-api-token` → `auton-rbac.yaml` → `auton-model.yaml` →
   `ollama-deployment.yaml` → pull the model → build/import `auton:local` →
-  `agent-deployment.yaml` → `auton-ops-deployment.yaml` →
+  `redis.yaml` → `agent-deployment.yaml` → `auton-ops-deployment.yaml` →
+  `auton-scanner-deployment.yaml` → `auton-worker-deployment.yaml` →
   `n8n-deployment.yaml` → `ingress.yaml`.
+  Redis comes **before** the API: `AGENT_QUEUE=redis` with no reachable Redis
+  makes the service refuse to start.
 - The agent image is local-only, not from a registry:
   ```bash
   docker build -t auton:local ./mcp
   k3d image import auton:local -c ai-cluster
-  kubectl apply -f yamls/agent-deployment.yaml
-  kubectl -n auton rollout restart deploy/auton   # after any rebuild
+  kubectl apply -f yamls/redis.yaml
+  kubectl apply -f yamls/agent-deployment.yaml yamls/auton-ops-deployment.yaml \
+    yamls/auton-scanner-deployment.yaml yamls/auton-worker-deployment.yaml
+  kubectl -n auton rollout restart deploy/auton deploy/auton-ops \
+    deploy/auton-scanner deploy/auton-worker   # after any rebuild
   ```
   `imagePullPolicy: IfNotPresent` is why the imported image is used.
 - `scripts/install.sh` is the executable runbook (cluster → GPU plugin → Ollama
-  → model → image → agent/ops → n8n → ingress, then a verification pass). It
-  is idempotent, keeps an existing token/PVC, and `--verify` re-runs only the
-  checks. Use `AUTON_IMAGE` to deploy a registry image instead of `auton:local`.
+  → model → image → Redis → API/executor/scanners/workers → n8n → ingress, then
+  a verification pass). It is idempotent, keeps an existing token/PVC, and
+  `--verify` re-runs only the checks (11 of them). Use `AUTON_IMAGE` to deploy a
+  registry image instead of `auton:local`.
 - `mcp/Dockerfile` explicitly `COPY`s the Python modules (currently
-  `agent_core.py agent_server.py agent_client.py agent_service.py audit.py
-  incidents.py k8s_tools.py llm.py n8n_tools.py playbooks.py
-  ops_controller.py`) **and** the `ui/` directory. Any new module/page must be
-  added there or it will be missing inside the pod. The image also installs
-  `git`, `ripgrep`, `bubblewrap` and **kubectl v1.35.5** (matches the server
-  minor); `tests/` and `.venv/` are excluded via `.dockerignore`.
+  `agent_core.py agent_server.py agent_client.py agent_service.py
+  agent_worker.py audit.py incidents.py k8s_tools.py llm.py n8n_tools.py
+  ops_controller.py ops_queue.py ops_scanner.py ops_worker.py playbooks.py
+  provider_admin.py task_store.py`) **and** the `ui/` directory. Any new
+  module/page must be added there or it will be missing inside the pod. The
+  image also installs `git`, `ripgrep`, `bubblewrap` and **kubectl v1.35.5**
+  (matches the server minor); `tests/` and `.venv/` are excluded via
+  `.dockerignore`.
 - Never apply `yamls/ollama-deployment.yaml.orig`; it creates a second Ollama in
   the `default` namespace that competes for the GPU.
 - Do not change the Deployments' `strategy: Recreate` while PVCs are
@@ -82,15 +115,28 @@ manifests, trust the code/manifests.
   It is deliberately one file: no bundler, no CDN, no external assets (the pod
   may have no egress). It keeps the bearer token in `localStorage` and talks to
   the same origin only. Keep it that way; putting data in the page would make
-  the open route a leak.
-- `charts/auton` is the Helm equivalent of `yamls/` (agent + ops + RBAC + PVCs,
-  optional Ollama/n8n/ingress). Resource names are intentionally fixed
-  (`auton`, `auton-ops`) because docs and generated n8n workflows use
-  `auton:8080`; do not add a release-name prefix without changing them.
-  `scripts/publish.sh` builds/pushes `docker.io/d3vhex/auton` and the OCI chart
-  (`oci://registry-1.docker.io/d3vhex/charts/auton`); `--no-push` is the local
-  check. PVCs and the API-token Secret carry `helm.sh/resource-policy: keep`.
-  On this k3d cluster adopt the existing install with `--take-ownership` and
+  the open route a leak. Auth is explained, not hidden: the **API access**
+  modal says why a token exists, prints the `kubectl get secret` command, and
+  `GET /auth/check` validates before saving. A banner stays while no valid
+  token is stored and any `401` re-opens the modal — do not go back to a bare
+  `prompt()`. Only one component may write the health chip (`refreshHealth`);
+  the old duplicate writes produced a stale “API unreachable” next to “API ok”.
+- The Provider tab is a **write** form (`POST /provider`,
+  `DELETE /provider/key`) backed by `mcp/provider_admin.py`: validate first,
+  `audit.begin("provider_update", …)` before the write, key value never in the
+  audit record, `400` for anything the agent would refuse at request time
+  (remote without key, `local-only` + remote, `custom` without base_url).
+- `charts/auton` is the Helm equivalent of `yamls/` (API + scanner + worker +
+  LLM executor + Redis + RBAC + PVCs, optional Ollama/n8n/ingress). Resource
+  names are intentionally fixed (`auton`, `auton-ops`, `auton-scanner`,
+  `auton-worker`, `redis`) because docs and generated n8n workflows use
+  `auton:8080`; do not add a release-name prefix without changing them. The
+  chart's `validate.yaml` fails the render on `queue.backend=redis` without
+  Redis. `scripts/publish.sh` builds/pushes `docker.io/d3vhex/auton` and the OCI
+  chart (`oci://registry-1.docker.io/d3vhex/charts/auton`); `--no-push` is the
+  local check. PVCs and the API-token Secret carry
+  `helm.sh/resource-policy: keep`. On this k3d cluster adopt the existing
+  install with `--take-ownership` and
   `--set agent.workspace.existingClaim=agent-workspace` (the bound PVC's
   `storageClassName` is immutable).
 - `yamls/gpu-test.yaml` is a one-shot `rocminfo` smoke test. Delete the pod after
@@ -110,9 +156,12 @@ manifests, trust the code/manifests.
     fallback, then verifies the key through `n8n_workflows("list")`.
   - `auton-model` key `api-key` — API key for the active remote provider
     (empty for `ollama`). Written by `scripts/set-provider.sh` from a file or
-    stdin, never from argv. Read per request, so a key rotation needs no
+    stdin, never from argv, **or** from the UI through `POST /provider`
+    (`mcp/provider_admin.py`). Read per request, so a key rotation needs no
     restart. `yamls/auton-model.yaml` also defines ConfigMap
     `auton-model-config` (provider/base_url/model/max_tokens/data_policy).
+    Only the `auton-api` ServiceAccount may `patch` these two named objects;
+    the audit record says “key set/cleared”, never the value.
 
 ## Agent code (`mcp/`)
 
@@ -148,15 +197,15 @@ manifests, trust the code/manifests.
   fuzzy beyond quotes: silent wrong-place edits are worse than a retry.
 - `agent_server.py` uses `mcp.server.mcpserver.MCPServer`, a **v2-only** API.
   Keep `requirements.txt` at `mcp>=2,<3`; do not downgrade to MCP v1.
-  33 tools total: workspace (`list_directory`, `read_file`, `write_file`,
+  34 tools total: workspace (`list_directory`, `read_file`, `write_file`,
   `edit_file`, `apply_patch`), search (`grep`, `glob`), shell (`bash`, `job`,
   `run_tests`), git (`git_status`, `git_diff`), housekeeping (`fs`,
   `todo_write`), Kubernetes (`k8s_get`, `k8s_describe`, `k8s_logs`,
   `k8s_snapshot`, `k8s_diagnose`, `k8s_events`, `k8s_wait`, `k8s_apply`,
-  `k8s_patch`, `k8s_scale`, `k8s_rollout`, `k8s_delete`, `k8s_exec`) and n8n
+  `k8s_patch`, `k8s_scale`, `k8s_rollout`, `k8s_delete`, `k8s_exec`), n8n
   (`n8n_workflows`, `n8n_activate`, `n8n_executions`, `n8n_webhook`,
-  `n8n_create_agent_pipeline`, `n8n_create_ops_pipeline`). `run_command` is a
-  deprecated alias for `bash`.
+  `n8n_create_agent_pipeline`, `n8n_create_ops_pipeline`) and the queue
+  (`task_queue`). `run_command` is a deprecated alias for `bash`.
 - `audit.py` is the gate for **every** mutation: `k8s_tools._audited()` calls
   `audit.begin()` (JSONL append + fsync + SQLite index under `AGENT_AUDIT_DIR`,
   default `/workspace/.ops`) *before* kubectl runs, and returns an error without
@@ -276,7 +325,7 @@ point at the system Python, so a Python upgrade leaves it broken.
 
 - Run the agent test suite before rebuilding the image:
   `cd mcp && python -m pytest tests -q` (no cluster or GPU needed; expect
-  `221 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
+  `246 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
   grants secrets or PVC delete.
 - To measure real model behaviour, run the eval harness against a live Ollama:
   `cd mcp && python eval/run_eval.py` (or `--list`, `--only N`, `--verbose`).

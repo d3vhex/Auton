@@ -42,7 +42,10 @@ spec:
         app: auton
         auton.io/protect: "true"
     spec:
-      serviceAccountName: auton-agent
+      # Narrow identity: the API pod may only patch the two provider objects.
+      # The agent loop (and its kubectl tools) runs in `deployment/auton-ops`
+      # under `auton-agent`, so this pod needs no cluster read/write at all.
+      serviceAccountName: auton-api
       securityContext:
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
@@ -97,6 +100,16 @@ spec:
         # Provider config is read per request from this projected volume.
         - name: AGENT_MODEL_DIR
           value: "/etc/auton-model"
+        # The UI writes provider settings through POST /provider. These are the
+        # only objects the API identity may patch (see the auton-api Role).
+        - name: AGENT_PROVIDER_STORE
+          value: "kubectl"
+        - name: AGENT_PROVIDER_NAMESPACE
+          value: "auton"
+        - name: AGENT_PROVIDER_CONFIGMAP
+          value: "auton-model-config"
+        - name: AGENT_PROVIDER_SECRET
+          value: "auton-model"
         - name: MAX_STEPS
           value: "25"
         # Context budget: ollama defaults to a small num_ctx, which truncates
@@ -107,7 +120,16 @@ spec:
           value: "8000"
         - name: AGENT_MAX_HISTORY_CHARS
           value: "60000"
-        # Jobs: one worker, FIFO. Sync /run still works for n8n.
+        # Jobs: the API is the producer when AGENT_QUEUE=redis; `deployment/auton-ops`
+        # is the executor. `memory` keeps the old single-process worker for
+        # local runs and tests. There is no silent fallback: with redis and an
+        # unreachable Redis the service refuses to start.
+        - name: AGENT_QUEUE
+          value: "redis"
+        - name: AGENT_REDIS_URL
+          value: "redis://redis.auton.svc.cluster.local:6379/0"
+        - name: AGENT_QUEUE_PREFIX
+          value: "auton"
         - name: AGENT_MAX_QUEUE
           value: "8"
         - name: AGENT_JOB_TIMEOUT

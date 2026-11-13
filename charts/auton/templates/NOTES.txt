@@ -5,19 +5,39 @@ The API is a ClusterIP service; the UI is served at "/":
   kubectl -n {{ .Release.Namespace }} port-forward svc/auton 8080:8080
   open http://localhost:8080/
 
-Paste the bearer token into the UI ("Set token"):
+Paste the bearer token into the UI ("API access"):
 
   kubectl -n {{ .Release.Namespace }} get secret {{ default "auton-api-token" .Values.agent.auth.existingSecret }} \
     -o jsonpath='{.data.token}' | base64 -d
 
-Check the autonomous ops controller:
+The pods and what they may do:
 
-  kubectl -n {{ .Release.Namespace }} logs deploy/auton-ops --tail=50
-  kubectl -n {{ .Release.Namespace }} get incidents   # no CRD: use GET /incidents
+  auton          HTTP API + UI, queue producer only       ({{ .Values.serviceAccount.api.name }})
+  auton-scanner  read-only detection, ×{{ .Values.scanner.replicas }}                      ({{ .Values.serviceAccount.scanner.name }})
+  auton-worker   repair playbooks, ×{{ .Values.worker.replicas }}                          ({{ .Values.serviceAccount.worker.name }})
+  auton-ops      LLM executor, ×{{ .Values.ops.replicas }}                             ({{ .Values.serviceAccount.agent.name }})
+  redis          queue, locks, cooldown, budget           (no SA)
 
-{{- if .Values.ops.dryRun }}
-NOTE: ops is in DRY RUN mode (reports, never mutates). Disable with
-      --set ops.dryRun=false when you trust the findings.
+Watch the queue and the workers:
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/auton-scanner --tail=50
+  kubectl -n {{ .Release.Namespace }} logs deploy/auton-worker  --tail=50
+  kubectl -n {{ .Release.Namespace }} logs deploy/auton-ops     --tail=50
+  kubectl -n {{ .Release.Namespace }} exec deploy/redis -- redis-cli xlen auton:q:repair:normal
+
+The "Tasks" tab in the UI shows both queues (repair + agent), the queue depth,
+worker heartbeats and the hourly action budget.
+
+{{- if .Values.worker.dryRun }}
+NOTE: the workers are in DRY RUN mode (incident recorded as detected +
+      dry_run, nothing is mutated). Disable with --set worker.dryRun=false
+      when you trust the findings.
+{{- end }}
+
+{{- if eq .Values.queue.backend "memory" }}
+NOTE: queue.backend=memory keeps the queue inside one process. That is for
+      local development and tests only; the scanner and worker replicas would
+      not share it. Use the default `redis` for anything real.
 {{- end }}
 
 {{- if not .Values.ollama.enabled }}
@@ -41,6 +61,6 @@ your instance and create Secret {{ default "n8n-api" .Values.n8n.apiKey.existing
 with key api-key.
 {{- end }}
 
-PVCs are annotated helm.sh/resource-policy=keep, so `helm uninstall` preserves
-the workspace (audit log, incidents) and any model data. Delete them manually
-if you really want a clean slate.
+PVCs and the token Secret are annotated helm.sh/resource-policy=keep, so
+`helm uninstall` preserves the workspace (audit log, incidents), the Redis AOF
+and any model data. Delete them manually if you really want a clean slate.

@@ -15,6 +15,11 @@ Endpoints:
   GET  /incidents?limit=&status=-> incidents recorded by the ops controller
   GET  /incidents/{id}          -> one incident (state, actions, verification)
   POST /incidents/ingest        -> the ops controller records an incident
+  GET  /tasks?queue=&status=    -> every queued/running/finished task
+  GET  /tasks/{id}              -> one task with its log tail
+  GET  /tasks/stats             -> queue depth, active counts, workers, budget
+  POST /tasks                   -> enqueue a manual repair (or an agent job)
+  POST /tasks/{id}/cancel       -> cancel a queued task
   GET  /provider                -> active model provider (key masked)
   POST /provider/test           -> one tiny completion against the provider
 
@@ -22,9 +27,14 @@ Endpoints:
 everything else requires `Authorization: Bearer $AGENT_API_TOKEN`.
 The service refuses to start without a token unless AGENT_AUTH_DISABLED=1.
 
-One worker thread owns the GPU: jobs run FIFO, so two tasks never fight over
-VRAM. No extra deps — stdlib http.server only. Listen addr/port via AGENT_BIND
-(default 0.0.0.0) / AGENT_PORT (default 8080).
+With `AGENT_QUEUE=redis` this process is only a producer: `/run` enqueues an
+`agent` task and `deployment/auton-ops` runs it. `AGENT_QUEUE=memory` (default
+for local runs) keeps the in-process worker thread.
+
+One worker thread owns the GPU (memory mode) / one executor pod holds the GPU
+slot (redis mode), so two tasks never fight over VRAM. No extra deps — stdlib
+http.server only. Listen addr/port via AGENT_BIND (default 0.0.0.0) /
+AGENT_PORT (default 8080).
 
   python agent_service.py
 """
@@ -48,6 +58,9 @@ from agent_core import MODEL, OLLAMA_HOST, run_agent
 import audit
 import incidents
 import llm
+import ops_queue
+import provider_admin
+import task_store
 
 UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 
@@ -58,6 +71,15 @@ JOB_TIMEOUT = max(10, int(os.environ.get("AGENT_JOB_TIMEOUT", "900")))
 MAX_JOBS = max(10, int(os.environ.get("AGENT_MAX_JOBS", "100")))
 MAX_BODY = 2 * 1024 * 1024  # 2 MiB is plenty for a task string
 LOG_TAIL = 300
+
+# Where the LLM work runs. `memory` keeps the old single-process queue (local
+# development); `redis` makes the API a *producer* and hands execution to the
+# `auton-ops` pod. There is no silent fallback: a redis deployment with an
+# unreachable Redis refuses to start.
+QUEUE_KIND = (os.environ.get("AGENT_QUEUE", "memory").strip().lower()
+              or "memory")
+AGENT_STORE: "task_store.TaskStore | None" = None
+AGENT_STORE_ERROR = ""
 
 # Bearer auth. /health stays open (probes); everything else needs the token.
 # An empty token is a configuration error, so the handler fails closed and
@@ -119,6 +141,9 @@ class Job:
                         if self.started else 0),
             "stop_reason": (self.result or {}).get("stop_reason"),
             "error": self.error,
+            # The UI polls this; without it a finished job looked "running"
+            # forever (the events stream knew, the JSON payload did not).
+            "done": self.done.is_set(),
         }
 
     def payload(self) -> dict:
@@ -133,6 +158,116 @@ JOBS_LOCK = threading.Lock()
 QUEUE: "queue.Queue[str]" = queue.Queue()
 _WORKER: threading.Thread | None = None
 _WORKER_LOCK = threading.Lock()
+
+
+# --------------------------------------------------------------------------- #
+# Redis-backed agent jobs (API producer, `auton-ops` executor)
+# --------------------------------------------------------------------------- #
+
+def redis_mode() -> bool:
+    return QUEUE_KIND == "redis"
+
+
+def _agent_store() -> "task_store.TaskStore":
+    """Create (once) the Redis-backed task store; raises QueueError."""
+    global AGENT_STORE, AGENT_STORE_ERROR
+    if AGENT_STORE is not None:
+        return AGENT_STORE
+    try:
+        backend = ops_queue.create_backend(QUEUE_KIND)
+        AGENT_STORE = task_store.TaskStore(backend, max_queue=MAX_QUEUE)
+    except ops_queue.QueueError as exc:
+        AGENT_STORE_ERROR = str(exc)
+        raise
+    AGENT_STORE_ERROR = ""
+    return AGENT_STORE
+
+
+def _agent_store_quiet() -> "task_store.TaskStore | None":
+    try:
+        return _agent_store()
+    except ops_queue.QueueError:
+        return None
+
+
+class RemoteJob:
+    """Read-through view of one `agent` task in the shared task store.
+
+    The HTTP layer was written against the in-process `Job`; this class gives a
+    Redis task the same surface (`summary`, `payload`, `logs`, `done`, `wait`)
+    so `/jobs` keeps working when the executor is a different pod.
+    """
+
+    def __init__(self, store, task_id: str, record: dict | None = None):
+        self.store = store
+        self.id = task_id
+        self.done = threading.Event()
+        self._record: dict = {}
+        self._refresh(record)
+
+    def _refresh(self, record: dict | None = None) -> dict:
+        record = record or self.store.get(self.id) or {}
+        self._record = record
+        self.task = str(record.get("task") or "")
+        self.status = str(record.get("status") or "queued")
+        self.result = record.get("result") or None
+        self.error = (self.result or {}).get("error") if self.status == "error" \
+            else None
+        self.created = float(record.get("created_ts") or 0)
+        self.started = float(record.get("started_ts") or 0) or None
+        self.finished = float(record.get("finished_ts") or 0) or None
+        if self.status in task_store.TERMINAL:
+            self.done.set()
+        else:
+            self.done.clear()
+        return record
+
+    @property
+    def logs(self) -> list[str]:
+        try:
+            return self.store.logs(self.id)
+        except ops_queue.QueueError:
+            return []
+
+    def summary(self) -> dict:
+        self._refresh()
+        if self.started:
+            end = self.finished or time.time()
+            elapsed = round(end - self.started, 1)
+        else:
+            elapsed = 0
+        return {
+            "job_id": self.id,
+            "status": self.status,
+            "task": self.task,
+            "created": round(self.created, 3),
+            "started": self.started,
+            "finished": self.finished,
+            "elapsed": elapsed,
+            "stop_reason": (self.result or {}).get("stop_reason"),
+            "error": self.error,
+            "done": self.done.is_set(),
+        }
+
+    def payload(self) -> dict:
+        data = self.summary()
+        data["result"] = self.result
+        data["logs"] = self.logs[-60:]
+        return data
+
+    def cancel(self) -> "RemoteJob":
+        self.store.cancel(self.id, by="api")
+        self._refresh()
+        return self
+
+    def wait(self, timeout: float) -> bool:
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            self._refresh()
+            if self.done.is_set():
+                return True
+            time.sleep(0.5)
+        return self.done.is_set()
 
 
 # --------------------------------------------------------------------------- #
@@ -153,8 +288,19 @@ def _prune_locked() -> None:
         JOBS.pop(job.id, None)
 
 
-def submit(task: str) -> Job:
+def submit(task: str):
     """Queue a task. Raises QueueFull instead of piling up unbounded work."""
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None:
+            raise QueueFull(f"queue unavailable: {AGENT_STORE_ERROR}")
+        try:
+            record = store.submit("agent", {"task": task, "source": "api"},
+                                  actor="api")
+        except task_store.TaskError as exc:
+            raise QueueFull(str(exc)) from exc
+        return RemoteJob(store, record["id"], record)
+
     job = Job(task)
     with JOBS_LOCK:
         if QUEUE.qsize() >= MAX_QUEUE:
@@ -165,7 +311,42 @@ def submit(task: str) -> Job:
     return job
 
 
-def cancel_job(job_id: str) -> Job | None:
+def get_job(job_id: str):
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None or not task_store.valid_id(job_id):
+            return None
+        record = store.get(job_id)
+        if not record or record.get("queue") != "agent":
+            return None
+        return RemoteJob(store, job_id, record)
+    with JOBS_LOCK:
+        return JOBS.get(job_id)
+
+
+def list_jobs(limit: int = 50) -> list[dict]:
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None:
+            return []
+        return [RemoteJob(store, record["id"], record).summary()
+                for record in store.list(queue="agent", limit=limit)]
+    with JOBS_LOCK:
+        jobs = sorted(JOBS.values(), key=lambda j: j.created, reverse=True)
+    return [job.summary() for job in jobs[:limit]]
+
+
+def cancel_job(job_id: str):
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None or not task_store.valid_id(job_id):
+            return None
+        try:
+            record = store.cancel(job_id, by="api")
+        except task_store.TaskError:
+            return None
+        return RemoteJob(store, job_id, record)
+
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -176,6 +357,67 @@ def cancel_job(job_id: str) -> Job | None:
         job.finished = time.time()
         job.done.set()
     return job
+
+
+def queue_depth() -> int:
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None:
+            return 0
+        try:
+            return int(store.backend.xlen(store.stream("agent", "normal")))
+        except Exception:
+            return 0
+    return QUEUE.qsize()
+
+
+def jobs_running() -> int:
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None:
+            return 0
+        try:
+            return store.active_count("agent")
+        except Exception:
+            return 0
+    with JOBS_LOCK:
+        return sum(1 for j in JOBS.values() if j.status == "running")
+
+
+def jobs_known() -> int:
+    if redis_mode():
+        store = _agent_store_quiet()
+        if store is None:
+            return 0
+        try:
+            return int(store.backend.zcard(store.index_key()))
+        except Exception:
+            return 0
+    return len(JOBS)
+
+
+# --------------------------------------------------------------------------- #
+# Tasks (both queues: scanner repairs and agent jobs)
+#
+# `/jobs` is the n8n-facing view of agent runs; `/tasks` is the operator view of
+# *everything* the queue holds. It reads the same `TaskStore` the scanner,
+# workers and executor use, so the UI cannot show a status the workers do not
+# see. Submitting a repair from here is a queue write, not a mutation: the
+# worker validates, locks, budgets and audit-gates it exactly like a finding.
+# --------------------------------------------------------------------------- #
+
+def tasks_store() -> task_store.TaskStore:
+    """The store behind `/tasks` (same backend as the agent queue)."""
+    return _agent_store()
+
+
+def _manual_causes() -> dict[str, str]:
+    """cause -> severity for the UI's manual repair form."""
+    import ops_controller as ops  # lazy: the API does not own the repair loop
+
+    causes = {cause: severity for cause, severity in ops.REASONS.values()}
+    causes.update({cause: "warning" for cause in ops.REPORT_ONLY})
+    return causes
 
 
 def _worker_loop() -> None:
@@ -217,7 +459,13 @@ def _worker_loop() -> None:
 
 
 def start_worker() -> None:
-    """Start the single GPU worker (idempotent)."""
+    """Start the single GPU worker (idempotent).
+
+    In Redis mode the API is a producer only: the `auton-ops` pod owns the GPU
+    and the agent loop, so this process must never start a second worker.
+    """
+    if redis_mode():
+        return
     global _WORKER
     with _WORKER_LOCK:
         if _WORKER is not None and _WORKER.is_alive():
@@ -234,12 +482,15 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "auton/1"
 
     # -- plumbing --------------------------------------------------------- #
-    def _send(self, code: int, obj: dict) -> None:
+    def _send(self, code: int, obj: dict,
+              headers: dict | None = None) -> None:
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -293,7 +544,9 @@ class Handler(BaseHTTPRequestHandler):
         ):
             return True
         self._send(401, {"error": "unauthorized",
-                         "hint": "send 'Authorization: Bearer <token>'"})
+                         "hint": "send 'Authorization: Bearer <token>'",
+                         "token_url": "/auth/check"},
+                   headers={"WWW-Authenticate": 'Bearer realm="auton"'})
         return False
 
     def _read_json(self) -> dict:
@@ -352,6 +605,163 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, record)
 
+    # -- tasks ------------------------------------------------------------ #
+    def _store_unavailable(self, exc: Exception) -> None:
+        self._send(503, {
+            "error": f"task store unavailable: {exc}",
+            "hint": "AGENT_QUEUE=redis needs Redis at AGENT_REDIS_URL; "
+                    "there is no memory fallback",
+        })
+
+    def _get_tasks(self, path: str) -> None:
+        try:
+            store = tasks_store()
+            if path == "/tasks/stats":
+                self._send(200, store.stats())
+                return
+            if path == "/tasks":
+                _, query = self._route()
+                try:
+                    limit = int(query.get("limit", ["50"])[0])
+                except (TypeError, ValueError):
+                    limit = 50
+                records = store.list(
+                    queue=query.get("queue", [""])[0].strip().lower(),
+                    status=query.get("status", [""])[0].strip().lower(),
+                    limit=limit)
+                self._send(200, {
+                    "count": len(records),
+                    "tasks": records,
+                    "stats": store.stats(),
+                    "causes": _manual_causes(),
+                })
+                return
+        except ops_queue.QueueError as exc:
+            self._store_unavailable(exc)
+            return
+
+        segments = path.strip("/").split("/")
+        if len(segments) != 2 or not task_store.valid_id(segments[1]):
+            self._send(404, {"error": "unknown task", "path": path})
+            return
+        task_id = segments[1]
+        try:
+            record = store.get(task_id)
+            logs = store.logs(task_id, limit=200) if record else []
+        except ops_queue.QueueError as exc:
+            self._store_unavailable(exc)
+            return
+        if record is None:
+            self._send(404, {"error": "unknown task", "task_id": task_id})
+            return
+        payload = dict(record)
+        payload["logs"] = logs
+        self._send(200, payload)
+
+    def _post_task(self) -> None:
+        try:
+            body = self._read_json()
+        except ValueError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        queue_name = (str(body.get("queue") or "repair").strip().lower()
+                      or "repair")
+
+        if queue_name == "agent":
+            text = str(body.get("task") or "").strip()
+            if not text:
+                self._send(400, {"error": "missing 'task'",
+                                 "hint": 'send {"queue": "agent", '
+                                         '"task": "what to do"}'})
+                return
+            try:
+                job = submit(text)
+            except QueueFull as exc:
+                self._send(429, {"error": str(exc), "hint": "retry later"})
+                return
+            self._send(202, {"task_id": job.id, "queue": "agent",
+                             "status": job.status,
+                             "poll": f"/tasks/{job.id}"})
+            return
+
+        if queue_name != "repair":
+            self._send(400, {"error": f"unknown queue {queue_name!r}",
+                             "hint": "queue is 'repair' or 'agent'"})
+            return
+        try:
+            store = tasks_store()
+        except ops_queue.QueueError as exc:
+            self._store_unavailable(exc)
+            return
+        try:
+            import ops_controller as ops  # lazy: the API does not own repairs
+
+            record = ops.submit_manual(store, body, actor="api")
+        except task_store.TaskError as exc:
+            status = 429 if "full" in str(exc) else 400
+            self._send(status, {"error": str(exc)})
+            return
+        except ValueError as exc:
+            self._send(400, {"error": str(exc),
+                             "causes": sorted(_manual_causes()),
+                             "kinds": ["Pod", "Deployment", "StatefulSet",
+                                       "PersistentVolumeClaim"]})
+            return
+        except ops_queue.QueueError as exc:
+            self._store_unavailable(exc)
+            return
+
+        # An event, not a mutation: the playbook's kubectl call is what must be
+        # write-ahead audited. A broken log must not swallow the request, so
+        # this is best effort and the id is attached to the task when written.
+        audit_id = ""
+        try:
+            audit_id = audit.record(
+                "task_submit", actor="api",
+                args={"task_id": record["id"],
+                      "namespace": record.get("namespace", ""),
+                      "kind": record.get("kind", ""),
+                      "name": record.get("name", ""),
+                      "cause": record.get("cause", ""),
+                      "priority": record.get("priority", "")},
+                result=f"queued {record['id']} for {record.get('resource', '')}")
+        except audit.AuditError as exc:
+            print(f"[http] task_submit audit event failed: {exc}", flush=True)
+        if audit_id:
+            try:
+                record = store.update(record["id"], audit_ids=[audit_id])
+            except ops_queue.QueueError:
+                pass
+        self._send(202, {"task_id": record["id"], "queue": "repair",
+                         "status": record["status"],
+                         "resource": record.get("resource", ""),
+                         "audit_ids": record.get("audit_ids") or [],
+                         "poll": f"/tasks/{record['id']}"})
+
+    def _cancel_task(self, task_id: str) -> None:
+        if not task_store.valid_id(task_id):
+            self._send(404, {"error": "unknown task", "task_id": task_id})
+            return
+        try:
+            store = tasks_store()
+            record = store.cancel(task_id, by="api")
+        except task_store.TaskError:
+            record = None
+        except ops_queue.QueueError as exc:
+            self._store_unavailable(exc)
+            return
+        if record is None and not redis_mode():
+            job = cancel_job(task_id)  # in-process agent job (local mode)
+            if job is not None:
+                self._send(200, {"task_id": job.id, "status": job.status,
+                                 "cancelled": True})
+                return
+        if record is None:
+            self._send(404, {"error": "unknown task", "task_id": task_id})
+            return
+        self._send(200, {"task_id": record["id"], "status": record["status"],
+                         "cancelled": True})
+
     # -- GET -------------------------------------------------------------- #
     def do_GET(self):  # noqa: N802
         path, _ = self._route()
@@ -359,8 +769,6 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_ui()
             return
         if path == "/health":
-            with JOBS_LOCK:
-                running = sum(1 for j in JOBS.values() if j.status == "running")
             info = llm.provider_info()
             self._send(200, {
                 "status": "ok",
@@ -368,17 +776,26 @@ class Handler(BaseHTTPRequestHandler):
                 "model": info.get("model", MODEL),
                 "local_model_enabled": info.get("local_model_enabled", True),
                 "ollama": OLLAMA_HOST,
-                "queue_depth": QUEUE.qsize(),
-                "jobs_running": running,
-                "jobs_known": len(JOBS),
+                "queue": QUEUE_KIND,
+                "queue_depth": queue_depth(),
+                "jobs_running": jobs_running(),
+                "jobs_known": jobs_known(),
+                "auth": "off" if AUTH_DISABLED else "bearer",
             })
             return
 
         if not self._check_auth():
             return
 
+        if path == "/auth/check":
+            # Cheap token probe for the UI: 200 means "this token is accepted",
+            # so the login modal can validate before saving it.
+            self._send(200, {"ok": True,
+                             "auth": "off" if AUTH_DISABLED else "bearer"})
+            return
+
         if path == "/provider":
-            self._send(200, llm.provider_info())
+            self._send(200, provider_admin.describe())
             return
 
         if path == "/audit":
@@ -402,17 +819,18 @@ class Handler(BaseHTTPRequestHandler):
             self._get_incidents(path)
             return
 
+        if path == "/tasks" or path.startswith("/tasks/"):
+            self._get_tasks(path)
+            return
+
         if path == "/jobs":
-            with JOBS_LOCK:
-                jobs = sorted(JOBS.values(), key=lambda j: j.created, reverse=True)
-            self._send(200, {"jobs": [j.summary() for j in jobs[:50]]})
+            self._send(200, {"jobs": list_jobs(50)})
             return
 
         if path.startswith("/jobs/"):
             segments = path.strip("/").split("/")
             job_id = segments[1]
-            with JOBS_LOCK:
-                job = JOBS.get(job_id)
+            job = get_job(job_id)
             if job is None:
                 self._send(404, {"error": "unknown job", "job_id": job_id})
                 return
@@ -471,6 +889,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, payload)
             return
 
+        if path == "/provider":
+            try:
+                body = self._read_json()
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            try:
+                payload = provider_admin.apply(body)
+            except provider_admin.ProviderError as exc:
+                self._send(400, {"ok": False, "error": str(exc)})
+                return
+            self._send(200, payload)
+            return
+
         if path == "/incidents/ingest":
             store = self._incident_store()
             if store is None:
@@ -496,6 +928,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, {"ok": True, "id": record["id"],
                              "status": record.get("status")})
+            return
+
+        if path == "/tasks":
+            self._post_task()
+            return
+
+        if path.startswith("/tasks/") and path.endswith("/cancel"):
+            segments = path.strip("/").split("/")
+            if len(segments) == 3:
+                self._cancel_task(segments[1])
+                return
+            self._send(404, {"error": "not found", "path": path})
             return
 
         if path == "/run":
@@ -524,8 +968,12 @@ class Handler(BaseHTTPRequestHandler):
                                  "poll": f"/jobs/{job.id}"})
                 return
 
-            # Synchronous mode: wait for the worker (n8n expects the result).
-            if not job.done.wait(JOB_TIMEOUT + 60):
+            # Synchronous mode: wait for the executor (n8n expects the result).
+            if hasattr(job, "wait"):
+                finished = job.wait(JOB_TIMEOUT + 60)
+            else:
+                finished = job.done.wait(JOB_TIMEOUT + 60)
+            if not finished:
                 self._send(504, {"error": "job did not finish in time",
                                  "job_id": job.id, "hint": f"poll /jobs/{job.id}"})
                 return
@@ -550,6 +998,21 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send(404, {"error": "not found", "path": path})
 
+    # -- DELETE ----------------------------------------------------------- #
+    def do_DELETE(self):  # noqa: N802
+        path, _ = self._route()
+        if not self._check_auth():
+            return
+        if path == "/provider/key":
+            try:
+                payload = provider_admin.clear_key()
+            except provider_admin.ProviderError as exc:
+                self._send(400, {"ok": False, "error": str(exc)})
+                return
+            self._send(200, payload)
+            return
+        self._send(404, {"error": "not found", "path": path})
+
 
 # --------------------------------------------------------------------------- #
 # Entry point
@@ -562,10 +1025,22 @@ def main() -> None:
               "Set AGENT_AUTH_DISABLED=1 only for local development.",
               file=sys.stderr, flush=True)
         raise SystemExit(1)
+    if redis_mode():
+        try:
+            store = _agent_store()
+        except ops_queue.QueueError as exc:
+            print(f"[agent-service] refusing to start: AGENT_QUEUE=redis but the "
+                  f"queue is unavailable: {exc}. There is no memory fallback: "
+                  f"two API pods with separate queues would look healthy and "
+                  f"lose work.", file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        print(f"[agent-service] queue=redis/{store.backend.name} "
+              f"depth={queue_depth()}", flush=True)
     start_worker()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"[agent-service] listening on {BIND}:{PORT}  model={MODEL}  "
-          f"ollama={OLLAMA_HOST}  queue={MAX_QUEUE}  timeout={JOB_TIMEOUT}s  "
+          f"ollama={OLLAMA_HOST}  queue={QUEUE_KIND}/{MAX_QUEUE}  "
+          f"timeout={JOB_TIMEOUT}s  "
           f"auth={'off' if AUTH_DISABLED else 'bearer'}", flush=True)
     try:
         srv.serve_forever()

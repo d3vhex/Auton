@@ -1,0 +1,155 @@
+# Redis: the shared queue for the autonomous ops split.
+#
+# One instance, AOF on a PVC. It holds task records, resource locks, cooldowns,
+# the hourly action budget and worker heartbeats — never a Secret value. The
+# Service is ClusterIP; nothing outside the cluster can reach it.
+#
+# `maxmemory-policy noeviction` is deliberate: if Redis is full a write fails
+# and the agent fails closed instead of silently dropping a repair task.
+#
+# A single instance is enough for the single-node lab. Before this becomes a
+# multi-node production system, replace it with Sentinel/Cluster — but that is
+# Phase 7 and intentionally out of scope here.
+#
+# If the cluster is shared, add auth:
+#   kubectl -n auton create secret generic auton-redis --from-literal=password=...
+# and start Redis with `--requirepass $(REDIS_PASSWORD)` plus
+# `AGENT_REDIS_PASSWORD` (or `_FILE`) on every pod that talks to it.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: auton
+  labels:
+    app: redis
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: auton
+  labels:
+    app: redis
+    # Never let a playbook touch the queue itself.
+    auton.io/protect: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: never run two Redis pods at once
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        auton.io/protect: "true"
+    spec:
+      # Redis needs no Kubernetes API access at all.
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      # local-path does not reliably apply fsGroup; fix the data dir once per
+      # pod start (idempotent and fast on an already-owned volume).
+      - name: fix-data-owner
+        image: redis:7-alpine
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown -R 999:999 /data && chmod 0770 /data"]
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+            add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        imagePullPolicy: IfNotPresent
+        command:
+        - redis-server
+        - "--appendonly"
+        - "yes"
+        - "--appendfsync"
+        - "everysec"
+        - "--aof-use-rdb-preamble"
+        - "yes"
+        - "--save"
+        - ""                    # no RDB snapshots; the AOF is the source of truth
+        - "--maxmemory"
+        - "256mb"
+        - "--maxmemory-policy"
+        - "noeviction"
+        - "--tcp-keepalive"
+        - "60"
+        securityContext:
+          runAsUser: 999
+          runAsGroup: 999
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        ports:
+        - name: redis
+          containerPort: 6379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "500m"
+            memory: "320Mi"
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          failureThreshold: 4
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: redis-data
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: auton
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis

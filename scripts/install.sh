@@ -136,7 +136,7 @@ EOF
     fi
   fi
 
-  step "RBAC (auton-agent, auton-ops, cluster read-only)"
+  step "RBAC (auton-agent, auton-api, auton-scanner, auton-worker, cluster read-only)"
   run kubectl apply -f yamls/auton-rbac.yaml
   # Do not reset a provider someone switched with scripts/set-provider.sh.
   if kubectl -n "$NS" get configmap auton-model-config >/dev/null 2>&1; then
@@ -193,19 +193,39 @@ EOF
   # ------------------------------------------------------------------------- #
   # 5. Deployments
   # ------------------------------------------------------------------------- #
-  step "Agent API"
+  # Redis first: the API refuses to start with AGENT_QUEUE=redis and no backend
+  # (no silent memory fallback), so applying it later would crash-loop the API.
+  step "Redis queue (single instance, AOF on a PVC)"
+  run kubectl apply -f yamls/redis.yaml
+  run kubectl -n "$NS" rollout status deploy/redis --timeout=300s
+
+  step "Agent API (producer)"
   run kubectl apply -f yamls/agent-deployment.yaml
   if [[ "$IMAGE" != "auton:local" && "$DRY_RUN" == 0 ]]; then
     kubectl -n "$NS" set image deploy/auton "auton=$IMAGE" >/dev/null
   fi
   run kubectl -n "$NS" rollout status deploy/auton --timeout=300s
 
-  step "Autonomous ops controller"
+  step "Ops executor (the pod that runs the LLM)"
   run kubectl apply -f yamls/auton-ops-deployment.yaml
   if [[ "$IMAGE" != "auton:local" && "$DRY_RUN" == 0 ]]; then
     kubectl -n "$NS" set image deploy/auton-ops "ops=$IMAGE" >/dev/null
   fi
   run kubectl -n "$NS" rollout status deploy/auton-ops --timeout=300s
+
+  step "Scanners (read-only detection -> repair queue)"
+  run kubectl apply -f yamls/auton-scanner-deployment.yaml
+  if [[ "$IMAGE" != "auton:local" && "$DRY_RUN" == 0 ]]; then
+    kubectl -n "$NS" set image deploy/auton-scanner "scanner=$IMAGE" >/dev/null
+  fi
+  run kubectl -n "$NS" rollout status deploy/auton-scanner --timeout=300s
+
+  step "Repair workers (playbooks; the only writers)"
+  run kubectl apply -f yamls/auton-worker-deployment.yaml
+  if [[ "$IMAGE" != "auton:local" && "$DRY_RUN" == 0 ]]; then
+    kubectl -n "$NS" set image deploy/auton-worker "worker=$IMAGE" >/dev/null
+  fi
+  run kubectl -n "$NS" rollout status deploy/auton-worker --timeout=300s
 
   step "n8n"
   run kubectl apply -f yamls/n8n-deployment.yaml
@@ -243,9 +263,24 @@ if [[ "$SHOW_TOKEN" == 1 && -n "$token" ]]; then
   info "token: $token"
 fi
 
+check "Redis answers PING" \
+  kubectl -n "$NS" exec deploy/redis -- redis-cli ping
+
 check "API /health answers" \
   kubectl -n "$NS" exec deploy/auton -- python -c \
   'import json,urllib.request; print(json.load(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5)))'
+
+check "API uses the redis queue" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+  'import json,urllib.request,sys
+h=json.load(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5))
+sys.exit(0 if h.get("queue") == "redis" else 1)'
+
+check "API serves /tasks with the token" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+  'import json,os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/tasks?limit=1",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+print(json.load(urllib.request.urlopen(r, timeout=5)).get("count", 0))'
 
 check "API serves /incidents with the token" \
   kubectl -n "$NS" exec deploy/auton -- python -c \
@@ -262,11 +297,17 @@ print(json.load(urllib.request.urlopen(r, timeout=5))["provider"])'
 check "agent cannot read secrets (RBAC)" \
   bash -c 'kubectl -n "$0" auth can-i get secrets --as=system:serviceaccount:auton:auton-agent | grep -qx no' "$NS"
 
-check "ops controller cannot patch auton" \
-  bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-ops | grep -qx no' "$NS"
+check "API identity cannot list pods (RBAC)" \
+  bash -c 'kubectl -n "$0" auth can-i list pods --as=system:serviceaccount:auton:auton-api | grep -qx no' "$NS"
 
-check "ops controller can patch auton-apps" \
-  bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-ops | grep -qx yes' "$APPS_NS"
+check "scanner cannot patch deployments (RBAC)" \
+  bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-scanner | grep -qx no' "$APPS_NS"
+
+check "worker cannot patch auton (RBAC)" \
+  bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-worker | grep -qx no' "$NS"
+
+check "worker can patch auton-apps (RBAC)" \
+  bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-worker | grep -qx yes' "$APPS_NS"
 
 if [[ "$fail" -gt 0 ]]; then
   echo
@@ -281,7 +322,10 @@ Auton is installed.
   API        kubectl -n $NS port-forward svc/auton 8080:8080
              curl -s localhost:8080/health
   Ingress    http://auton.localhost (if :80 was mapped at cluster creation)
-  Ops logs   kubectl -n $NS logs deploy/auton-ops --tail=50
+  Ops logs   kubectl -n $NS logs deploy/auton-ops --tail=50      (LLM executor)
+  Scanner    kubectl -n $NS logs deploy/auton-scanner --tail=50  (read-only)
+  Workers    kubectl -n $NS logs deploy/auton-worker --tail=50   (playbooks)
+  Queue      kubectl -n $NS exec deploy/redis -- redis-cli xlen auton:q:repair:normal
   Provider   scripts/set-provider.sh --provider ollama   (or openai|gemini|anthropic|custom)
   n8n        scripts/rotate-n8n-api-key.sh --help
 

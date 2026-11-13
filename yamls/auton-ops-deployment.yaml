@@ -1,13 +1,22 @@
-# Auton operations controller: the autonomous half of the system.
+# Auton ops executor: the single pod that runs LLM agent tasks.
 #
-# It is a separate Deployment (not a thread in the API pod) so a long repair or
-# a crash cannot take /run down. It talks to the API over the cluster network
-# (http://auton:8080) and shares the workspace PVC so its audit log and
-# incident records are the same files `GET /audit` and `GET /incidents` read.
+# When `AGENT_QUEUE=redis` the API (`deployment/auton`) is only a *producer*: it
+# validates the request, enqueues an `agent` task and answers 202. This pod is
+# the consumer — it takes the global GPU slot, claims one task and runs
+# `agent_worker.py` → `agent_core.run_agent()` → the model provider.
 #
-# The PVC is ReadWriteOnce; k3d runs a single node, where both pods can mount
-# it. On a multi-node cluster give this Deployment its own PVC and set
-# AGENT_INCIDENTS_DIR — the ingest endpoint makes the split transparent.
+# Why a separate pod:
+#   * a long agent run no longer occupies the API process;
+#   * the API can be scaled/restarted without killing a running task;
+#   * every task is a Redis record, so a crash is visible (`recover()` requeues
+#     it after the lease expires) instead of an invisible lost thread.
+#
+# It keeps the `auton-agent` identity: the agent loop needs both namespaces and
+# the read-only cluster view for its kubectl tools. The repair path is *not*
+# here — scanners and workers own the queue (`auton-scanner`, `auton-worker`).
+#
+# Replicas: 1. A second replica is safe (it defers while the GPU slot is held)
+# but a single GPU cannot run two agent loops faster.
 #
 # Build/import the same image as the API:
 #   docker build -t auton:local ./mcp && k3d image import auton:local -c ai-cluster
@@ -19,7 +28,7 @@ metadata:
   namespace: auton
   labels:
     app: auton-ops
-    # Neither the 7B model nor the playbooks may "repair" the controller.
+    # Neither the 7B model nor a playbook may "repair" the executor.
     auton.io/protect: "true"
 spec:
   replicas: 1
@@ -34,7 +43,7 @@ spec:
         app: auton-ops
         auton.io/protect: "true"
     spec:
-      serviceAccountName: auton-ops
+      serviceAccountName: auton-agent
       securityContext:
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
@@ -60,7 +69,7 @@ spec:
       - name: ops
         image: auton:local
         imagePullPolicy: IfNotPresent
-        command: ["python", "ops_controller.py"]
+        command: ["python", "agent_worker.py"]
         securityContext:
           runAsUser: 10001
           runAsGroup: 10001
@@ -76,76 +85,94 @@ spec:
           value: "/tmp"
         - name: PYTHONDONTWRITEBYTECODE
           value: "1"
-        # --- Kubernetes access -------------------------------------------- #
-        - name: AGENT_NAMESPACE
-          valueFrom:
-            fieldRef: { fieldPath: metadata.namespace }
-        # The k8s_tools allowlist. The ops allowlist below is narrower.
-        - name: AGENT_NAMESPACES
-          value: "auton,auton-apps"
-        # Where the controller may repair. Everything else is read-only.
-        - name: AGENT_OPS_NAMESPACES
-          value: "auton-apps"
-        - name: AGENT_K8S_ENABLED
-          value: "1"
-        - name: AGENT_K8S_WRITE
-          value: "1"
-        # Shared with the API pod: one audit log, one incident store.
+        # --- model --------------------------------------------------------- #
+        - name: OLLAMA_HOST
+          value: "http://ollama-service:11434"
+        - name: AGENT_MODEL
+          value: "qwen2.5-coder:7b-instruct"
+        # Provider config is read per request from this projected volume, so a
+        # provider switch needs no restart (scripts/set-provider.sh or the UI).
+        - name: AGENT_MODEL_DIR
+          value: "/etc/auton-model"
+        - name: MAX_STEPS
+          value: "25"
+        - name: AGENT_NUM_CTX
+          value: "16384"
+        - name: AGENT_MAX_OBSERVATION_CHARS
+          value: "8000"
+        - name: AGENT_MAX_HISTORY_CHARS
+          value: "60000"
+        # --- workspace ----------------------------------------------------- #
+        - name: AGENT_WORKSPACE
+          value: "/workspace"
+        # Shared with the API: one audit log, one incident store.
         - name: AGENT_AUDIT_DIR
           value: "/workspace/.ops"
         - name: AGENT_INCIDENTS_DIR
           value: "/workspace/.ops/incidents"
-        # --- loop policy --------------------------------------------------- #
-        - name: AGENT_OPS_INTERVAL
-          value: "60"
-        - name: AGENT_OPS_COOLDOWN
-          value: "1800"
-        - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
-          value: "6"
-        # Ignore Pending/NotReady for this long after a pod starts so a normal
-        # image pull/container start is not reported as an incident.
-        - name: AGENT_OPS_STARTUP_GRACE
-          value: "120"
-        # A pod with a DeletionTimestamp is only "stuck" after this long, so a
-        # normal kubectl delete/rollout is not reported as an incident.
-        - name: AGENT_OPS_TERMINATION_GRACE
-          value: "120"
-        - name: AGENT_OPS_MAX_MEMORY
-          value: "2Gi"
-        - name: AGENT_OPS_MAX_INCIDENTS
-          value: "500"
-        # Flip to "1" to detect and report without changing anything.
-        - name: AGENT_OPS_DRY_RUN
-          value: "0"
+        - name: AGENT_SANDBOX
+          value: "off"
+        # --- Kubernetes access --------------------------------------------- #
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef: { fieldPath: metadata.namespace }
+        - name: AGENT_NAMESPACES
+          value: "auton,auton-apps"
+        - name: AGENT_K8S_ENABLED
+          value: "1"
+        - name: AGENT_K8S_WRITE
+          value: "1"
+        # --- n8n access ----------------------------------------------------- #
+        - name: N8N_API_URL
+          value: "http://n8n.auton.svc.cluster.local:5678/api/v1"
+        - name: N8N_WEBHOOK_BASE
+          value: "http://n8n.auton.svc.cluster.local:5678/webhook"
+        - name: N8N_API_KEY_FILE
+          value: "/etc/n8n-api/api-key"
+        # --- queue ---------------------------------------------------------- #
+        # No memory fallback: without Redis the executor refuses to start.
+        - name: AGENT_QUEUE
+          value: "redis"
+        - name: AGENT_REDIS_URL
+          value: "redis://redis.auton.svc.cluster.local:6379/0"
+        - name: AGENT_QUEUE_PREFIX
+          value: "auton"
+        - name: AGENT_AGENT_POLL
+          value: "5"
+        # One global GPU slot (SET NX + TTL) keeps two executors from calling
+        # the model at once even if the Deployment is scaled by accident.
+        - name: AGENT_JOB_TIMEOUT
+          value: "900"
         - name: AGENT_OPS_HEARTBEAT
-          value: "/tmp/ops-heartbeat"
-        # --- reporting ----------------------------------------------------- #
-        - name: AGENT_API_URL
-          value: "http://auton:8080"
+          value: "/tmp/agent-heartbeat"
+        # --- API auth ------------------------------------------------------- #
         - name: AGENT_API_TOKEN
           valueFrom:
             secretKeyRef:
               name: auton-api-token
               key: token
-        # UI host (Traefik) used in notification links. P5 adds the UI.
-        - name: AGENT_UI_URL
-          value: "http://auton.localhost"
-        # n8n workflow that forwards reports to Slack/Telegram. Point it at the
-        # generated `auton-ops` workflow; an inactive webhook only logs errors.
-        - name: N8N_OPS_WEBHOOK
-          value: "http://n8n.auton.svc.cluster.local:5678/webhook/auton-ops"
         resources:
           requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
-            cpu: "500m"
+            cpu: "250m"
             memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
         volumeMounts:
         - name: workspace
           mountPath: /workspace
         - name: tmp
           mountPath: /tmp
+        - name: model-config
+          mountPath: /etc/auton-model/config
+          readOnly: true
+        - name: model-secret
+          mountPath: /etc/auton-model/secret
+          readOnly: true
+        # optional: the executor starts even before the n8n API key exists.
+        - name: n8n-api
+          mountPath: /etc/n8n-api
+          readOnly: true
         livenessProbe:
           exec:
             command:
@@ -153,15 +180,26 @@ spec:
             - -c
             - |
               import os, sys, time
-              path = "/tmp/ops-heartbeat"
+              path = "/tmp/agent-heartbeat"
               sys.exit(0 if os.path.exists(path)
-                       and time.time() - os.path.getmtime(path) < 1800 else 1)
+                       and time.time() - os.path.getmtime(path) < 600 else 1)
           initialDelaySeconds: 60
           periodSeconds: 60
-          failureThreshold: 3
+          failureThreshold: 5
       volumes:
       - name: workspace
         persistentVolumeClaim:
           claimName: agent-workspace
       - name: tmp
         emptyDir: {}
+      - name: model-config
+        configMap:
+          name: auton-model-config
+      - name: model-secret
+        secret:
+          secretName: auton-model
+          optional: true
+      - name: n8n-api
+        secret:
+          secretName: n8n-api
+          optional: true

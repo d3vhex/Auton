@@ -1,0 +1,122 @@
+{{- if .Values.scanner.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton-scanner
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: auton-scanner
+    auton.io/protect: "true"
+spec:
+  replicas: {{ .Values.scanner.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: auton-scanner
+  template:
+    metadata:
+      labels:
+        {{- include "auton.labels" . | nindent 8 }}
+        app: auton-scanner
+        auton.io/protect: "true"
+    spec:
+      # Read-only identity: a bug here can produce a wrong finding, never a
+      # mutation. It does not mount the workspace or the model.
+      serviceAccountName: {{ .Values.serviceAccount.scanner.name }}
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scanner
+          image: {{ include "auton.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "ops_scanner.py"]
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- $env := dict
+            "HOME" "/tmp"
+            "TMPDIR" "/tmp"
+            "PYTHONDONTWRITEBYTECODE" "1"
+            "AGENT_NAMESPACES" (join "," .Values.scanner.namespaces)
+            "AGENT_OPS_NAMESPACES" (join "," .Values.scanner.namespaces)
+            "AGENT_K8S_ENABLED" "1"
+            "AGENT_K8S_WRITE" "0"
+            "AGENT_AUDIT_DIR" "/tmp/ops"
+            "AGENT_INCIDENTS_DIR" "/tmp/ops/incidents"
+            "AGENT_QUEUE" .Values.queue.backend
+            "AGENT_REDIS_URL" (include "auton.redisUrl" .)
+            "AGENT_QUEUE_PREFIX" .Values.queue.prefix
+            "AGENT_QUEUE_MAX" (toString .Values.queue.maxTaskQueue)
+            "AGENT_SCAN_INTERVAL" (toString .Values.scanner.interval)
+            "AGENT_SCAN_DEDUPE_WINDOW" (toString .Values.scanner.dedupeWindow)
+            "AGENT_OPS_COOLDOWN" (toString .Values.scanner.cooldown)
+            "AGENT_OPS_STARTUP_GRACE" (toString .Values.scanner.startupGrace)
+            "AGENT_OPS_TERMINATION_GRACE" (toString .Values.scanner.terminationGrace)
+            "AGENT_OPS_HEARTBEAT" .Values.scanner.heartbeat
+          }}
+          {{- range $key, $value := .Values.scanner.env }}
+          {{- $_ := set $env $key (toString $value) }}
+          {{- end }}
+          env:
+            - name: AGENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.queue.redisExistingSecret }}
+            - name: AGENT_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.queue.redisExistingSecret }}
+                  key: password
+            {{- end }}
+            {{- range $key, $value := $env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.scanner.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, sys, time
+                  path = "{{ .Values.scanner.heartbeat }}"
+                  sys.exit(0 if os.path.exists(path)
+                           and time.time() - os.path.getmtime(path) < 600 else 1)
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            failureThreshold: 5
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.scanner.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scanner.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scanner.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

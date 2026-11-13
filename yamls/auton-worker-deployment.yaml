@@ -1,0 +1,173 @@
+# Auton repair worker: the only component that mutates a workload.
+#
+# Scanners detect, this pod executes. Every task it claims is executed under a
+# per-resource lock (two workers may repair different Deployments in parallel,
+# never the same one), inside an audit-gated `incident_scope`, with the hourly
+# action budget enforced atomically in Redis.
+#
+# Replicas: 2. The `agent-workspace` PVC is ReadWriteOnce and k3d is a single
+# node, where several pods can mount it. On a multi-node cluster either give
+# every worker its own audit/incident directory (set AGENT_AUDIT_DIR and rely on
+# `POST /incidents/ingest`) or use an RWX volume.
+#
+# Build/import the same image as the API:
+#   docker build -t auton:local ./mcp && k3d image import auton:local -c ai-cluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton-worker
+  namespace: auton
+  labels:
+    app: auton-worker
+    # Neither the 7B model nor another playbook may repair the workers.
+    auton.io/protect: "true"
+spec:
+  replicas: 2
+  strategy:
+    type: Recreate          # RWO volume: never two pods per node during a rollout
+  selector:
+    matchLabels:
+      app: auton-worker
+  template:
+    metadata:
+      labels:
+        app: auton-worker
+        auton.io/protect: "true"
+    spec:
+      serviceAccountName: auton-worker
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: fix-workspace-owner
+        image: auton:local
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+            add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      containers:
+      - name: worker
+        image: auton:local
+        imagePullPolicy: IfNotPresent
+        command: ["python", "ops_worker.py"]
+        securityContext:
+          runAsUser: 10001
+          runAsGroup: 10001
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: HOME
+          value: "/tmp"
+        - name: TMPDIR
+          value: "/tmp"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        # --- Kubernetes access -------------------------------------------- #
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef: { fieldPath: metadata.namespace }
+        - name: AGENT_NAMESPACES
+          value: "auton,auton-apps"
+        # Where a playbook may repair. Everything else is read-only.
+        - name: AGENT_OPS_NAMESPACES
+          value: "auton-apps"
+        - name: AGENT_K8S_ENABLED
+          value: "1"
+        - name: AGENT_K8S_WRITE
+          value: "1"
+        # Shared with the API/ops pod: one audit log, one incident store.
+        - name: AGENT_AUDIT_DIR
+          value: "/workspace/.ops"
+        - name: AGENT_INCIDENTS_DIR
+          value: "/workspace/.ops/incidents"
+        # --- queue --------------------------------------------------------- #
+        - name: AGENT_QUEUE
+          value: "redis"
+        - name: AGENT_REDIS_URL
+          value: "redis://redis.auton.svc.cluster.local:6379/0"
+        - name: AGENT_QUEUE_PREFIX
+          value: "auton"
+        # A noeviction Redis refuses writes on a full instance: the worker then
+        # fails closed instead of losing a task.
+        - name: AGENT_TASK_LEASE
+          value: "300"           # a crashed worker's task comes back after 5 min
+        - name: AGENT_TASK_MAX_ATTEMPTS
+          value: "3"
+        - name: AGENT_TASK_BACKOFF
+          value: "30,120,300"
+        - name: AGENT_WORKER_POLL
+          value: "5"
+        # --- repair policy ------------------------------------------------- #
+        - name: AGENT_OPS_COOLDOWN
+          value: "1800"
+        - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
+          value: "6"
+        - name: AGENT_OPS_MAX_MEMORY
+          value: "2Gi"
+        - name: AGENT_OPS_MAX_INCIDENTS
+          value: "500"
+        - name: AGENT_OPS_PRUNE_EVERY
+          value: "300"
+        # Flip to "1" to record detected + dry_run without changing anything.
+        - name: AGENT_OPS_DRY_RUN
+          value: "0"
+        - name: AGENT_OPS_HEARTBEAT
+          value: "/tmp/worker-heartbeat"
+        # --- reporting ----------------------------------------------------- #
+        - name: AGENT_API_URL
+          value: "http://auton:8080"
+        - name: AGENT_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: auton-api-token
+              key: token
+        - name: AGENT_UI_URL
+          value: "http://auton.localhost"
+        - name: N8N_OPS_WEBHOOK
+          value: "http://n8n.auton.svc.cluster.local:5678/webhook/auton-ops"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - |
+              import os, sys, time
+              path = "/tmp/worker-heartbeat"
+              sys.exit(0 if os.path.exists(path)
+                       and time.time() - os.path.getmtime(path) < 900 else 1)
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          failureThreshold: 5
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: agent-workspace
+      - name: tmp
+        emptyDir: {}

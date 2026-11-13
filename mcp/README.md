@@ -52,6 +52,7 @@ host.
 | `audit.py` | Write-ahead audit log: JSONL + SQLite, fail-closed, `begin`/`finish`/`record` |
 | `k8s_tools.py` | `kubectl` wrapper: 13 Kubernetes tools (diagnosis + audit-gated mutations) |
 | `llm.py` | Provider layer: `ollama`/`openai`/`gemini`/`anthropic`/`custom`, config read per request, redaction, no fallback |
+| `provider_admin.py` | Validated provider writes behind `POST /provider`: ConfigMap/Secret patch (or files), audit without the key, `400` for a config the agent would reject |
 | `n8n_tools.py` | n8n public-API + webhook client: 6 tools, stdlib HTTP only |
 | `incidents.py` | Atomic incident records (`detected`…`failed`) + local report retry queue |
 | `playbooks.py` | Deterministic repairs: OOM memory bump, stuck pod, crashloop recreate, rollout undo, replica restore |
@@ -345,6 +346,17 @@ In the cluster the directory is `/etc/auton-model` (ConfigMap
 `AGENT_LLM_API_KEY`, `AGENT_DATA_POLICY`) are the local-development fallback;
 file values win.
 
+There are two write paths, and they produce the same result:
+
+- `scripts/set-provider.sh` (host, kubeconfig) — waits for the projected volume
+  and runs the round-trip.
+- `POST /provider` / `DELETE /provider/key` (UI or API) — `provider_admin.py`
+  validates, audits (`provider_update`, key never recorded), then patches the
+  named ConfigMap/Secret. `AGENT_PROVIDER_STORE=files` writes the files directly
+  for local development. The API identity may `patch` only
+  `auton-model-config` and `auton-model` (`resourceNames` in the `auton-api`
+  Role); it cannot read secrets or touch workloads.
+
 | Provider | Transport | Notes |
 |---|---|---|
 | `ollama` | `ollama.AsyncClient` | Default; native `tool_calls` are preserved |
@@ -466,7 +478,9 @@ Authorization: Bearer <token from the auton-api-token Secret>
 
 The service **refuses to start** without `AGENT_API_TOKEN` unless
 `AGENT_AUTH_DISABLED=1`, and an empty token answers `503` rather than becoming
-"open". Errors: `401` missing/wrong token, `503` no token configured.
+"open". Errors: `401` missing/wrong token (with `WWW-Authenticate: Bearer`),
+`503` no token configured. `GET /auth/check` is the cheapest authenticated
+route: it exists so the UI can tell "wrong token" (`401`) from "API down".
 
 Synchronous (default, and what the n8n workflows use):
 
@@ -492,10 +506,21 @@ curl -s "http://localhost:8080/incidents/inc-..." -H "Authorization: Bearer $TOK
 # active model provider (key masked) and a one-line round-trip
 curl -s http://localhost:8080/provider -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://localhost:8080/provider/test -H "Authorization: Bearer $TOKEN"
+
+# change provider settings from the UI/API (partial update; api_key is write-only)
+curl -s -X POST http://localhost:8080/provider -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"openai","model":"gpt-4o-mini","api_key":"sk-..."}'
+curl -s -X DELETE http://localhost:8080/provider/key -H "Authorization: Bearer $TOKEN"
 ```
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /auth/check` | Token probe (`200` = accepted) |
+| `GET /provider` | Active provider, masked key, `providers`/`policies`/`defaults` |
+| `POST /provider` | Partial update; `400` for an invalid or key-less remote config |
+| `DELETE /provider/key` | Remove the stored key (a remote provider then fails, no fallback) |
+| `POST /provider/test` | One tiny completion through the active provider |
 | `GET /audit?limit=&incident_id=` | JSONL-backed mutation records |
 | `GET /incidents?limit=&status=` | Newest-first incident list (`status` is a comma list) |
 | `GET /incidents/{id}` | One incident: observations, actions, verification, report, audit ids |
@@ -510,11 +535,22 @@ out `504` (with the `job_id` to poll).
 `ui/index.html` is served verbatim at `/` and `/ui`. It is intentionally a
 single dependency-free file (the cluster may have no egress) and uses only
 same-origin `fetch` with the bearer token the user pastes in; the token lives in
-`localStorage`. Tabs: **Chat** (`POST /run?async=1` + poll `/jobs/{id}`,
-cancel), **Incidents** (`GET /incidents`, `GET /incidents/{id}`), **Audit**
-(`GET /audit`) and **Provider** (`GET /provider`, `POST /provider/test`). The
-page itself is open because it contains no data; do not move secrets or records
-into the HTML.
+`localStorage`.
+
+Authentication is explained in an **API access** modal rather than a bare
+`prompt()`: it says why the API is protected (it can run commands and patch
+workloads), prints the `kubectl get secret auton-api-token …` command with a
+copy button, states that the token stays in this browser, and offers *Test and
+save* (`GET /auth/check`), *Save*, *Forget token* and *Close*. A banner remains
+visible while no valid token is stored and any `401` re-opens the modal with the
+rejected request named. A single `refreshHealth()` owns the health chip.
+
+Tabs: **Chat** (`POST /run?async=1` + poll `/jobs/{id}`, cancel),
+**Incidents** (`GET /incidents`, `GET /incidents/{id}`), **Audit**
+(`GET /audit`) and **Provider** — a real form: provider, model, base URL, max
+tokens, data policy and a write-only API key, with *Save settings*, *Clear API
+key* and *Send test completion*. The page itself is open because it contains no
+data; do not move secrets or records into the HTML.
 
 ### Async jobs
 
@@ -743,6 +779,10 @@ delete it and recreate it.
 | `AGENT_LLM_MAX_TOKENS` | `1024` | llm | Response cap for remote providers |
 | `AGENT_LLM_TIMEOUT` | `120` | llm | Remote HTTP timeout, seconds |
 | `AGENT_DATA_POLICY` | `redact` | llm | `redact` / `allow` / `local-only` |
+| `AGENT_PROVIDER_STORE` | `kubectl` | provider_admin | `kubectl` (patch ConfigMap/Secret) or `files` (local dev) |
+| `AGENT_PROVIDER_NAMESPACE` | `AGENT_NAMESPACE` | provider_admin | Namespace of the provider objects |
+| `AGENT_PROVIDER_CONFIGMAP` | `auton-model-config` | provider_admin | ConfigMap the API may patch |
+| `AGENT_PROVIDER_SECRET` | `auton-model` | provider_admin | Secret the API may patch (key only) |
 | `AGENT_WORKSPACE` | `./workspace` | server | Root the file tools are jailed to (pod: `/workspace`) |
 | `MAX_STEPS` | `25` | core | Iteration budget per task |
 | `AGENT_NUM_CTX` | `16384` | core | Ollama context window |

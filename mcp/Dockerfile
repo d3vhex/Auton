@@ -33,8 +33,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # NOTE: keep this list in sync with the modules in mcp/ (AGENTS.md).
 COPY agent_core.py agent_server.py agent_client.py agent_service.py \
-     audit.py incidents.py k8s_tools.py llm.py n8n_tools.py \
-     playbooks.py ops_controller.py ./
+     agent_worker.py audit.py incidents.py k8s_tools.py llm.py n8n_tools.py \
+     ops_controller.py ops_queue.py ops_scanner.py ops_worker.py \
+     playbooks.py provider_admin.py task_store.py ./
 COPY ui ./ui
 
 ENV AGENT_WORKSPACE=/workspace \

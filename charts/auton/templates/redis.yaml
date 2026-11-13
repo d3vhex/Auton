@@ -1,0 +1,146 @@
+{{- if and .Values.redis.enabled (eq .Values.queue.backend "redis") }}
+{{- if not .Values.redis.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: redis
+  {{- if .Values.redis.persistence.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.redis.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: redis
+    # Never let a playbook touch the queue itself.
+    auton.io/protect: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: never run two Redis pods at once
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        {{- include "auton.labels" . | nindent 8 }}
+        app: redis
+        auton.io/protect: "true"
+    spec:
+      # Redis needs no Kubernetes API access at all.
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # local-path does not reliably apply fsGroup; fix the data dir once per
+        # pod start (idempotent and fast on an already-owned volume).
+        - name: fix-data-owner
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.imagePullPolicy }}
+          command: ["sh", "-c", "chown -R 999:999 /data && chmod 0770 /data"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.imagePullPolicy }}
+          command:
+            - redis-server
+            - "--appendonly"
+            - "yes"
+            - "--appendfsync"
+            - {{ .Values.redis.appendFsync | quote }}
+            - "--aof-use-rdb-preamble"
+            - "yes"
+            - "--save"
+            - ""                # no RDB snapshots; the AOF is the source of truth
+            - "--maxmemory"
+            - {{ .Values.redis.maxMemory | quote }}
+            - "--maxmemory-policy"
+            - "noeviction"
+            - "--tcp-keepalive"
+            - "60"
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 4
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ default "redis-data" .Values.redis.persistence.existingClaim }}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+{{- end }}

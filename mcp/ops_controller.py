@@ -32,9 +32,11 @@ network (``http://auton:8080``) with the same bearer token.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import sys
 import threading
@@ -46,6 +48,7 @@ import audit
 import incidents
 import k8s_tools
 import playbooks
+import task_store
 
 NAMESPACES = playbooks.ops_namespaces()
 INTERVAL = max(10, int(os.environ.get("AGENT_OPS_INTERVAL", "60")))
@@ -69,6 +72,12 @@ OPS_DIR = os.environ.get("AGENT_OPS_DIR", "").strip() or os.environ.get(
 STORE = incidents.IncidentStore(os.path.join(OPS_DIR, "incidents"),
                                 max_records=MAX_RECORDS)
 STOP = threading.Event()
+
+# Queue split (see ops_scanner.py / ops_worker.py).
+SCAN_INTERVAL = max(5, int(os.environ.get("AGENT_SCAN_INTERVAL", str(INTERVAL))))
+DEDUPE_WINDOW = max(30, int(os.environ.get("AGENT_SCAN_DEDUPE_WINDOW", "300")))
+WORKER_POLL = max(1, int(os.environ.get("AGENT_WORKER_POLL", "5")))
+PRUNE_EVERY = max(60, int(os.environ.get("AGENT_OPS_PRUNE_EVERY", "300")))
 
 
 def log(message: str) -> None:
@@ -542,6 +551,394 @@ def handle(item: dict, namespace: str) -> None:
     notify(record)
 
 
+# --------------------------------------------------------------------------- #
+# Queue split: scanners detect and enqueue, workers execute
+#
+# The legacy `handle()`/`run_once()` path above does detection and repair in
+# one process. The scalable path below splits the two halves:
+#
+#   ops_scanner.py  read-only  → findings() → submit("repair")
+#   ops_worker.py   write      → claim() → execute_task() → finish/retry
+#
+# The split is what lets N scanners and M workers run without duplicating a
+# repair: the task record, resource lock, cooldown and hourly budget in Redis
+# are shared by every pod, and `_dedupe_key()` makes concurrent submissions of
+# the same finding collapse into one task.
+# --------------------------------------------------------------------------- #
+
+def _dedupe_key(namespace: str, resource: str, cause: str,
+                now: float | None = None) -> str:
+    """One task per (namespace, resource, cause) per dedupe window.
+
+    Two scanners see the same failure at the same moment; the window is shorter
+    than the cooldown so a genuinely recurring problem can be queued again once
+    the earlier task is gone.
+    """
+    bucket = int((now if now is not None else time.time()) // DEDUPE_WINDOW)
+    raw = f"{namespace}|{resource}|{cause}|{bucket}"
+    return "scan:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _submit_finding(store, item: dict, namespace: str) -> dict:
+    resource = incidents.resource_key(item["kind"], item["name"])
+    return store.submit(
+        "repair",
+        {
+            "namespace": namespace,
+            "kind": item["kind"],
+            "name": item["name"],
+            "cause": item["cause"],
+            "severity": item["severity"],
+            "observation": item["observation"],
+            "container": item.get("container", ""),
+            "resource": resource,
+            "source": "scanner",
+        },
+        priority="critical" if item["severity"] == "critical" else "normal",
+        idempotency_key=_dedupe_key(namespace, resource, item["cause"]),
+        actor="scanner",
+    )
+
+
+# Manual submissions (UI "Tasks" tab, `task_queue` tool) go through the same
+# validation the scanner output already satisfies, so a human click cannot
+# queue something a finding could not: a known cause, a real name, and the
+# `auton-apps` allowlist. The worker re-checks namespace/cooldown/budget and the
+# playbook is still audit-gated — "manual" means "do not wait for the scanner",
+# not "skip the safety rails".
+MANUAL_KINDS = {
+    "pod": "Pod",
+    "deployment": "Deployment",
+    "statefulset": "StatefulSet",
+    "persistentvolumeclaim": "PersistentVolumeClaim",
+}
+_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+
+
+def manual_task_fields(payload: dict) -> dict:
+    """Validate a manual repair request; raises ``ValueError``."""
+    body = dict(payload or {})
+    raw_kind = str(body.get("kind") or "").strip().lower()
+    if raw_kind not in MANUAL_KINDS:
+        raise ValueError(f"kind must be one of {sorted(MANUAL_KINDS.values())}")
+    kind = MANUAL_KINDS[raw_kind]
+    name = str(body.get("name") or "").strip()
+    if not name or len(name) > 253 or not _NAME.match(name):
+        raise ValueError("name must be a lowercase Kubernetes resource name")
+    namespaces = playbooks.ops_namespaces()
+    namespace = str(body.get("namespace") or "").strip() or (
+        namespaces[0] if namespaces else "")
+    if namespace not in namespaces:
+        raise ValueError(
+            f"namespace {namespace!r} is outside AGENT_OPS_NAMESPACES "
+            f"({', '.join(namespaces)})")
+    cause = str(body.get("cause") or "").strip().lower()
+    if cause not in CAUSE_TEXT:
+        raise ValueError(f"cause must be one of {sorted(CAUSE_TEXT)}")
+    default_severity = {value[0]: value[1]
+                        for value in REASONS.values()}.get(cause, "warning")
+    severity = str(body.get("severity") or "").strip().lower()
+    if severity not in ("critical", "warning", "info"):
+        severity = default_severity
+    return {
+        "namespace": namespace,
+        "kind": kind,
+        "name": name,
+        "cause": cause,
+        "severity": severity,
+        "observation": (str(body.get("observation") or "").strip()[:1000]
+                        or f"manual repair request for {kind.lower()}/{name}"),
+        "container": str(body.get("container") or "").strip(),
+        # A human asking for this now should not be blocked by a cooldown that
+        # an earlier automatic task set; the hourly budget and the resource lock
+        # still apply.
+        "force": bool(body.get("force", True)),
+        "source": "manual",
+        "resource": incidents.resource_key(kind, name),
+    }
+
+
+def submit_manual(store, payload: dict, actor: str = "api",
+                  source: str = "") -> dict:
+    """Validate and enqueue one manual repair task."""
+    fields = manual_task_fields(payload)
+    if source:
+        fields["source"] = source
+    priority = "critical" if fields["severity"] == "critical" else "normal"
+    return store.submit("repair", fields, priority=priority, actor=actor)
+
+
+def scan_once(store) -> dict:
+    """Read-only pass: collect findings and enqueue repair tasks.
+
+    Nothing is mutated here. A queue cooldown, a recent incident or an active
+    task for the same resource all suppress a submission, so two scanners (or
+    a second pass while a slow playbook is still running) cannot create
+    duplicate work.
+    """
+    touch_heartbeat()
+    store.heartbeat("scanner")
+    summary = {"namespaces": list(NAMESPACES), "findings": 0, "queued": 0,
+               "duplicates": 0, "suppressed": 0, "errors": 0, "tasks": []}
+    for namespace in NAMESPACES:
+        if STOP.is_set():
+            break
+        snapshot, error = k8s_tools._collect(namespace)
+        if error:
+            log(f"scan: snapshot failed for {namespace}: {error}")
+            summary["errors"] += 1
+            continue
+        for item in findings(snapshot):
+            summary["findings"] += 1
+            resource = incidents.resource_key(item["kind"], item["name"])
+            cause = item["cause"]
+            if store.in_cooldown(resource, cause):
+                summary["suppressed"] += 1
+                continue
+            try:
+                recent = STORE.find_recent(resource, cause, within=COOLDOWN)
+            except incidents.IncidentError as exc:
+                log(f"scan: cannot read incidents: {exc}")
+                summary["errors"] += 1
+                continue
+            if recent:
+                summary["suppressed"] += 1
+                continue
+            if store.active_for(resource, cause):
+                summary["suppressed"] += 1
+                continue
+            try:
+                record = _submit_finding(store, item, namespace)
+            except task_store.TaskError as exc:
+                log(f"scan: cannot enqueue {resource} {cause}: {exc}")
+                summary["errors"] += 1
+                continue
+            if record.get("duplicate"):
+                summary["duplicates"] += 1
+            else:
+                summary["queued"] += 1
+                summary["tasks"].append(record["id"])
+                log(f"queued {record['id']}: {resource} {cause} in {namespace}")
+    return summary
+
+
+def _task_item(task: dict) -> dict:
+    return _finding(task.get("kind", ""), task.get("name", ""),
+                    task.get("cause", ""), task.get("severity", "warning"),
+                    task.get("observation", ""),
+                    container=task.get("container", ""))
+
+
+def _incident_for(task: dict, item: dict, namespace: str) -> dict:
+    """Reuse the incident a retry already created, or create a new one."""
+    if task.get("incident_id"):
+        incident = STORE.get(task["incident_id"])
+        if incident is not None:
+            return incident
+    return STORE.create(
+        namespace=namespace, kind=item["kind"], name=item["name"],
+        cause=item["cause"], observation=item["observation"],
+        severity=item["severity"])
+
+
+def _append_action(incident: dict, result: dict) -> None:
+    incident.setdefault("actions", []).append({
+        "action": result.get("action", ""),
+        "ok": bool(result.get("ok")),
+        "detail": result.get("detail", "")})
+
+
+def _audit_ids(incident_id: str) -> list[str]:
+    try:
+        rows = audit.incident_actions(incident_id)
+    except Exception:
+        return []
+    return list(dict.fromkeys(
+        row.get("audit_id") for row in rows if row.get("audit_id")))
+
+
+def _finish_skipped(store, claim, reason: str, result: dict) -> dict:
+    record = store.finish(claim, status="skipped", result=result, note=reason)
+    store.append_log(claim.id, f"skipped: {reason}")
+    log(f"task {claim.id} skipped: {reason}")
+    return {"task": "skipped", "task_id": record["id"], "reason": reason}
+
+
+def _retry(store, claim, reason: str) -> dict:
+    outcome = store.retry(claim, reason=reason)
+    store.append_log(claim.id, f"retry: {reason} -> {outcome}")
+    log(f"task {claim.id}: {reason} -> {outcome}")
+    return {"task": outcome, "task_id": claim.id, "reason": reason}
+
+
+def execute_task(store, claim, namespace: str = "") -> dict:
+    """Run one claimed repair task and close its incident.
+
+    Order matters and mirrors the single-process controller: namespace check →
+    cooldown → report-only → dry run → hourly budget → incident → audit-gated
+    playbook → verify → incident + task status → notify.
+    """
+    task = claim.task
+    namespace = (namespace or task.get("namespace")
+                 or (NAMESPACES[0] if NAMESPACES else ""))
+    item = _task_item(task)
+    resource = (task.get("resource")
+                or incidents.resource_key(item["kind"], item["name"]))
+    task_id = claim.id
+    store.start(claim)
+    store.heartbeat("worker")
+    store.append_log(task_id, f"{namespace}/{resource} {item['cause']} "
+                              f"(attempt {task.get('attempts')})")
+    log(f"task {task_id}: {resource} {item['cause']} in {namespace}")
+
+    if namespace not in playbooks.ops_namespaces():
+        return _finish_skipped(
+            store, claim,
+            f"namespace {namespace!r} is outside AGENT_OPS_NAMESPACES",
+            {"action": "refused", "namespace": namespace})
+
+    if not task.get("force") and store.in_cooldown(resource, item["cause"]):
+        remaining = store.cooldown_remaining(resource, item["cause"])
+        return _finish_skipped(store, claim,
+                               f"cooldown ({remaining}s remaining)",
+                               {"action": "cooldown", "remaining": remaining})
+
+    if item["cause"] in REPORT_ONLY:
+        try:
+            incident = _incident_for(task, item, namespace)
+            store.update(task_id, incident_id=incident["id"])
+            incident.update({
+                "status": "needs_human", "needs_human": True,
+                "verification": "no automatic action taken",
+                "actions": [{"action": "report_only", "ok": False,
+                             "detail": _human_action(item["cause"])}],
+            })
+            incident["report"] = build_report(incident)
+            STORE.save(incident)
+        except incidents.IncidentError as exc:
+            return _retry(store, claim, f"incident store failed: {exc}")
+        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        notify(incident)
+        record = store.finish(
+            claim, status="needs_human",
+            result={"action": "report_only", "incident_id": incident["id"]},
+            verification="no automatic action taken")
+        store.append_log(task_id, "needs_human: report only")
+        return {"task": "needs_human", "incident": incident["id"],
+                "task_id": record["id"]}
+
+    if DRY_RUN:
+        try:
+            incident = _incident_for(task, item, namespace)
+            store.update(task_id, incident_id=incident["id"])
+            incident.update({
+                "status": "detected", "needs_human": False,
+                "actions": [{"action": "dry_run", "ok": True,
+                             "detail": f"would run the {item['cause']} playbook"}],
+                "verification": "dry run: nothing was changed",
+            })
+            incident["report"] = build_report(incident)
+            STORE.save(incident)
+        except incidents.IncidentError as exc:
+            return _retry(store, claim, f"incident store failed: {exc}")
+        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        notify(incident)
+        return _finish_skipped(store, claim,
+                               "dry run: nothing was changed",
+                               {"action": "dry_run",
+                                "incident_id": incident["id"]})
+
+    allowed, used = store.take_budget(MAX_ACTIONS_PER_HOUR)
+    if not allowed:
+        # A short cooldown stops the scanner from re-queueing the same finding
+        # on every pass; the hourly counter resets on its own.
+        store.set_cooldown(resource, item["cause"],
+                           max(60, min(COOLDOWN or 900, 900)))
+        return _finish_skipped(
+            store, claim,
+            f"hourly action budget reached ({used}/{MAX_ACTIONS_PER_HOUR})",
+            {"action": "budget", "used": used,
+             "limit": MAX_ACTIONS_PER_HOUR})
+
+    try:
+        incident = _incident_for(task, item, namespace)
+        store.update(task_id, incident_id=incident["id"])
+        incident["attempts"] = int(incident.get("attempts") or 0) + 1
+        incident.update({"status": "acting", "needs_human": False})
+        evidence = incident.get("evidence") or _diagnose(item, namespace)
+        if evidence:
+            incident["evidence"] = evidence
+        STORE.save(incident)
+    except incidents.IncidentError as exc:
+        return _retry(store, claim, f"incident store failed: {exc}")
+
+    store.append_log(task_id, f"incident {incident['id']} acting")
+    try:
+        with k8s_tools.incident_scope(incident["id"]):
+            result = _run_playbook(item, namespace, evidence)
+    except Exception as exc:
+        result = {"action": "playbook_error", "ok": False,
+                  "detail": f"{type(exc).__name__}: {exc}",
+                  "verification": "", "needs_human": False}
+        log(f"task {task_id}: playbook raised: {exc}")
+
+    _append_action(incident, result)
+    if result.get("action") == "playbook_error":
+        # Transient (kubectl timeout, API hiccup): retry with backoff instead
+        # of claiming a human is needed. The incident is reused on the retry.
+        incident.update({"status": "failed", "needs_human": False,
+                         "verification": result.get("verification", "")})
+        incident["report"] = build_report(incident)
+        try:
+            STORE.save(incident)
+        except incidents.IncidentError as exc:
+            log(f"task {task_id}: cannot save incident: {exc}")
+        outcome = store.retry(claim, reason=result.get("detail", ""),
+                              result={"action": "playbook_error",
+                                      "incident_id": incident["id"]})
+        store.append_log(task_id,
+                         f"retry: {result.get('detail', '')} -> {outcome}")
+        if outcome != "queued":
+            incident.update({"status": "needs_human", "needs_human": True})
+            try:
+                STORE.save(incident)
+                notify(incident)
+            except incidents.IncidentError as exc:
+                log(f"task {task_id}: cannot save incident: {exc}")
+        return {"task": outcome, "incident": incident["id"],
+                "task_id": task_id}
+
+    status = ("resolved" if result.get("ok")
+              else "needs_human" if result.get("needs_human")
+              else "failed")
+    incident.update({
+        "status": status,
+        "needs_human": status == "needs_human",
+        "verification": result.get("verification", ""),
+        "audit_ids": _audit_ids(incident["id"]),
+    })
+    incident["report"] = build_report(incident)
+    try:
+        STORE.save(incident)
+    except incidents.IncidentError as exc:
+        log(f"task {task_id}: cannot save incident: {exc}")
+
+    store.set_cooldown(resource, item["cause"], COOLDOWN)
+    notify(incident)
+    record = store.finish(
+        claim, status=status,
+        result={"action": result.get("action"),
+                "ok": bool(result.get("ok")),
+                "detail": result.get("detail", ""),
+                "incident_id": incident["id"]},
+        verification=result.get("verification", ""),
+        note=result.get("detail", "")[:200])
+    store.append_log(task_id, f"{status}: {result.get('detail', '')}")
+    log(f"task {task_id} -> {status}: {result.get('detail')}")
+    return {"task": status, "incident": incident["id"],
+            "task_id": record["id"]}
+
+
 def run_once() -> dict:
     touch_heartbeat()
     flush_pending()
@@ -568,7 +965,6 @@ def run_once() -> dict:
     except incidents.IncidentError as exc:
         log(f"prune failed: {exc}")
     return summary
-
 
 def _stop(signum, frame):  # noqa: ARG001 - signal handler signature
     log(f"received signal {signum}; finishing the current pass")

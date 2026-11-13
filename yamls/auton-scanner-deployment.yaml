@@ -1,0 +1,121 @@
+# Auton scanner: read-only detection that fills the repair queue.
+#
+# It has no write permission in any namespace and never mounts the model. Its
+# ServiceAccount (`auton-scanner`) can only `get/list/watch` in `auton-apps`.
+# Two replicas are enough to prove the deduplication contract: concurrent
+# submissions of the same finding collapse on the queue's idempotency key, and
+# an active task / cooldown suppresses a finding before it is queued.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auton-scanner
+  namespace: auton
+  labels:
+    app: auton-scanner
+    auton.io/protect: "true"
+spec:
+  replicas: 2
+  strategy:
+    type: Recreate          # stateless, but avoids overlapping chowns on the PVC
+  selector:
+    matchLabels:
+      app: auton-scanner
+  template:
+    metadata:
+      labels:
+        app: auton-scanner
+        auton.io/protect: "true"
+    spec:
+      serviceAccountName: auton-scanner
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: scanner
+        image: auton:local
+        imagePullPolicy: IfNotPresent
+        command: ["python", "ops_scanner.py"]
+        securityContext:
+          runAsUser: 10001
+          runAsGroup: 10001
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: HOME
+          value: "/tmp"
+        - name: TMPDIR
+          value: "/tmp"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        # --- Kubernetes access (read-only) -------------------------------- #
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef: { fieldPath: metadata.namespace }
+        - name: AGENT_NAMESPACES
+          value: "auton-apps"
+        - name: AGENT_OPS_NAMESPACES
+          value: "auton-apps"
+        - name: AGENT_K8S_ENABLED
+          value: "1"
+        - name: AGENT_K8S_WRITE
+          value: "0"
+        # The scanner does not read the shared incident store: task state and
+        # the queue cooldown are enough to suppress a duplicate. A private
+        # emptyDir keeps it off the RWO workspace PVC entirely.
+        - name: AGENT_AUDIT_DIR
+          value: "/tmp/ops"
+        - name: AGENT_INCIDENTS_DIR
+          value: "/tmp/ops/incidents"
+        # --- queue --------------------------------------------------------- #
+        - name: AGENT_QUEUE
+          value: "redis"
+        - name: AGENT_REDIS_URL
+          value: "redis://redis.auton.svc.cluster.local:6379/0"
+        - name: AGENT_QUEUE_PREFIX
+          value: "auton"
+        - name: AGENT_QUEUE_MAX
+          value: "500"
+        - name: AGENT_SCAN_INTERVAL
+          value: "60"
+        # Two scanners that read the same snapshot try to enqueue together;
+        # this window is what turns that into one task.
+        - name: AGENT_SCAN_DEDUPE_WINDOW
+          value: "300"
+        - name: AGENT_OPS_COOLDOWN
+          value: "1800"
+        - name: AGENT_OPS_STARTUP_GRACE
+          value: "120"
+        - name: AGENT_OPS_TERMINATION_GRACE
+          value: "120"
+        - name: AGENT_OPS_HEARTBEAT
+          value: "/tmp/scanner-heartbeat"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - |
+              import os, sys, time
+              path = "/tmp/scanner-heartbeat"
+              sys.exit(0 if os.path.exists(path)
+                       and time.time() - os.path.getmtime(path) < 600 else 1)
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          failureThreshold: 5
+      volumes:
+      - name: tmp
+        emptyDir: {}

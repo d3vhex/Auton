@@ -1,5 +1,5 @@
 {{/* Common helpers. Resource names are fixed on purpose: docs, generated n8n
-   workflows and the ops controller all use "auton:8080" by DNS. */}}
+   workflows and the workers all use "auton:8080" by DNS. */}}
 
 {{- define "auton.name" -}}
 {{- default "auton" .Values.nameOverride -}}
@@ -32,15 +32,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
 
-{{- define "auton.opsImage" -}}
-{{- if .Values.ops.image.repository -}}
-{{- $tag := default .Chart.AppVersion .Values.ops.image.tag -}}
-{{- printf "%s:%s" .Values.ops.image.repository $tag -}}
-{{- else -}}
-{{- include "auton.image" . -}}
-{{- end -}}
-{{- end -}}
-
 {{/* Bearer token: explicit value > existing Secret > generated (kept on upgrade). */}}
 {{- define "auton.apiToken" -}}
 {{- if .Values.agent.auth.token -}}
@@ -64,18 +55,35 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default "agent-workspace" .Values.agent.workspace.existingClaim -}}
 {{- end -}}
 
-{{- define "auton.opsClaim" -}}
-{{- if .Values.ops.workspace.existingClaim -}}
-{{- .Values.ops.workspace.existingClaim -}}
-{{- else if .Values.ops.workspace.create -}}
-{{- printf "%s-ops-workspace" (include "auton.name" .) -}}
-{{- else -}}
+{{/* The shared workspace: audit log, incident store and the agent's files. */}}
+{{- define "auton.workspaceClaim" -}}
 {{- include "auton.agentClaim" . -}}
-{{- end -}}
 {{- end -}}
 
 {{- define "auton.modelSecretName" -}}
 {{- default "auton-model" .Values.provider.secretName -}}
+{{- end -}}
+
+{{- define "auton.redisSecretName" -}}
+{{- default "auton-redis" .Values.queue.redisSecretName -}}
+{{- end -}}
+
+{{/* URL every pod uses to reach the queue. */}}
+{{- define "auton.redisUrl" -}}
+{{- if .Values.queue.redisUrl -}}
+{{- .Values.queue.redisUrl -}}
+{{- else -}}
+{{- printf "redis://redis.%s.svc.cluster.local:6379/0" (include "auton.namespace" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Password source for the queue: inline value > Secret > none. */}}
+{{- define "auton.redisPasswordValue" -}}
+{{- if .Values.queue.redisPassword -}}
+{{- .Values.queue.redisPassword -}}
+{{- else -}}
+{{- "" -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "auton.n8nUrl" -}}

@@ -12,6 +12,7 @@ Tools exposed over stdio (the MCP standard transport):
                  k8s_rollout, k8s_delete          (k8s_tools.py)
   n8n            n8n_workflows, n8n_activate, n8n_executions, n8n_webhook,
                  n8n_create_agent_pipeline         (n8n_tools.py)
+  Queue          task_queue                       (task_store.py)
 
 Design notes
 ------------
@@ -1100,6 +1101,128 @@ def todo_write(todos: list[dict] | None = None) -> str:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(todos, indent=2), encoding="utf-8")
     return "\n".join(rendered)
+
+
+# --------------------------------------------------------------------------- #
+# Task queue (repair + agent)
+# --------------------------------------------------------------------------- #
+
+TASK_STORE = None          # lazy: importing the server must never need Redis
+
+
+def _task_store():
+    global TASK_STORE
+    if TASK_STORE is None:
+        import task_store
+
+        TASK_STORE = task_store.TaskStore()
+    return TASK_STORE
+
+
+@mcp.tool()
+def task_queue(action: str = "list", task_id: str = "", queue: str = "",
+               status: str = "", limit: int = 20, kind: str = "",
+               name: str = "", namespace: str = "", cause: str = "",
+               force: bool = False) -> str:
+    """Inspect or submit work on the shared task queue (repair and agent jobs).
+
+    action:
+      list   -> recent tasks; filter with queue=repair|agent and
+                status=queued|running|resolved|needs_human|done|error|...
+      get    -> one task plus its log tail (needs task_id)
+      stats  -> queue depth, active counts, worker heartbeats, hourly budget
+      submit -> enqueue a REPAIR task (needs kind, name, cause). Namespace
+                defaults to the ops namespace. The worker re-checks the
+                namespace/cooldown/lock/budget and every mutation is audited.
+      cancel -> cancel a queued task (needs task_id)
+
+    Use `list`/`get` to see what the autonomous workers already did before
+    proposing a repair; do not submit a task for a resource that is already
+    queued or in cooldown.
+    """
+    try:
+        store = _task_store()
+    except Exception as exc:  # QueueError or a redis import error
+        return _err(f"task store unavailable: {exc}",
+                    "AGENT_QUEUE=redis needs Redis at AGENT_REDIS_URL; "
+                    "there is no memory fallback")
+    action = (action or "list").strip().lower()
+    try:
+        if action == "stats":
+            return _clip(json.dumps(store.stats(), indent=2, default=str),
+                         MAX_OUTPUT_CHARS)
+        if action == "list":
+            records = store.list(queue=(queue or "").strip().lower(),
+                                 status=(status or "").strip().lower(),
+                                 limit=max(1, min(int(limit or 20), 100)))
+            summary = [{
+                "task_id": record.get("id"),
+                "queue": record.get("queue"),
+                "status": record.get("status"),
+                "priority": record.get("priority"),
+                "resource": record.get("resource"),
+                "cause": record.get("cause"),
+                "namespace": record.get("namespace"),
+                "attempts": record.get("attempts"),
+                "worker": record.get("worker"),
+                "created_at": record.get("created_at"),
+                "finished_at": record.get("finished_at"),
+                "incident_id": record.get("incident_id"),
+            } for record in records]
+            return _clip(json.dumps({"count": len(summary), "tasks": summary},
+                                    indent=2, default=str), MAX_OUTPUT_CHARS)
+        if action == "get":
+            import task_store
+
+            if not task_store.valid_id((task_id or "").strip()):
+                return _err("task_id must look like tsk-0123456789ab")
+            record = store.get(task_id.strip())
+            if record is None:
+                return _err(f"unknown task {task_id!r}",
+                            "use task_queue(action='list') first")
+            payload = dict(record)
+            payload["logs"] = store.logs(task_id.strip(), limit=80)
+            return _clip(json.dumps(payload, indent=2, default=str),
+                         MAX_OUTPUT_CHARS)
+        if action == "cancel":
+            import task_store
+
+            if not task_store.valid_id((task_id or "").strip()):
+                return _err("task_id must look like tsk-0123456789ab")
+            try:
+                record = store.cancel(task_id.strip(), by="agent")
+            except task_store.TaskError as exc:
+                return _err(str(exc))
+            return json.dumps({"ok": True, "task_id": record["id"],
+                               "status": record["status"]})
+        if action == "submit":
+            import ops_controller as ops  # lazy: only submit needs the rules
+
+            try:
+                record = ops.submit_manual(
+                    store,
+                    {"kind": kind, "name": name, "cause": cause,
+                     "namespace": namespace, "force": bool(force)},
+                    actor="agent", source="agent")
+            except ValueError as exc:
+                return _err(f"invalid repair task: {exc}",
+                            "kind is Pod|Deployment|StatefulSet|"
+                            "PersistentVolumeClaim and cause is one of "
+                            + ", ".join(sorted(ops.CAUSE_TEXT)))
+            return json.dumps({
+                "ok": True,
+                "task_id": record["id"],
+                "queue": record["queue"],
+                "status": record["status"],
+                "resource": record.get("resource", ""),
+                "priority": record.get("priority"),
+                "note": "the repair worker will validate and run it; "
+                        "poll task_queue(action='get', task_id=...)",
+            })
+        return _err(f"unknown action {action!r}",
+                    "use list, get, stats, submit or cancel")
+    except Exception as exc:  # QueueError and friends become a tool error
+        return _err(f"task queue {action} failed: {type(exc).__name__}: {exc}")
 
 
 @mcp.tool()

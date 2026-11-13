@@ -1,23 +1,27 @@
-# RBAC for the Auton agent and the autonomous ops controller.
+# RBAC for the Auton agent, the API, the scanners and the repair workers.
 #
-# Both pods run kubectl inside their own pod with the token of their
+# Every pod runs kubectl inside its own pod with the token of its
 # ServiceAccount. RBAC — not the Python code — is the real security boundary.
-# The agent can repair its own namespace; the ops controller is narrower: it
-# repairs only `auton-apps` and can only read `auton` (so a bug in a playbook
-# cannot touch the API, its PVC or its Deployment).
+# There are four identities:
+#
+#   auton-api      the HTTP API: may only PATCH the provider ConfigMap/Secret
+#   auton-scanner  read-only detection in `auton-apps`; never mutates
+#   auton-worker   repair rights in `auton-apps` only (the playbooks)
+#   auton-agent    the LLM executor: repair rights in `auton` + `auton-apps`
 #
 # Namespace scope (auton + auton-apps): the agent may repair workloads, which
 # is what "autonomous operations" needs. Deliberately NOT granted anywhere:
-#   - secrets               (a pod can still reference one by name; keep the
-#                            target namespaces free of long-lived credentials)
+#   - general secrets access  (one exception: the API identity may PATCH the
+#                              single Secret `auton-model` to store a provider
+#                              API key; never get/list another Secret)
 #   - persistentvolumeclaims delete   (data loss is irreversible; the agent must
 #                            report and ask a human, and RBAC enforces it even
 #                            if the tool guard is bypassed)
 #   - serviceaccounts / roles / rolebindings   (no privilege escalation)
 #   - namespaces delete
 #
-# Cluster scope is read-only (auton-cluster-reader): nodes, PVs, CRDs and
-# storage classes are needed for diagnosis, never for mutation.
+# Cluster scope is read-only (auton-cluster-reader) and only the LLM executor
+# needs it; scanners/workers read just their namespace.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -26,12 +30,65 @@ metadata:
   namespace: auton
 automountServiceAccountToken: true
 ---
-# The ops controller runs as its own identity: repair rights in auton-apps,
-# read-only in auton. It never needs secrets, exec or PVC deletion.
+# The HTTP API's own identity. It is deliberately almost powerless: the only
+# mutation it performs is writing model-provider settings for the UI. Workload
+# repair runs in the worker pods with their own ServiceAccount, so a bug in the
+# UI/HTTP layer cannot delete a pod.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: auton-ops
+  name: auton-api
+  namespace: auton
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-api
+  namespace: auton
+rules:
+# Provider settings only. resourceNames is the boundary: no other ConfigMap or
+# Secret is reachable, and `get` is not granted (the agent reads the projected
+# files, not the API objects).
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["auton-model-config"]
+  verbs: ["patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["auton-model"]
+  verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-api
+  namespace: auton
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-api
+subjects:
+- kind: ServiceAccount
+  name: auton-api
+  namespace: auton
+---
+# The scanner is read-only: a bug there can only produce a wrong finding, never
+# a mutation. It repairs nothing, so it needs no write verbs anywhere.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auton-scanner
+  namespace: auton
+automountServiceAccountToken: true
+---
+# The repair worker owns every playbook mutation. Its Role (below) is limited
+# to `auton-apps`, so even a compromised worker cannot touch the API, Redis or
+# its own Deployment.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auton-worker
   namespace: auton
 automountServiceAccountToken: true
 ---
@@ -250,7 +307,59 @@ subjects:
   name: auton-agent
   namespace: auton
 # --------------------------------------------------------------------------- #
-# Ops controller (auton-ops) — narrow, playbook-shaped permissions.
+# Scanner identity: read-only, `auton-apps` only.
+# --------------------------------------------------------------------------- #
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-scanner
+  namespace: auton-apps
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/log
+  - pods/status
+  - services
+  - endpoints
+  - configmaps
+  - persistentvolumeclaims
+  - events
+  - resourcequotas
+  - limitranges
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "networkpolicies"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-scanner
+  namespace: auton-apps
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-scanner
+subjects:
+- kind: ServiceAccount
+  name: auton-scanner
+  namespace: auton
+# --------------------------------------------------------------------------- #
+# Worker identity: the playbooks, and nothing else.
 #
 # Read everything it diagnoses, delete pods (stuck/CrashLoop) and patch/scale
 # Deployments (OOM bump, rollout undo). No create, no configmaps, no exec,
@@ -260,7 +369,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: auton-ops
+  name: auton-worker
   namespace: auton-apps
 rules:
 - apiGroups: [""]
@@ -305,77 +414,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: auton-ops
+  name: auton-worker
   namespace: auton-apps
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: auton-ops
+  name: auton-worker
 subjects:
 - kind: ServiceAccount
-  name: auton-ops
-  namespace: auton
----
-# Read-only in `auton`: the controller may diagnose but never repair the API,
-# its PVC or its own Deployment.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: auton-ops-reader
-  namespace: auton
-rules:
-- apiGroups: [""]
-  resources:
-  - pods
-  - pods/log
-  - pods/status
-  - services
-  - endpoints
-  - configmaps
-  - persistentvolumeclaims
-  - events
-  - resourcequotas
-  - limitranges
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["apps"]
-  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["batch"]
-  resources: ["jobs", "cronjobs"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["networking.k8s.io"]
-  resources: ["ingresses", "networkpolicies"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["autoscaling"]
-  resources: ["horizontalpodautoscalers"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["policy"]
-  resources: ["poddisruptionbudgets"]
-  verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: auton-ops-reader
-  namespace: auton
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: auton-ops-reader
-subjects:
-- kind: ServiceAccount
-  name: auton-ops
-  namespace: auton
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: auton-ops-cluster-reader
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: auton-cluster-reader
-subjects:
-- kind: ServiceAccount
-  name: auton-ops
+  name: auton-worker
   namespace: auton

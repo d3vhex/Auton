@@ -22,7 +22,7 @@ metadata:
     {{- with .Values.namespaceLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-    # Read by the ops controller.
+    # Read by the scanners and workers.
     auton.io/ops: "enabled"
   annotations:
     helm.sh/resource-policy: keep

@@ -2,12 +2,220 @@
 {{- $ns := include "auton.namespace" . }}
 {{- $apps := include "auton.appsNamespace" . }}
 {{- $agent := .Values.serviceAccount.agent.name }}
-{{- $ops := .Values.serviceAccount.ops.name }}
+{{- $api := .Values.serviceAccount.api.name }}
+{{- $scanner := .Values.serviceAccount.scanner.name }}
+{{- $worker := .Values.serviceAccount.worker.name }}
+# --------------------------------------------------------------------------- #
+# Service accounts: one identity per pod role, so a bug in one cannot use the
+# permissions of another. RBAC — not the Python code — is the real boundary.
+# --------------------------------------------------------------------------- #
+{{- if .Values.serviceAccount.agent.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $agent }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+{{- end }}
+{{- if .Values.serviceAccount.api.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $api }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+# The API's only mutation is writing provider settings for the UI. The agent
+# loop runs in auton-ops, so this identity cannot delete a pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-api
+  namespace: {{ $ns }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+rules:
+  # resourceNames is the boundary: no other ConfigMap or Secret is reachable,
+  # and `get` is not granted (the agent reads the projected files instead).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["auton-model-config"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["auton-model"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-api
+  namespace: {{ $ns }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-api
+subjects:
+  - kind: ServiceAccount
+    name: {{ $api }}
+    namespace: {{ $ns }}
+{{- end }}
+{{- if .Values.serviceAccount.scanner.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $scanner }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+# Read-only: a bug in the scanner can produce a wrong finding, never a mutation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-scanner
+  namespace: {{ $apps }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+      - services
+      - endpoints
+      - configmaps
+      - persistentvolumeclaims
+      - events
+      - resourcequotas
+      - limitranges
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-scanner
+  namespace: {{ $apps }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-scanner
+subjects:
+  - kind: ServiceAccount
+    name: {{ $scanner }}
+    namespace: {{ $ns }}
+{{- end }}
+{{- if .Values.serviceAccount.worker.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $worker }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+# Playbook-shaped and nothing else: read for diagnosis, delete pods (stuck /
+# CrashLoopBackOff), patch and scale Deployments (OOM bump, rollout undo).
+# No create, no configmaps, no exec, no secrets, no PVC verbs at all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auton-worker
+  namespace: {{ $apps }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+      - services
+      - endpoints
+      - configmaps
+      - persistentvolumeclaims
+      - events
+      - resourcequotas
+      - limitranges
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auton-worker
+  namespace: {{ $apps }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auton-worker
+subjects:
+  - kind: ServiceAccount
+    name: {{ $worker }}
+    namespace: {{ $ns }}
+{{- end }}
+{{- if .Values.serviceAccount.agent.create }}
+# --------------------------------------------------------------------------- #
+# The LLM executor: repair rights in both namespaces + the read-only cluster
+# view its kubectl tools need. Deliberately absent everywhere: secrets,
+# serviceaccounts/roles/rolebindings, namespace delete, PVC delete.
+# --------------------------------------------------------------------------- #
 {{- range $target := list $ns $apps }}
 ---
-# The agent may repair workloads in both namespaces. Deliberately absent
-# everywhere: secrets, PVC delete, serviceaccounts/roles/rolebindings,
-# namespace delete.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -138,123 +346,6 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ $agent }}
-    namespace: {{ $ns }}
-{{- end }}
-{{- if .Values.ops.enabled }}
----
-# Narrow, playbook-shaped permissions: read everything, delete pods, patch and
-# scale Deployments in the repair namespace only.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: auton-ops
-  namespace: {{ $apps }}
-  labels:
-    {{- include "auton.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "pods/log", "pods/status", "services", "endpoints", "configmaps",
-                "persistentvolumeclaims", "events", "resourcequotas", "limitranges"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "networkpolicies"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["delete"]
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["update", "patch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    verbs: ["get", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: auton-ops
-  namespace: {{ $apps }}
-  labels:
-    {{- include "auton.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: auton-ops
-subjects:
-  - kind: ServiceAccount
-    name: {{ $ops }}
-    namespace: {{ $ns }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: auton-ops-reader
-  namespace: {{ $ns }}
-  labels:
-    {{- include "auton.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "pods/log", "pods/status", "services", "endpoints", "configmaps",
-                "persistentvolumeclaims", "events", "resourcequotas", "limitranges"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "networkpolicies"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: auton-ops-reader
-  namespace: {{ $ns }}
-  labels:
-    {{- include "auton.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: auton-ops-reader
-subjects:
-  - kind: ServiceAccount
-    name: {{ $ops }}
-    namespace: {{ $ns }}
-{{- if .Values.rbac.clusterReader }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: auton-ops-cluster-reader
-  labels:
-    {{- include "auton.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: auton-cluster-reader
-subjects:
-  - kind: ServiceAccount
-    name: {{ $ops }}
     namespace: {{ $ns }}
 {{- end }}
 {{- end }}

@@ -9,7 +9,7 @@ metadata:
     app: auton-ops
     auton.io/protect: "true"
 spec:
-  replicas: 1
+  replicas: {{ .Values.ops.replicas }}
   strategy:
     type: Recreate          # RWO volume: never run two pods at once
   selector:
@@ -22,7 +22,10 @@ spec:
         app: auton-ops
         auton.io/protect: "true"
     spec:
-      serviceAccountName: {{ .Values.serviceAccount.ops.name }}
+      # The LLM executor keeps the broad `auton-agent` identity: the agent loop
+      # needs both namespaces and the read-only cluster view for its tools.
+      # Repair playbooks are *not* here — the workers own them.
+      serviceAccountName: {{ .Values.serviceAccount.agent.name }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -34,7 +37,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: fix-workspace-owner
-          image: {{ include "auton.opsImage" . }}
+          image: {{ include "auton.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
           securityContext:
@@ -50,9 +53,9 @@ spec:
               mountPath: /workspace
       containers:
         - name: ops
-          image: {{ include "auton.opsImage" . }}
+          image: {{ include "auton.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["python", "ops_controller.py"]
+          command: ["python", "agent_worker.py"]
           securityContext:
             runAsUser: 10001
             runAsGroup: 10001
@@ -61,58 +64,60 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          {{- $env := dict
+            "HOME" "/tmp"
+            "TMPDIR" "/tmp"
+            "PYTHONDONTWRITEBYTECODE" "1"
+            "AGENT_WORKSPACE" "/workspace"
+            "AGENT_AUDIT_DIR" "/workspace/.ops"
+            "AGENT_INCIDENTS_DIR" "/workspace/.ops/incidents"
+            "AGENT_MODEL" .Values.agent.model
+            "AGENT_MODEL_DIR" "/etc/auton-model"
+            "AGENT_NUM_CTX" (toString .Values.agent.numCtx)
+            "MAX_STEPS" (toString .Values.agent.maxSteps)
+            "AGENT_MAX_OBSERVATION_CHARS" (toString .Values.agent.maxObservationChars)
+            "AGENT_MAX_HISTORY_CHARS" (toString .Values.agent.maxHistoryChars)
+            "AGENT_JOB_TIMEOUT" (toString .Values.agent.jobTimeout)
+            "AGENT_SANDBOX" "off"
+            "OLLAMA_HOST" .Values.provider.baseUrl
+            "AGENT_NAMESPACES" (printf "%s,%s" (include "auton.namespace" .) (include "auton.appsNamespace" .))
+            "AGENT_K8S_ENABLED" "1"
+            "AGENT_K8S_WRITE" "1"
+            "AGENT_QUEUE" .Values.queue.backend
+            "AGENT_REDIS_URL" (include "auton.redisUrl" .)
+            "AGENT_QUEUE_PREFIX" .Values.queue.prefix
+            "AGENT_WORKER_POLL" (toString .Values.ops.poll)
+            "AGENT_TASK_LEASE" (toString .Values.queue.lease)
+            "AGENT_GPU_LOCK_TTL" (toString .Values.queue.gpuLockTtl)
+            "AGENT_OPS_HEARTBEAT" .Values.ops.heartbeat
+            "N8N_API_URL" (printf "%s/api/v1" (include "auton.n8nUrl" .))
+            "N8N_WEBHOOK_BASE" (printf "%s/webhook" (include "auton.n8nUrl" .))
+            "N8N_API_KEY_FILE" "/etc/n8n-api/api-key"
+          }}
+          {{- range $key, $value := .Values.ops.env }}
+          {{- $_ := set $env $key (toString $value) }}
+          {{- end }}
           env:
-            - name: HOME
-              value: /tmp
-            - name: TMPDIR
-              value: /tmp
-            - name: PYTHONDONTWRITEBYTECODE
-              value: "1"
             - name: AGENT_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: AGENT_NAMESPACES
-              value: {{ printf "%s,%s" (include "auton.namespace" .) (include "auton.appsNamespace" .) | quote }}
-            - name: AGENT_OPS_NAMESPACES
-              value: {{ join "," .Values.ops.namespaces | quote }}
-            - name: AGENT_K8S_ENABLED
-              value: "1"
-            - name: AGENT_K8S_WRITE
-              value: "1"
-            - name: AGENT_AUDIT_DIR
-              value: /workspace/.ops
-            - name: AGENT_INCIDENTS_DIR
-              value: /workspace/.ops/incidents
-            - name: AGENT_OPS_INTERVAL
-              value: {{ .Values.ops.interval | quote }}
-            - name: AGENT_OPS_COOLDOWN
-              value: {{ .Values.ops.cooldown | quote }}
-            - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
-              value: {{ .Values.ops.maxActionsPerHour | quote }}
-            - name: AGENT_OPS_STARTUP_GRACE
-              value: {{ .Values.ops.startupGrace | quote }}
-            - name: AGENT_OPS_TERMINATION_GRACE
-              value: {{ .Values.ops.terminationGrace | quote }}
-            - name: AGENT_OPS_MAX_MEMORY
-              value: {{ .Values.ops.maxMemory | quote }}
-            - name: AGENT_OPS_MAX_INCIDENTS
-              value: {{ .Values.ops.maxIncidents | quote }}
-            - name: AGENT_OPS_DRY_RUN
-              value: {{ ternary "1" "0" .Values.ops.dryRun | quote }}
-            - name: AGENT_OPS_HEARTBEAT
-              value: {{ .Values.ops.heartbeat | quote }}
-            - name: AGENT_API_URL
-              value: {{ .Values.ops.apiUrl | quote }}
             - name: AGENT_API_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ default (include "auton.tokenSecretName" .) .Values.agent.auth.existingSecret }}
                   key: token
-            - name: AGENT_UI_URL
-              value: {{ .Values.ops.uiUrl | quote }}
-            - name: N8N_OPS_WEBHOOK
-              value: {{ .Values.ops.n8nWebhook | quote }}
+            {{- if .Values.queue.redisExistingSecret }}
+            - name: AGENT_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.queue.redisExistingSecret }}
+                  key: password
+            {{- end }}
+            {{- range $key, $value := $env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.ops.resources | nindent 12 }}
           volumeMounts:
@@ -120,6 +125,16 @@ spec:
               mountPath: /workspace
             - name: tmp
               mountPath: /tmp
+            - name: model-config
+              mountPath: /etc/auton-model/config
+              readOnly: true
+            - name: model-secret
+              mountPath: /etc/auton-model/secret
+              readOnly: true
+            # optional: the executor starts even before the n8n API key exists.
+            - name: n8n-api
+              mountPath: /etc/n8n-api
+              readOnly: true
           livenessProbe:
             exec:
               command:
@@ -129,16 +144,27 @@ spec:
                   import os, sys, time
                   path = "{{ .Values.ops.heartbeat }}"
                   sys.exit(0 if os.path.exists(path)
-                           and time.time() - os.path.getmtime(path) < 1800 else 1)
+                           and time.time() - os.path.getmtime(path) < 600 else 1)
             initialDelaySeconds: 60
             periodSeconds: 60
-            failureThreshold: 3
+            failureThreshold: 5
       volumes:
         - name: workspace
           persistentVolumeClaim:
-            claimName: {{ include "auton.opsClaim" . }}
+            claimName: {{ include "auton.workspaceClaim" . }}
         - name: tmp
           emptyDir: {}
+        - name: model-config
+          configMap:
+            name: auton-model-config
+        - name: model-secret
+          secret:
+            secretName: {{ default (include "auton.modelSecretName" .) .Values.provider.existingSecret }}
+            optional: true
+        - name: n8n-api
+          secret:
+            secretName: {{ default .Values.n8n.apiKey.secretName .Values.n8n.apiKey.existingSecret }}
+            optional: true
       {{- with .Values.ops.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

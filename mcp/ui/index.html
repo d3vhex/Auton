@@ -30,50 +30,99 @@
   }
   .chip b { color: var(--text); font-weight: 600; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
-  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .dot.warn { background: var(--warn); }
   .spacer { flex: 1; }
-  button, select, input, textarea {
-    font: inherit; color: var(--text); background: var(--panel2);
-    border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px;
+  nav {
+    display: flex; gap: 4px; padding: 8px 18px 0; background: var(--panel);
+    border-bottom: 1px solid var(--line);
   }
-  button { cursor: pointer; }
-  button:hover { border-color: var(--accent); }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #06111f; font-weight: 600; }
-  button.danger { border-color: #5a2a2a; color: var(--bad); }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  nav { display: flex; gap: 6px; padding: 10px 18px 0; }
-  nav button { border-radius: 8px 8px 0 0; border-bottom-color: transparent; color: var(--dim); }
-  nav button.active { background: var(--panel); color: var(--text); border-color: var(--line); border-bottom-color: var(--panel); }
-  main { flex: 1; min-height: 0; padding: 0 18px 18px; }
-  .pane { display: none; height: 100%; }
-  .pane.active { display: flex; flex-direction: column; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 0 10px 10px 10px; padding: 14px; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+  nav button {
+    background: transparent; color: var(--dim); border: 0;
+    border-bottom: 2px solid transparent; padding: 8px 14px; cursor: pointer;
+    font: inherit;
+  }
+  nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { flex: 1; overflow: auto; padding: 16px 18px 28px; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; display: flex; flex-direction: column; gap: 12px;
+  }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  textarea { width: 100%; min-height: 92px; resize: vertical; font-family: var(--mono); font-size: 13px; }
-  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1; min-height: 0; }
-  .box { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; min-height: 0; }
-  .box h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .box {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; min-height: 180px; max-height: 55vh; overflow: auto;
+  }
+  .box h3 { margin: 0 0 8px; font-size: 12px; color: var(--dim); font-weight: 500; }
   pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; }
-  .status { color: var(--dim); font-size: 12.5px; min-height: 18px; }
+  textarea, input, select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font: inherit; width: 100%;
+  }
+  textarea { min-height: 92px; resize: vertical; font-family: var(--mono); font-size: 12.5px; }
+  input[type=number] { width: 110px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); flex: 1; min-width: 150px; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 13px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  button.danger { color: var(--bad); }
+  .status { color: var(--dim); font-size: 12.5px; }
   .status.err { color: var(--bad); }
-  .list { overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+  .list { display: flex; flex-direction: column; gap: 10px; }
   .incident { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel2); cursor: pointer; }
   .incident:hover { border-color: var(--accent); }
   .incident .top { display: flex; gap: 10px; align-items: center; }
   .incident .id { font-family: var(--mono); font-size: 12px; color: var(--dim); }
   .incident .sum { flex: 1; }
   .badge { padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); text-transform: uppercase; letter-spacing: .4px; }
-  .badge.resolved { color: var(--ok); border-color: #1f5a41; }
+  .badge.resolved, .badge.done { color: var(--ok); border-color: #1f5a41; }
   .badge.needs_human { color: var(--warn); border-color: #5c4720; }
-  .badge.failed { color: var(--bad); border-color: #5a2a2a; }
-  .badge.detected, .badge.acting { color: var(--accent); border-color: #234a72; }
+  .badge.failed, .badge.error { color: var(--bad); border-color: #5a2a2a; }
+  .badge.detected, .badge.acting, .badge.queued, .badge.claimed,
+  .badge.running, .badge.verifying { color: var(--accent); border-color: #234a72; }
+  .badge.skipped, .badge.cancelled { color: var(--dim); }
   .meta { color: var(--dim); font-size: 12px; margin-top: 3px; }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--bg); }
   td.mono { font-family: var(--mono); font-size: 12px; }
   .hidden { display: none !important; }
-  .toast { position: fixed; right: 18px; bottom: 18px; background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 8px; max-width: 420px; }
+  .toast { position: fixed; right: 18px; bottom: 18px; background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 8px; max-width: 420px; z-index: 40; }
+  /* Auth banner: always visible while the page is open but the token is not. */
+  .banner {
+    display: flex; gap: 10px; align-items: center; padding: 9px 18px;
+    background: #2a2410; border-bottom: 1px solid #5c4720; color: #f2dfae;
+    font-size: 13px;
+  }
+  .banner b { color: #ffe9b8; }
+  .banner .spacer { flex: 1; }
+  /* Modal */
+  .modal {
+    position: fixed; inset: 0; background: rgba(4, 7, 12, .72);
+    display: flex; align-items: center; justify-content: center; padding: 18px;
+    z-index: 50;
+  }
+  .modal-card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 22px; width: min(620px, 100%); max-height: 92vh; overflow: auto;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .modal-card h2 { margin: 0; font-size: 17px; }
+  .modal-card h3 { margin: 6px 0 0; font-size: 12px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+  .modal-card p { margin: 0; font-size: 13px; color: #c3cee0; }
+  .modal-card code { font-family: var(--mono); font-size: 12.5px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+  .cmd { display: flex; gap: 8px; align-items: stretch; }
+  .cmd pre { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; overflow: auto; }
+  .keyrow { display: flex; gap: 8px; align-items: flex-end; }
+  .keyrow label { flex: 1; }
   @media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -84,13 +133,21 @@
   <span class="chip">provider <b id="provider-name">—</b></span>
   <span class="chip">model <b id="model-name">—</b></span>
   <span class="spacer"></span>
-  <span class="chip" id="token-chip" title="Bearer token for the API">token <b id="token-state">not set</b></span>
-  <button id="token-btn">Set token</button>
+  <span class="chip" id="token-chip">token <b id="token-state">not set</b></span>
+  <button id="token-btn">API access</button>
 </header>
+
+<div class="banner hidden" id="auth-banner">
+  <span><b>Read-only mode.</b> The page is public, but running tasks, the task
+    queue, incidents, audit and provider settings need the API token.</span>
+  <span class="spacer"></span>
+  <button id="banner-token">Add token</button>
+</div>
 
 <nav>
   <button data-tab="chat" class="active">Chat</button>
   <button data-tab="incidents">Incidents</button>
+  <button data-tab="tasks">Tasks</button>
   <button data-tab="audit">Audit</button>
   <button data-tab="provider">Provider</button>
 </nav>
@@ -118,7 +175,7 @@
   <section class="pane" id="pane-incidents">
     <div class="card">
       <div class="row">
-        <select id="incident-filter">
+        <select id="incident-filter" style="width:auto">
           <option value="">all statuses</option>
           <option value="needs_human">needs human</option>
           <option value="resolved">resolved</option>
@@ -130,6 +187,73 @@
         <span class="status" id="incident-status"></span>
       </div>
       <div class="list" id="incident-list"></div>
+    </div>
+  </section>
+
+  <!-- Tasks ------------------------------------------------------------ -->
+  <section class="pane" id="pane-tasks">
+    <div class="card">
+      <div class="row">
+        <select id="task-queue" style="width:auto">
+          <option value="">all queues</option>
+          <option value="repair">repair (scanner + manual)</option>
+          <option value="agent">agent (LLM)</option>
+        </select>
+        <select id="task-status" style="width:auto">
+          <option value="">all statuses</option>
+          <option value="queued">queued</option>
+          <option value="running">running</option>
+          <option value="resolved">resolved</option>
+          <option value="needs_human">needs human</option>
+          <option value="failed">failed</option>
+          <option value="skipped">skipped</option>
+          <option value="done">done (agent)</option>
+          <option value="error">error (agent)</option>
+          <option value="cancelled">cancelled</option>
+        </select>
+        <button id="task-reload">Refresh</button>
+        <span class="status" id="task-status-line"></span>
+      </div>
+      <div class="row" id="task-stats"></div>
+      <div class="list" id="task-detail"></div>
+      <div class="list" id="task-list"></div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3 style="margin:0;font-size:12px;color:var(--dim)">Manual repair</h3>
+      <p class="status" style="margin:0">
+        Queues a repair task for the workers. They still check the
+        <code>auton-apps</code> allowlist, the resource lock, the cooldown and the
+        hourly budget, and every kubectl call is audit-gated. Image, config,
+        scheduling and PVC problems stay report-only.
+      </p>
+      <div class="row">
+        <label>kind
+          <select id="m-kind">
+            <option value="Pod">Pod</option>
+            <option value="Deployment">Deployment</option>
+            <option value="StatefulSet">StatefulSet</option>
+            <option value="PersistentVolumeClaim">PersistentVolumeClaim</option>
+          </select>
+        </label>
+        <label>name
+          <input id="m-name" placeholder="api-1" autocomplete="off">
+        </label>
+        <label>namespace
+          <input id="m-ns" value="auton-apps" autocomplete="off">
+        </label>
+        <label>cause
+          <select id="m-cause"></select>
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex-direction:row;align-items:center;gap:6px;min-width:0;flex:0">
+          <input id="m-force" type="checkbox" checked style="width:auto">
+          ignore cooldown (budget still applies)
+        </label>
+        <button class="primary" id="m-submit">Queue repair</button>
+        <span class="status" id="m-status"></span>
+      </div>
     </div>
   </section>
 
@@ -153,14 +277,97 @@
   <section class="pane" id="pane-provider">
     <div class="card">
       <div class="row">
-        <button id="provider-reload">Refresh</button>
+        <label>Provider
+          <select id="p-provider"></select>
+        </label>
+        <label>Model
+          <input id="p-model" placeholder="qwen2.5-coder:7b-instruct">
+        </label>
+      </div>
+      <div class="row">
+        <label>Base URL
+          <input id="p-base" placeholder="http://ollama-service:11434">
+        </label>
+        <label>Max tokens
+          <input id="p-tokens" type="number" min="64" max="8192" step="1">
+        </label>
+      </div>
+      <div class="row">
+        <label>Data policy
+          <select id="p-policy">
+            <option value="redact">redact — mask secrets before leaving the cluster</option>
+            <option value="allow">allow — send messages unchanged</option>
+            <option value="local-only">local-only — refuse remote providers</option>
+          </select>
+        </label>
+      </div>
+      <div class="row keyrow">
+        <label>API key (write-only)
+          <input id="p-key" type="password" autocomplete="new-password"
+                 placeholder="leave blank to keep the current key">
+        </label>
+        <button id="p-key-toggle" type="button">Show</button>
+      </div>
+      <div class="row">
+        <button class="primary" id="provider-save">Save settings</button>
+        <button id="provider-clear-key" class="danger">Clear API key</button>
         <button id="provider-test">Send test completion</button>
+        <button id="provider-reload">Refresh</button>
         <span class="status" id="provider-status"></span>
       </div>
-      <div class="box" style="flex:1"><pre id="provider-json">—</pre></div>
+      <p class="meta">
+        Switching to a remote provider disables the local model completely — there
+        is no fallback. <code>local-only</code> refuses remote providers, and a
+        remote provider without a key is rejected. The key is never returned by
+        the API; changes are written to the <code>auton-model-config</code>
+        ConfigMap and the <code>auton-model</code> Secret and audited without the
+        key value.
+      </p>
+      <div class="box" style="min-height:120px"><pre id="provider-json">—</pre></div>
     </div>
   </section>
 </main>
+
+<!-- API access modal ---------------------------------------------------- -->
+<div class="modal hidden" id="auth-modal">
+  <div class="modal-card">
+    <h2>API access token</h2>
+    <p>
+      The page you are looking at contains no data and is served without a
+      token. Everything that <em>does</em> something — running a task, reading
+      incidents or audit records, changing provider settings — goes through an
+      API that can execute shell commands and patch workloads in your cluster.
+      That is why it requires a bearer token.
+    </p>
+    <h3>Where do I get it?</h3>
+    <div class="cmd">
+      <pre id="token-cmd">kubectl -n auton get secret auton-api-token -o jsonpath='{.data.token}' | base64 -d</pre>
+      <button id="token-copy" type="button">Copy</button>
+    </div>
+    <p class="meta">or run <code>./scripts/install.sh --show-token</code>.</p>
+    <h3>Where is it stored?</h3>
+    <p>
+      Only in this browser's <code>localStorage</code>. It is never embedded in
+      the page and is sent only to this origin (no third-party requests). Use
+      “Forget token” to remove it.
+    </p>
+    <div class="keyrow">
+      <label>Token
+        <input id="token-input" type="password" autocomplete="off"
+               placeholder="paste the value from the Secret">
+      </label>
+      <button id="token-show" type="button">Show</button>
+    </div>
+    <div class="row">
+      <button class="primary" id="token-test">Test and save</button>
+      <button id="token-save">Save</button>
+      <button class="danger" id="token-forget">Forget token</button>
+      <span class="spacer"></span>
+      <button id="token-cancel">Close</button>
+    </div>
+    <span class="status" id="token-msg"></span>
+  </div>
+</div>
 
 <div class="toast hidden" id="toast"></div>
 
@@ -168,8 +375,16 @@
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
-  const state = { token: localStorage.getItem("auton.token") || "", job: null, timer: null };
+  const state = {
+    token: localStorage.getItem("auton.token") || "",
+    auth: "bearer",        // "bearer" | "off", from /health
+    verified: false,       // /auth/check accepted the current token
+    job: null,
+    timer: null,
+    provider: null,        // last GET /provider payload
+  };
   let toastTimer = null;
+  let currentTab = "chat";
 
   function toast(msg, bad) {
     const el = $("toast");
@@ -177,20 +392,141 @@
     el.style.borderLeftColor = bad ? "var(--bad)" : "var(--accent)";
     el.classList.remove("hidden");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.add("hidden"), 4000);
+    toastTimer = setTimeout(() => el.classList.add("hidden"), 4500);
   }
 
+  // -- auth ------------------------------------------------------------- //
+  function needsToken() {
+    return state.auth !== "off" && !state.token;
+  }
+
+  function renderAuth() {
+    $("token-state").textContent = state.auth === "off" ? "auth off"
+      : state.token ? (state.verified ? "valid" : "set, unverified") : "not set";
+    $("token-chip").title = state.auth === "off"
+      ? "Authentication is disabled on this server (local development)"
+      : "Bearer token for the API — click API access to change it";
+    $("auth-banner").classList.toggle("hidden",
+      state.auth === "off" || (!!state.token && state.verified));
+  }
+
+  function setTokenMsg(text, bad) {
+    const el = $("token-msg");
+    el.textContent = text || "";
+    el.classList.toggle("err", !!bad);
+  }
+
+  function openAuthModal(reason) {
+    if (state.auth === "off") {
+      toast("This server runs with authentication disabled.");
+      return;
+    }
+    $("token-input").value = state.token || "";
+    setTokenMsg(reason || (state.token
+      ? "Stored token was not accepted. Paste a fresh one."
+      : ""), !!reason);
+    $("auth-modal").classList.remove("hidden");
+    $("token-input").focus();
+  }
+
+  function closeAuthModal() {
+    $("auth-modal").classList.add("hidden");
+  }
+
+  function saveToken(value, verified) {
+    state.token = (value || "").trim();
+    state.verified = !!verified;
+    if (state.token) localStorage.setItem("auton.token", state.token);
+    else localStorage.removeItem("auton.token");
+    renderAuth();
+    if (state.token) refreshHealth();
+  }
+
+  async function checkToken(token) {
+    const res = await fetch("/auth/check", {
+      headers: { "Authorization": "Bearer " + token },
+    });
+    return res.ok;
+  }
+
+  async function verifyStoredToken() {
+    if (!state.token || state.auth === "off") { renderAuth(); return; }
+    try {
+      state.verified = await checkToken(state.token);
+    } catch (_) {
+      state.verified = false;
+    }
+    renderAuth();
+    if (!state.verified && state.token) {
+      setTokenMsg("The saved token is no longer accepted.", true);
+    }
+  }
+
+  $("token-btn").onclick = () => openAuthModal("");
+  $("banner-token").onclick = () => openAuthModal("");
+  $("token-cancel").onclick = closeAuthModal;
+  $("auth-modal").onclick = (ev) => {
+    if (ev.target === $("auth-modal")) closeAuthModal();
+  };
+  $("token-show").onclick = () => {
+    const input = $("token-input");
+    const hidden = input.type === "password";
+    input.type = hidden ? "text" : "password";
+    $("token-show").textContent = hidden ? "Hide" : "Show";
+  };
+  $("token-copy").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText($("token-cmd").textContent);
+      setTokenMsg("Command copied.");
+    } catch (_) {
+      setTokenMsg("Copy failed — select the command manually.", true);
+    }
+  };
+  $("token-save").onclick = () => {
+    saveToken($("token-input").value, false);
+    setTokenMsg(state.token ? "Saved. Click “Test and save” to verify it."
+      : "Token removed.");
+  };
+  $("token-test").onclick = async () => {
+    const value = $("token-input").value.trim();
+    if (!value) { setTokenMsg("Paste a token first.", true); return; }
+    setTokenMsg("Testing…");
+    let ok = false;
+    try { ok = await checkToken(value); } catch (_) { ok = false; }
+    if (!ok) {
+      setTokenMsg("Rejected (401). Check that you copied the whole value.", true);
+      return;
+    }
+    saveToken(value, true);
+    setTokenMsg("Token accepted.");
+    closeAuthModal();
+    toast("API token saved.");
+    reloadTab();
+  };
+  $("token-forget").onclick = () => {
+    saveToken("", false);
+    setTokenMsg("Token removed from this browser.");
+    $("token-input").value = "";
+  };
+
+  // -- http ------------------------------------------------------------- //
+  // 401 on any call re-opens the modal: silently retrying with an empty token
+  // is what produced the old "401 — set the token" toast with no way forward.
   async function api(path, opts = {}) {
+    const { silent, ...rest } = opts;
     const res = await fetch(path, {
-      ...opts,
+      ...rest,
       headers: {
-        "Authorization": "Bearer " + state.token,
-        ...(opts.body ? { "Content-Type": "application/json" } : {}),
-        ...(opts.headers || {}),
+        ...(state.auth === "off" ? {} : { "Authorization": "Bearer " + state.token }),
+        ...(rest.body ? { "Content-Type": "application/json" } : {}),
+        ...(rest.headers || {}),
       },
     });
     if (res.status === 401) {
-      toast("401 unauthorized — set the API token.", true);
+      state.verified = false;
+      renderAuth();
+      if (!silent) openAuthModal("That request was rejected: the API token is " +
+        "missing or expired.");
     }
     return res;
   }
@@ -201,58 +537,49 @@
     try { body = await res.json(); } catch (_) {}
     if (!res.ok) {
       const msg = (body && (body.error || body.hint)) || ("HTTP " + res.status);
-      throw new Error(msg);
+      const err = new Error(msg);
+      err.status = res.status;
+      throw err;
     }
     return body;
   }
 
-  // -- token ----------------------------------------------------------- //
-  function renderToken() {
-    $("token-state").textContent = state.token ? "set" : "not set";
-  }
-  $("token-btn").onclick = () => {
-    const value = prompt("Bearer token (Secret auton-api-token):", state.token);
-    if (value === null) return;
-    state.token = value.trim();
-    if (state.token) localStorage.setItem("auton.token", state.token);
-    else localStorage.removeItem("auton.token");
-    renderToken();
-    refreshHeader();
-    if (currentTab === "incidents") loadIncidents();
-    if (currentTab === "audit") loadAudit();
-    if (currentTab === "provider") loadProvider();
-  };
-
   // -- header / health -------------------------------------------------- //
-  async function refreshHeader() {
+  // One poll, one writer per element: the old code updated the health chip
+  // twice and could leave a stale "API unreachable" next to "API ok".
+  async function refreshHealth() {
     try {
       const h = await (await fetch("/health")).json();
       $("health-dot").className = "dot ok";
-      $("health-text").textContent = "API ok";
+      $("health-text").textContent = h.status === "ok" ? "API ok"
+        : (h.status || "degraded");
       $("provider-name").textContent = h.provider || "—";
       $("model-name").textContent = h.model || "—";
+      const wasOff = state.auth === "off";
+      state.auth = h.auth || "bearer";
+      if (wasOff !== (state.auth === "off")) renderAuth();
+      return true;
     } catch (_) {
       $("health-dot").className = "dot bad";
       $("health-text").textContent = "API unreachable";
+      return false;
     }
-    if (!state.token) return;
-    try {
-      const p = await apiJson("/provider");
-      $("provider-name").textContent = p.provider || "—";
-      $("model-name").textContent = p.model || "—";
-    } catch (_) { /* header stays with /health values */ }
   }
 
   // -- tabs ------------------------------------------------------------- //
-  let currentTab = "chat";
+  function reloadTab() {
+    if (currentTab === "incidents") loadIncidents();
+    if (currentTab === "tasks") loadTasks();
+    if (currentTab === "audit") loadAudit();
+    if (currentTab === "provider") loadProvider();
+  }
+
   document.querySelectorAll("nav button").forEach((btn) => {
     btn.onclick = () => {
       currentTab = btn.dataset.tab;
       document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
       document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + currentTab));
-      if (currentTab === "incidents") loadIncidents();
-      if (currentTab === "audit") loadAudit();
-      if (currentTab === "provider") loadProvider();
+      reloadTab();
     };
   });
 
@@ -264,8 +591,9 @@
 
   async function pollJob(id) {
     try {
-      const job = await apiJson("/jobs/" + encodeURIComponent(id));
-      $("log").textContent = (job.log || []).join("\n") || "…";
+      const job = await apiJson("/jobs/" + encodeURIComponent(id), { silent: true });
+      const lines = job.logs || job.log || [];
+      $("log").textContent = lines.join("\n") || "…";
       $("log").scrollTop = $("log").scrollHeight;
       setStatus($("chat-status"), `${job.status} · ${Math.round(job.elapsed || 0)}s`);
       if (job.done) {
@@ -294,7 +622,7 @@
   $("run").onclick = async () => {
     const task = $("task").value.trim();
     if (!task) { setStatus($("chat-status"), "Write a task first.", true); return; }
-    if (!state.token) { toast("Set the API token first.", true); return; }
+    if (!state.token && state.auth !== "off") { openAuthModal(""); return; }
     $("run").disabled = true;
     $("cancel").classList.remove("hidden");
     $("log").textContent = "starting…";
@@ -330,8 +658,15 @@
     return isNaN(d) ? String(ts) : d.toLocaleString();
   }
 
+  function tokenGuard(statusEl, what) {
+    if (state.token || state.auth === "off") return false;
+    setStatus(statusEl, "Token required — click “Add token”.", true);
+    openAuthModal("");
+    return true;
+  }
+
   async function loadIncidents() {
-    if (!state.token) { setStatus($("incident-status"), "set the API token", true); return; }
+    if (tokenGuard($("incident-status"))) return;
     setStatus($("incident-status"), "loading…");
     try {
       const status = $("incident-filter").value;
@@ -394,9 +729,180 @@
   $("incident-reload").onclick = loadIncidents;
   $("incident-filter").onchange = loadIncidents;
 
+  // -- tasks ------------------------------------------------------------ //
+  // One list + one detail pane: the list polls every few seconds, the open
+  // detail does not, so reading a task is not interrupted by a refresh.
+  function chips(el, parts) {
+    el.innerHTML = "";
+    parts.forEach((text) => {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = text;
+      el.appendChild(chip);
+    });
+  }
+
+  function renderTaskStats(stats) {
+    const depth = stats.queue_depth || {};
+    const active = stats.active || {};
+    chips($("task-stats"), [
+      "repair critical " + (depth.repair_critical || 0),
+      "repair normal " + (depth.repair_normal || 0),
+      "agent " + (depth.agent || 0),
+      "active repair " + (active.repair || 0),
+      "active agent " + (active.agent || 0),
+      "delayed " + (depth.delayed || 0),
+      "dead " + (depth.dead || 0),
+      "budget " + (stats.budget_used || 0) + "/h",
+      "backend " + (stats.backend || "?"),
+    ]);
+  }
+
+  function fillCauses(causes) {
+    const select = $("m-cause");
+    if (select.options.length > 0 || !causes) return;
+    Object.keys(causes).sort().forEach((cause) => {
+      const opt = document.createElement("option");
+      opt.value = cause;
+      opt.textContent = cause + " (" + causes[cause] + ")";
+      select.appendChild(opt);
+    });
+  }
+
+  function taskCard(task) {
+    const el = document.createElement("div");
+    el.className = "incident";
+    const top = document.createElement("div");
+    top.className = "top";
+    const sum = document.createElement("div");
+    sum.className = "sum";
+    sum.textContent = (task.resource || "(no resource)") +
+      (task.cause ? " · " + task.cause : "");
+    const queue = document.createElement("span");
+    queue.className = "badge";
+    queue.textContent = task.queue || "?";
+    const badge = document.createElement("span");
+    badge.className = "badge " + (task.status || "");
+    badge.textContent = task.status || "?";
+    const id = document.createElement("span");
+    id.className = "id";
+    id.textContent = task.id;
+    top.append(sum, queue, badge, id);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = [
+      task.namespace,
+      task.priority,
+      "attempt " + (task.attempts || 0),
+      task.worker ? "on " + task.worker : "",
+      fmtTime(task.created_ts),
+      task.incident_id,
+    ].filter(Boolean).join(" · ");
+    el.append(top, meta);
+    el.onclick = () => showTask(task.id);
+    return el;
+  }
+
+  async function showTask(id) {
+    try {
+      const rec = await apiJson("/tasks/" + encodeURIComponent(id));
+      const box = document.createElement("div");
+      box.className = "incident";
+      const row = document.createElement("div");
+      row.className = "row";
+      const title = document.createElement("b");
+      title.textContent = id;
+      const spacer = document.createElement("span");
+      spacer.className = "spacer";
+      const cancel = document.createElement("button");
+      cancel.className = "danger";
+      cancel.textContent = "Cancel task";
+      cancel.onclick = async (ev) => {
+        ev.stopPropagation();
+        try {
+          await apiJson("/tasks/" + encodeURIComponent(id) + "/cancel",
+                        { method: "POST" });
+          toast("Cancel requested");
+          box.remove();
+          loadTasks();
+        } catch (e) { toast(e.message, true); }
+      };
+      const close = document.createElement("button");
+      close.textContent = "Close";
+      close.onclick = (ev) => { ev.stopPropagation(); box.remove(); };
+      row.append(title, spacer, cancel, close);
+
+      const copy = Object.assign({}, rec);
+      delete copy.logs;
+      const detail = document.createElement("pre");
+      detail.textContent = JSON.stringify(copy, null, 2);
+      const log = document.createElement("div");
+      log.className = "box";
+      const pre = document.createElement("pre");
+      pre.textContent = (rec.logs || []).join("\n") || "(no log lines)";
+      log.appendChild(pre);
+      box.append(row, detail, log);
+      $("task-detail").innerHTML = "";
+      $("task-detail").appendChild(box);
+    } catch (e) { toast(e.message, true); }
+  }
+
+  async function loadTasks() {
+    if (tokenGuard($("task-status-line"))) return;
+    setStatus($("task-status-line"), "loading…");
+    try {
+      const params = ["limit=50"];
+      if ($("task-queue").value) params.push("queue=" + encodeURIComponent($("task-queue").value));
+      if ($("task-status").value) params.push("status=" + encodeURIComponent($("task-status").value));
+      const data = await apiJson("/tasks?" + params.join("&"));
+      const list = $("task-list");
+      list.innerHTML = "";
+      renderTaskStats(data.stats || {});
+      fillCauses(data.causes);
+      setStatus($("task-status-line"), data.count + " task(s)");
+      data.tasks.forEach((task) => list.appendChild(taskCard(task)));
+      if (!data.tasks.length) {
+        const empty = document.createElement("div");
+        empty.className = "meta";
+        empty.textContent = "No tasks in this view. Scanners queue repairs; " +
+          "Chat queues agent jobs.";
+        list.appendChild(empty);
+      }
+    } catch (e) { setStatus($("task-status-line"), e.message, true); }
+  }
+
+  $("task-reload").onclick = loadTasks;
+  $("task-queue").onchange = loadTasks;
+  $("task-status").onchange = loadTasks;
+
+  $("m-submit").onclick = async () => {
+    const payload = {
+      queue: "repair",
+      kind: $("m-kind").value,
+      name: $("m-name").value.trim(),
+      namespace: $("m-ns").value.trim(),
+      cause: $("m-cause").value,
+      force: $("m-force").checked,
+    };
+    if (!payload.name) {
+      setStatus($("m-status"), "Write a resource name.", true);
+      return;
+    }
+    setStatus($("m-status"), "queueing…");
+    try {
+      const res = await apiJson("/tasks", {
+        method: "POST", body: JSON.stringify(payload),
+      });
+      setStatus($("m-status"), "queued " + res.task_id);
+      toast("Repair task queued");
+      $("m-name").value = "";
+      loadTasks();
+    } catch (e) { setStatus($("m-status"), e.message, true); }
+  };
+
   // -- audit ------------------------------------------------------------ //
   async function loadAudit() {
-    if (!state.token) { setStatus($("audit-status"), "set the API token", true); return; }
+    if (tokenGuard($("audit-status"))) return;
     setStatus($("audit-status"), "loading…");
     try {
       const data = await apiJson("/audit?limit=100");
@@ -426,31 +932,120 @@
   $("audit-reload").onclick = loadAudit;
 
   // -- provider --------------------------------------------------------- //
+  function providerDefaults(name) {
+    const p = state.provider;
+    if (!p || !p.defaults || !p.defaults[name]) return null;
+    return p.defaults[name];
+  }
+
+  function fillProviderForm(p) {
+    const select = $("p-provider");
+    if (select.options.length === 0) {
+      (p.providers || []).forEach((name) => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      });
+    }
+    select.value = p.provider || "ollama";
+    $("p-model").value = p.model || "";
+    $("p-base").value = p.base_url || "";
+    $("p-tokens").value = p.max_tokens || 1024;
+    $("p-policy").value = p.data_policy || "redact";
+  }
+
   async function loadProvider() {
-    if (!state.token) { setStatus($("provider-status"), "set the API token", true); return; }
+    if (tokenGuard($("provider-status"))) return;
+    setStatus($("provider-status"), "loading…");
     try {
       const p = await apiJson("/provider");
+      state.provider = p;
+      fillProviderForm(p);
       $("provider-json").textContent = JSON.stringify(p, null, 2);
       $("provider-name").textContent = p.provider || "—";
       $("model-name").textContent = p.model || "—";
-      setStatus($("provider-status"), "loaded");
+      const parts = [p.ok ? "loaded" : (p.error || "misconfigured")];
+      if (p.api_key_set && p.api_key_hint) parts.push("key " + p.api_key_hint);
+      else if (!p.local_model_enabled) parts.push("no API key");
+      setStatus($("provider-status"), parts.join(" · "), !p.ok);
     } catch (e) { setStatus($("provider-status"), e.message, true); }
   }
+
   $("provider-reload").onclick = loadProvider;
+  $("p-provider").onchange = () => {
+    const defaults = providerDefaults($("p-provider").value);
+    if (!defaults) return;
+    $("p-base").value = defaults.base_url || "";
+    $("p-model").value = defaults.model || "";
+  };
+  $("p-key-toggle").onclick = () => {
+    const input = $("p-key");
+    const hidden = input.type === "password";
+    input.type = hidden ? "text" : "password";
+    $("p-key-toggle").textContent = hidden ? "Hide" : "Show";
+  };
+
+  $("provider-save").onclick = async () => {
+    const payload = {
+      provider: $("p-provider").value,
+      base_url: $("p-base").value.trim(),
+      model: $("p-model").value.trim(),
+      max_tokens: $("p-tokens").value,
+      data_policy: $("p-policy").value,
+    };
+    const key = $("p-key").value.trim();
+    if (key) payload.api_key = key;
+    setStatus($("provider-status"), "saving…");
+    try {
+      const res = await apiJson("/provider", {
+        method: "POST", body: JSON.stringify(payload),
+      });
+      $("p-key").value = "";
+      state.provider = res;
+      fillProviderForm(res);
+      $("provider-json").textContent = JSON.stringify(res, null, 2);
+      $("provider-name").textContent = res.provider || "—";
+      $("model-name").textContent = res.model || "—";
+      const applied = (res.applied || []).join(", ");
+      const msg = ["saved", applied, res.api_key_change !== "unchanged"
+        ? "key " + res.api_key_change : ""].filter(Boolean).join(" · ");
+      setStatus($("provider-status"), msg, !res.ok);
+      toast("Provider settings saved");
+    } catch (e) { setStatus($("provider-status"), e.message, true); }
+  };
+
+  $("provider-clear-key").onclick = async () => {
+    if (!confirm("Remove the stored provider API key? A remote provider will " +
+                 "then fail every request (no local fallback).")) return;
+    setStatus($("provider-status"), "clearing…");
+    try {
+      const res = await apiJson("/provider/key", { method: "DELETE" });
+      state.provider = res;
+      $("provider-json").textContent = JSON.stringify(res, null, 2);
+      setStatus($("provider-status"), "API key cleared", !res.ok);
+    } catch (e) { setStatus($("provider-status"), e.message, true); }
+  };
+
   $("provider-test").onclick = async () => {
     setStatus($("provider-status"), "sending a tiny completion…");
     try {
       const res = await apiJson("/provider/test", { method: "POST" });
-      setStatus($("provider-status"), res.ok ? "ok" : "failed");
+      setStatus($("provider-status"), res.ok ? "test ok" : "test failed");
       $("provider-json").textContent = JSON.stringify(res, null, 2);
     } catch (e) { setStatus($("provider-status"), e.message, true); }
   };
 
   // -- boot ------------------------------------------------------------- //
-  renderToken();
-  refreshHeader();
-  setInterval(refreshHeader, 30000);
-  if (!state.token) toast("Set the API token (Secret auton-api-token).");
+  renderAuth();
+  refreshHealth().then(() => {
+    renderAuth();
+    verifyStoredToken();
+  });
+  setInterval(refreshHealth, 30000);
+  // Keep the task list current while it is on screen (the detail pane is
+  // written only on click, so a poll never closes what you are reading).
+  setInterval(() => { if (currentTab === "tasks") loadTasks(); }, 5000);
 })();
 </script>
 </body>

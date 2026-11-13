@@ -1,0 +1,20 @@
+{{- /* Fail early on combinations that would produce a broken (or silently
+       degraded) installation. There is no memory fallback in the cluster: the
+       API would refuse to start anyway, but a clear install-time error is
+       better than a CrashLoopBackOff. */ -}}
+{{- $backends := list "redis" "memory" }}
+{{- if not (has .Values.queue.backend $backends) }}
+{{- fail (printf "queue.backend must be one of %v (got %q)" $backends .Values.queue.backend) }}
+{{- end }}
+{{- if and (eq .Values.queue.backend "redis") (not .Values.redis.enabled) (not .Values.queue.redisUrl) }}
+{{- fail "queue.backend=redis needs redis.enabled=true or an explicit queue.redisUrl" }}
+{{- end }}
+{{- if and .Values.scanner.enabled (not .Values.redis.enabled) (eq .Values.queue.backend "redis") }}
+{{- fail "scanner.enabled with the redis queue requires redis.enabled=true" }}
+{{- end }}
+{{- if and .Values.worker.enabled (not .Values.redis.enabled) (eq .Values.queue.backend "redis") }}
+{{- fail "worker.enabled with the redis queue requires redis.enabled=true" }}
+{{- end }}
+{{- if and (gt (int .Values.scanner.replicas) 1) (not .Values.queue.prefix) }}
+{{- fail "a shared queue prefix is required when scanner.replicas > 1" }}
+{{- end }}

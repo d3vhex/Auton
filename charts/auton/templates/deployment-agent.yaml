@@ -19,10 +19,12 @@ spec:
       labels:
         {{- include "auton.labels" . | nindent 8 }}
         app: auton
-        # The ops controller never repairs itself or its own namespace.
+        # The workers never repair this pod or its namespace.
         auton.io/protect: "true"
     spec:
-      serviceAccountName: {{ .Values.serviceAccount.agent.name }}
+      # The API is a producer: it validates, enqueues and serves the UI. The
+      # agent loop (and every kubectl tool) runs in auton-ops under auton-agent.
+      serviceAccountName: {{ .Values.serviceAccount.api.name }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -69,20 +71,17 @@ spec:
             "TMPDIR" "/tmp"
             "PYTHONDONTWRITEBYTECODE" "1"
             "AGENT_WORKSPACE" "/workspace"
+            "AGENT_AUDIT_DIR" "/workspace/.ops"
+            "AGENT_INCIDENTS_DIR" "/workspace/.ops/incidents"
             "AGENT_MODEL" .Values.agent.model
-            "AGENT_NUM_CTX" (toString .Values.agent.numCtx)
-            "MAX_STEPS" (toString .Values.agent.maxSteps)
-            "AGENT_MAX_OBSERVATION_CHARS" (toString .Values.agent.maxObservationChars)
-            "AGENT_MAX_HISTORY_CHARS" (toString .Values.agent.maxHistoryChars)
+            "AGENT_MODEL_DIR" "/etc/auton-model"
+            "OLLAMA_HOST" .Values.provider.baseUrl
             "AGENT_MAX_QUEUE" (toString .Values.agent.maxQueue)
             "AGENT_JOB_TIMEOUT" (toString .Values.agent.jobTimeout)
             "AGENT_SANDBOX" "off"
-            "AGENT_MODEL_DIR" "/etc/auton-model"
-            "OLLAMA_HOST" .Values.provider.baseUrl
-            "AGENT_NAMESPACES" (printf "%s,%s" (include "auton.namespace" .) (include "auton.appsNamespace" .))
-            "AGENT_AUDIT_DIR" "/workspace/.ops"
-            "AGENT_K8S_ENABLED" "1"
-            "AGENT_K8S_WRITE" "1"
+            "AGENT_QUEUE" .Values.queue.backend
+            "AGENT_REDIS_URL" (include "auton.redisUrl" .)
+            "AGENT_QUEUE_PREFIX" .Values.queue.prefix
             "N8N_API_URL" (printf "%s/api/v1" (include "auton.n8nUrl" .))
             "N8N_WEBHOOK_BASE" (printf "%s/webhook" (include "auton.n8nUrl" .))
             "N8N_API_KEY_FILE" "/etc/n8n-api/api-key"
@@ -101,6 +100,13 @@ spec:
                 secretKeyRef:
                   name: {{ default (include "auton.tokenSecretName" .) .Values.agent.auth.existingSecret }}
                   key: token
+            {{- if .Values.queue.redisExistingSecret }}
+            - name: AGENT_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.queue.redisExistingSecret }}
+                  key: password
+            {{- end }}
             {{- range $key, $value := $env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -118,6 +124,8 @@ spec:
             - name: model-secret
               mountPath: /etc/auton-model/secret
               readOnly: true
+            # Optional: only a local `AGENT_QUEUE=memory` run puts the n8n tools
+            # in this process. In the cluster they run in auton-ops.
             - name: n8n-api
               mountPath: /etc/n8n-api
               readOnly: true
@@ -136,7 +144,7 @@ spec:
       volumes:
         - name: workspace
           persistentVolumeClaim:
-            claimName: {{ include "auton.agentClaim" . }}
+            claimName: {{ include "auton.workspaceClaim" . }}
         - name: tmp
           emptyDir: {}
         - name: model-config

@@ -2,3 +2,6 @@
 mcp>=2.0,<3
 ollama>=0.4.0
 pathspec>=0.12
+# Queue backend when AGENT_QUEUE=redis (the cluster deployment). Imported
+# lazily, so local runs and the test suite work without it.
+redis>=5,<6

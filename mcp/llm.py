@@ -151,7 +151,7 @@ def provider_info() -> dict:
         cfg = config()
     except LLMError as exc:
         return {"ok": False, "error": str(exc)}
-    return {
+    info = {
         "ok": True,
         "provider": cfg["provider"],
         "model": cfg["model"],
@@ -161,6 +161,13 @@ def provider_info() -> dict:
         "api_key_set": bool(cfg["api_key"]),
         "api_key_hint": _mask(cfg["api_key"]),
     }
+    # Report the same failure a request would hit: a remote provider without a
+    # key never falls back to Ollama, so `ok` must not claim it is healthy.
+    if not cfg["is_local"] and not cfg["api_key"]:
+        info["ok"] = False
+        info["error"] = (f"provider={cfg['provider']} has no API key; write one "
+                         "to the auton-model Secret (POST /provider)")
+    return info
 
 
 # --------------------------------------------------------------------------- #

@@ -7,12 +7,20 @@
 #     --namespace auton --create-namespace \
 #     --set agent.auth.token="$(openssl rand -hex 24)"
 #
+# The system has five pod roles, each with its own identity:
+#
+#   auton          the HTTP API + UI          (auton-api)     producer only
+#   auton-scanner  read-only detection ×2     (auton-scanner) fills the queue
+#   auton-worker   repair playbooks ×2        (auton-worker)  the only writer
+#   auton-ops      LLM executor ×1            (auton-agent)   runs agent tasks
+#   redis          shared queue ×1            (no SA)         state, locks, budget
+#
 # Everything the agent needs to be safe (RBAC, audit PVC, namespace split) is
 # created by the chart. Ollama and n8n are optional so the chart also works on
 # a cluster that already has them.
 
 # Fixed resource names are intentional: the agent's own docs, the generated n8n
-# workflow and the ops controller all address "auton:8080" by DNS.
+# workflow and the workers all address "auton:8080" by DNS.
 nameOverride: ""
 
 namespace:
@@ -36,6 +44,9 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
+# --------------------------------------------------------------------------- #
+# The API pod: validation, UI, /run producer, /tasks and /audit reads.
+# --------------------------------------------------------------------------- #
 agent:
   replicas: 1
   service:
@@ -56,7 +67,7 @@ agent:
     # Keep the PVC on `helm uninstall`: it holds the audit log, incidents and
     # the agent's workspace.
     keep: true
-  # Agent loop tuning (see mcp/README.md).
+  # Agent loop tuning (see mcp/README.md). Used by the ops executor.
   model: qwen2.5-coder:7b-instruct
   numCtx: 16384
   maxSteps: 25
@@ -64,7 +75,135 @@ agent:
   maxHistoryChars: 60000
   maxQueue: 8
   jobTimeout: 900
-  # Extra env vars, e.g. AGENT_K8S_WRITE: "0" for a read-only install.
+  # Extra env vars for the API pod, e.g. AGENT_AUTH_DISABLED: "1" (never in a
+  # shared cluster).
+  env: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --------------------------------------------------------------------------- #
+# Queue backend shared by every pod. `redis` is the cluster default; there is
+# no memory fallback — with `redis` and an unreachable server the API refuses to
+# start instead of silently losing repair tasks to a private in-memory queue.
+# --------------------------------------------------------------------------- #
+queue:
+  backend: redis           # redis | memory (memory is for local/test only)
+  prefix: auton
+  # Empty derives redis://redis.<namespace>.svc.cluster.local:6379/0
+  redisUrl: ""
+  # Optional auth; prefer an existing Secret with key `password`.
+  redisPassword: ""
+  redisExistingSecret: ""
+  redisSecretName: auton-redis
+  # Global LLM slot: one model call at a time even if ops is scaled by accident.
+  gpuLockTtl: 900
+  lease: 300               # a crashed worker's task is requeued after this
+  maxAttempts: 3
+  backoff: "30,120,300"
+  maxTaskQueue: 500
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  imagePullPolicy: IfNotPresent
+  # noeviction is deliberate: a full Redis refuses the write and the worker
+  # fails closed instead of dropping a repair.
+  maxMemory: 256mb
+  appendFsync: everysec
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 1Gi
+    keep: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 320Mi
+
+# --------------------------------------------------------------------------- #
+# Scanner: read-only detection. Replicas > 1 is safe by design; the dedupe
+# window collapses concurrent submissions of the same finding into one task.
+# --------------------------------------------------------------------------- #
+scanner:
+  enabled: true
+  replicas: 2
+  interval: 60
+  dedupeWindow: 300
+  cooldown: 1800
+  startupGrace: 120
+  terminationGrace: 120
+  heartbeat: /tmp/scanner-heartbeat
+  # Namespaces it watches; must be covered by its read-only Role.
+  namespaces:
+    - auton-apps
+  env: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --------------------------------------------------------------------------- #
+# Repair worker: executes the playbooks. The only component with write verbs.
+# Two workers repair different Deployments in parallel; the per-resource lock
+# serialises the same one.
+# --------------------------------------------------------------------------- #
+worker:
+  enabled: true
+  replicas: 2
+  cooldown: 1800
+  maxActionsPerHour: 6
+  maxMemory: 2Gi
+  maxIncidents: 500
+  pruneEvery: 300
+  dryRun: false
+  heartbeat: /tmp/worker-heartbeat
+  # Namespaces a playbook may repair. RBAC is created for appsNamespace only;
+  # add namespaces here together with your own Role if you extend it.
+  namespaces:
+    - auton-apps
+  apiUrl: http://auton:8080
+  uiUrl: http://auton.localhost
+  # n8n webhook that fans reports out to Slack/Telegram. Empty disables it.
+  n8nWebhook: ""
+  env: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --------------------------------------------------------------------------- #
+# Ops executor: the single pod that runs LLM agent tasks from the queue.
+# One replica; a second is safe (it defers while the GPU slot is held) but a
+# single GPU cannot run two agent loops faster.
+# --------------------------------------------------------------------------- #
+ops:
+  enabled: true
+  replicas: 1
+  poll: 5
+  heartbeat: /tmp/agent-heartbeat
   env: {}
   resources:
     requests:
@@ -73,50 +212,6 @@ agent:
     limits:
       cpu: "2"
       memory: 2Gi
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
-
-ops:
-  enabled: true
-  # Defaults to the agent image when empty.
-  image: {}
-  interval: 60
-  cooldown: 1800
-  maxActionsPerHour: 6
-  # Seconds a Pending/NotReady pod is ignored after it starts, so image pulls
-  # and container startup are not reported as incidents. 0 disables it.
-  startupGrace: 120
-  # Seconds a pod may stay Terminating before it is treated as stuck.
-  terminationGrace: 120
-  maxMemory: 2Gi
-  maxIncidents: 500
-  dryRun: false
-  # Namespaces the controller may repair. RBAC is created for appsNamespace
-  # only; add namespaces here together with your own Role if you extend it.
-  namespaces:
-    - auton-apps
-  heartbeat: /tmp/ops-heartbeat
-  apiUrl: http://auton:8080
-  uiUrl: http://auton.localhost
-  # n8n webhook that fans reports out to Slack/Telegram. Empty disables it.
-  n8nWebhook: ""
-  workspace:
-    # On a multi-node cluster give the controller its own RWO claim; the
-    # ingest endpoint keeps the API view complete.
-    existingClaim: ""
-    create: false
-    storageClass: ""
-    accessMode: ReadWriteOnce
-    size: 5Gi
-    keep: true
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -216,12 +311,22 @@ rbac:
   clusterReader: true
 
 serviceAccount:
+  # The HTTP API: may only PATCH the provider ConfigMap and Secret.
+  api:
+    create: true
+    name: auton-api
+  # Read-only detection in the apps namespace.
+  scanner:
+    create: true
+    name: auton-scanner
+  # The playbooks: pod delete + Deployment patch/scale in the apps namespace.
+  worker:
+    create: true
+    name: auton-worker
+  # The LLM executor: repair rights in both namespaces + cluster read-only.
   agent:
     create: true
     name: auton-agent
-  ops:
-    create: true
-    name: auton-ops
 
 # Namespace labels applied to both created namespaces (the standard
 # app.kubernetes.io/* labels are added by the helpers).
