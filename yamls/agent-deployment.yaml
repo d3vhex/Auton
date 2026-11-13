@@ -110,6 +110,10 @@ spec:
           value: "auton-model-config"
         - name: AGENT_PROVIDER_SECRET
           value: "auton-model"
+        # The repair policy, read per request by GET /policy. The UI patches
+        # the named ConfigMap `auton-policy` (see the auton-api Role).
+        - name: AGENT_POLICY_DIR
+          value: "/etc/auton-policy"
         - name: MAX_STEPS
           value: "25"
         # Context budget: ollama defaults to a small num_ctx, which truncates
@@ -188,6 +192,9 @@ spec:
         - name: model-secret
           mountPath: /etc/auton-model/secret
           readOnly: true
+        - name: policy
+          mountPath: /etc/auton-policy
+          readOnly: true
         # optional: the agent starts even before the n8n API key exists.
         - name: n8n-api
           mountPath: /etc/n8n-api
@@ -212,6 +219,10 @@ spec:
       - name: model-secret
         secret:
           secretName: auton-model
+          optional: true
+      - name: policy
+        configMap:
+          name: auton-policy
           optional: true
       - name: n8n-api
         secret:

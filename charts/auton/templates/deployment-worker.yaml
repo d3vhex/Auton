@@ -88,6 +88,7 @@ spec:
             "AGENT_OPS_PRUNE_EVERY" (toString .Values.worker.pruneEvery)
             "AGENT_OPS_DRY_RUN" (ternary "1" "0" .Values.worker.dryRun)
             "AGENT_OPS_HEARTBEAT" .Values.worker.heartbeat
+            "AGENT_POLICY_DIR" "/etc/auton-policy"
             "AGENT_API_URL" .Values.worker.apiUrl
             "AGENT_UI_URL" .Values.worker.uiUrl
             "N8N_OPS_WEBHOOK" .Values.worker.n8nWebhook
@@ -123,6 +124,11 @@ spec:
               mountPath: /workspace
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.policy.create }}
+            - name: policy
+              mountPath: /etc/auton-policy
+              readOnly: true
+            {{- end }}
           livenessProbe:
             exec:
               command:
@@ -142,6 +148,12 @@ spec:
             claimName: {{ include "auton.workspaceClaim" . }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.policy.create }}
+        - name: policy
+          configMap:
+            name: {{ .Values.policy.configMapName }}
+            optional: true
+        {{- end }}
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

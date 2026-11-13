@@ -87,9 +87,15 @@ def test_api_role_is_provider_settings_shaped():
     rules = _rules(role)
     configmap_rules = [r for r in rules if "configmaps" in (r.get("resources") or [])]
     assert configmap_rules, "the API must be able to write the provider ConfigMap"
+    # Only two named ConfigMaps are writable: the provider settings and the
+    # repair policy. Everything else stays out of reach.
+    writable = set()
     for rule in configmap_rules:
         assert set(rule.get("verbs") or []) <= {"patch"}
-        assert rule.get("resourceNames") == ["auton-model-config"]
+        names = set(rule.get("resourceNames") or [])
+        assert names <= {"auton-model-config", "auton-policy"}, names
+        writable |= names
+    assert writable == {"auton-model-config", "auton-policy"}
     # Nothing else: no workloads, no exec, no PVCs.
     resources = {res for rule in rules for res in (rule.get("resources") or [])}
     assert resources == {"configmaps", "secrets"}

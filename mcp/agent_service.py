@@ -55,10 +55,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from agent_core import MODEL, OLLAMA_HOST, run_agent
+import approvals
 import audit
 import incidents
 import llm
 import ops_queue
+import policy
 import provider_admin
 import task_store
 
@@ -98,6 +100,15 @@ try:
 except incidents.IncidentError as _exc:
     INCIDENT_STORE = None
     INCIDENT_STORE_ERROR = str(_exc)
+
+# The approval requests live in the same directory tree, so the worker that
+# parks a plan and the API that decides it see the same files.
+try:
+    APPROVAL_STORE: approvals.ApprovalStore | None = approvals.ApprovalStore()
+    APPROVAL_STORE_ERROR = ""
+except approvals.ApprovalError as _exc:
+    APPROVAL_STORE = None
+    APPROVAL_STORE_ERROR = str(_exc)
 
 
 class QueueFull(Exception):
@@ -588,7 +599,15 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     limit = 50
                 status = query.get("status", [""])[0]
-                records = store.list(limit=limit, status=status)
+                severity = query.get("severity", [""])[0]
+                cause = query.get("cause", [""])[0]
+                namespace = query.get("namespace", [""])[0]
+                resource = query.get("resource", [""])[0]
+                fingerprint = query.get("fingerprint", [""])[0]
+                records = store.list(limit=limit, status=status,
+                                     severity=severity, cause=cause,
+                                     namespace=namespace, resource=resource,
+                                     fingerprint=fingerprint)
                 self._send(200, {"count": len(records), "incidents": records})
                 return
             segments = path.strip("/").split("/")
@@ -604,6 +623,145 @@ class Handler(BaseHTTPRequestHandler):
                              "incident_id": segments[1]})
             return
         self._send(200, record)
+
+    # -- policy and approvals ---------------------------------------------- #
+    def _approval_store(self):
+        store = globals().get("APPROVAL_STORE")
+        if store is None:
+            self._send(503, {
+                "error": f"approval store unavailable: {APPROVAL_STORE_ERROR}",
+                "hint": "check the workspace volume / AGENT_APPROVALS_DIR",
+            })
+        return store
+
+    def _get_policy(self) -> None:
+        """The effective policy, and the modes/tiers it understands."""
+        self._send(200, policy.describe())
+
+    def _get_approvals(self, path: str) -> None:
+        store = self._approval_store()
+        if store is None:
+            return
+        try:
+            if path == "/approvals":
+                _, query = self._route()
+                try:
+                    limit = int(query.get("limit", ["50"])[0])
+                except (TypeError, ValueError):
+                    limit = 50
+                records = store.list(
+                    status=query.get("status", [""])[0].strip(),
+                    incident_id=query.get("incident_id", [""])[0].strip(),
+                    limit=limit)
+                self._send(200, {"count": len(records),
+                                 "approvals": records})
+                return
+            segments = path.strip("/").split("/")
+            if len(segments) != 2:
+                self._send(404, {"error": "not found", "path": path})
+                return
+            record = store.get(segments[1])
+        except approvals.ApprovalError as exc:
+            self._send(503, {"error": f"approval store unavailable: {exc}"})
+            return
+        if record is None:
+            self._send(404, {"error": "unknown approval",
+                             "approval_id": segments[1]})
+            return
+        self._send(200, record)
+
+    def _post_approval(self, path: str) -> None:
+        """Approve or reject a pending repair plan."""
+        store = self._approval_store()
+        if store is None:
+            return
+        segments = path.strip("/").split("/")
+        if len(segments) != 3 or segments[2] not in ("approve", "reject"):
+            self._send(404, {"error": "not found", "path": path})
+            return
+        approve = segments[2] == "approve"
+        try:
+            body = self._read_json()
+        except ValueError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        by = str(body.get("by") or "").strip() or "api"
+        comment = str(body.get("comment") or "").strip()
+        try:
+            record = store.decide(segments[1], approve=approve, by=by,
+                                  comment=comment)
+        except approvals.ApprovalConflict as exc:
+            self._send(409, {"error": str(exc)})
+            return
+        except approvals.ApprovalError as exc:
+            self._send(404 if "unknown approval" in str(exc) else 503,
+                       {"error": str(exc)})
+            return
+
+        task = None
+        if approve:
+            task = self._enqueue_approved(record)
+        else:
+            self._close_approved_incident(record, by=by, comment=comment)
+        self._send(200, {"ok": True, "approval": record, "task": task})
+
+    def _enqueue_approved(self, record: dict) -> dict | None:
+        """Turn an approved plan back into a repair task."""
+        # `ops_controller` is imported lazily: at module level it would build a
+        # second IncidentStore (the API already has one).
+        import ops_controller
+
+        plan = record.get("plan") or {}
+        fields = {
+            "namespace": str(plan.get("namespace") or ""),
+            "kind": str(plan.get("kind") or "Pod"),
+            "name": str(plan.get("name") or ""),
+            "cause": str(plan.get("cause") or ""),
+            "severity": "critical",
+            "observation": f"approved repair plan {plan.get('plan_id', '')}",
+            "container": str((plan.get("params") or {}).get("container") or ""),
+            "resource": str(plan.get("resource") or ""),
+            "source": "approval",
+            # The same incident continues; the approval is the authorisation.
+            "incident_id": str(record.get("incident_id") or ""),
+            "approval_id": str(record.get("id") or ""),
+            # A human asked for this, so the cooldown does not block it.
+            "force": True,
+        }
+        try:
+            task = ops_controller.submit_manual(
+                tasks_store(), fields, actor=str(record.get("decided_by")
+                                                 or "api"),
+                source="approval")
+        except (ValueError, ops_queue.QueueError) as exc:
+            print(f"[http] cannot enqueue approved plan: {exc}", flush=True)
+            return None
+        return task
+
+    def _close_approved_incident(self, record: dict, *, by: str,
+                                 comment: str) -> None:
+        """A rejected plan sends its incident back to a human."""
+        import ops_controller
+
+        incident_id = str(record.get("incident_id") or "")
+        store = globals().get("INCIDENT_STORE")
+        if not incident_id or store is None:
+            return
+        try:
+            incident = store.get(incident_id)
+            if incident is None:
+                return
+            incident.update({"status": "needs_human", "needs_human": True,
+                             "verification": "the repair plan was rejected",
+                             "actions": (incident.get("actions") or []) + [
+                                 {"action": "rejected", "ok": False,
+                                  "detail": comment or
+                                            f"rejected by {by}"}]})
+            incident["state"] = incidents.STATE_LABELS["needs_human"]
+            incident["report"] = ops_controller.build_report(incident)
+            store.save(incident)
+        except incidents.IncidentError as exc:
+            print(f"[http] cannot close rejected incident: {exc}", flush=True)
 
     # -- tasks ------------------------------------------------------------ #
     def _store_unavailable(self, exc: Exception) -> None:
@@ -819,6 +977,14 @@ class Handler(BaseHTTPRequestHandler):
             self._get_incidents(path)
             return
 
+        if path == "/policy":
+            self._get_policy()
+            return
+
+        if path == "/approvals" or path.startswith("/approvals/"):
+            self._get_approvals(path)
+            return
+
         if path == "/tasks" or path.startswith("/tasks/"):
             self._get_tasks(path)
             return
@@ -932,6 +1098,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/tasks":
             self._post_task()
+            return
+
+        if path.startswith("/approvals/") and path.endswith(("/approve",
+                                                             "/reject")):
+            self._post_approval(path)
             return
 
         if path.startswith("/tasks/") and path.endswith("/cancel"):

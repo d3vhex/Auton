@@ -1,0 +1,52 @@
+# The repair policy: what Auton may do, and when it may do it.
+#
+# The policy engine (`mcp/policy.py`) reads this ConfigMap on every decision,
+# so a change takes effect without a restart. It is mounted as a projected
+# volume, so no ServiceAccount needs permission to read it.
+#
+# `mode` is a flat key on purpose: flipping the whole platform to
+# observe-only is one `kubectl patch`, not a JSON edit.
+#
+#   kubectl -n auton patch cm auton-policy --type merge \
+#     -p '{"data":{"mode":"observe-only"}}'
+#
+# `policy.json` holds the full document (tiers, rules, protected targets).
+# The modes are:
+#
+#   disabled           nothing runs — the off switch
+#   observe-only       plans are computed and recorded, never executed
+#   safe-auto          the tiers in auto_approve_tiers run unattended, the
+#                      tiers in approval_tiers wait for a human
+#   approval-required  every mutating tier waits for a human
+#
+# The tiers describe the risk of the *action*, not of the symptom:
+#
+#   0  observe/report only            (no mutation)
+#   1  transient and recreated         (restart a pod, undo a rollout, scale up)
+#   2  changes the workload's spec     (raise a memory limit)
+#   3  data-affecting / irreversible   (never automatic)
+#
+# The defaults keep today's behaviour: everything the platform can already do
+# runs unattended, and the irreversible tier needs an approval.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auton-policy
+  namespace: auton
+data:
+  mode: "safe-auto"
+  policy.json: |
+    {
+      "mode": "safe-auto",
+      "default_tier": 1,
+      "auto_approve_tiers": [0, 1, 2],
+      "approval_tiers": [3],
+      "deny_tiers": [],
+      "protected_namespaces": ["kube-system", "kube-public", "kube-node-lease"],
+      "protected_labels": [{"key": "auton.io/protect", "value": "true"}],
+      "namespace_tiers": {},
+      "rules": [],
+      "approval_timeout_seconds": 3600,
+      "max_plan_age_seconds": 900
+    }

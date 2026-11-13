@@ -41,11 +41,15 @@ import ops_queue as queue_backend
 
 # Repair states then agent states; the union is what `/tasks?status=` accepts.
 REPAIR_STATUSES = ("queued", "claimed", "running", "verifying", "resolved",
-                   "needs_human", "failed", "skipped", "cancelled")
+                   "needs_human", "failed", "skipped", "cancelled",
+                   # The repair was not run: the policy engine wants a human
+                   # to approve it first. The work continues in a *new* task
+                   # that carries the same incident.
+                   "awaiting_approval")
 AGENT_STATUSES = ("queued", "running", "done", "error", "cancelled")
 STATUSES = tuple(dict.fromkeys(REPAIR_STATUSES + AGENT_STATUSES))
 TERMINAL = frozenset({"resolved", "needs_human", "failed", "skipped",
-                      "cancelled", "done", "error"})
+                      "cancelled", "done", "error", "awaiting_approval"})
 ACTIVE = frozenset({"queued", "claimed", "running", "verifying"})
 QUEUES = ("repair", "agent")
 PRIORITIES = ("critical", "normal")

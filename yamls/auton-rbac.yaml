@@ -58,6 +58,13 @@ rules:
   resources: ["secrets"]
   resourceNames: ["auton-model"]
   verbs: ["patch"]
+# The repair policy (`auton-policy`) is the other object the API may write:
+# the UI can tighten or loosen what the workers are allowed to do. It is one
+# named ConfigMap, and nothing else is reachable.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["auton-policy"]
+  verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -113,6 +113,11 @@ spec:
         - name: AGENT_WORKER_POLL
           value: "5"
         # --- repair policy ------------------------------------------------- #
+        # The policy engine reads this ConfigMap on every decision: a change
+        # takes effect without a restart. It is a projected volume, so the
+        # worker's ServiceAccount needs no permission to read it.
+        - name: AGENT_POLICY_DIR
+          value: "/etc/auton-policy"
         - name: AGENT_OPS_COOLDOWN
           value: "1800"
         - name: AGENT_OPS_MAX_ACTIONS_PER_HOUR
@@ -152,6 +157,9 @@ spec:
           mountPath: /workspace
         - name: tmp
           mountPath: /tmp
+        - name: policy
+          mountPath: /etc/auton-policy
+          readOnly: true
         livenessProbe:
           exec:
             command:
@@ -171,3 +179,7 @@ spec:
           claimName: agent-workspace
       - name: tmp
         emptyDir: {}
+      - name: policy
+        configMap:
+          name: auton-policy
+          optional: true

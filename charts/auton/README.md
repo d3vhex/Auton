@@ -199,6 +199,12 @@ token helper reads the current value so n8n and the workers keep working.
 | `provider.name` / `.baseUrl` / `.model` | `ollama` / `http://ollama-service:11434` / `qwen2.5-coder:7b-instruct` | Model provider |
 | `provider.apiKey` | `""` | Creates Secret `auton-model` |
 | `provider.dataPolicy` | `redact` | `redact` / `allow` / `local-only` |
+| `policy.create` | `true` | Create ConfigMap `auton-policy` and mount it into the API + workers |
+| `policy.mode` | `safe-auto` | `disabled` / `observe-only` / `safe-auto` / `approval-required` |
+| `policy.autoApproveTiers` / `.approvalTiers` / `.denyTiers` | `[0,1,2]` / `[3]` / `[]` | Risk tiers that run unattended, that wait for a human, that are refused |
+| `policy.protectedNamespaces` / `.protectedLabels` | `kube-system`, … / `auton.io/protect=true` | Targets the platform may never repair |
+| `policy.rules` | `[]` | Ordered rules; the first match wins (`match` + `action`/`tier`) |
+| `policy.approvalTimeoutSeconds` | `3600` | How long a pending approval stays decidable |
 | `ollama.enabled` | `false` | Deploy Ollama + model-pull Job |
 | `n8n.enabled` | `false` | Deploy n8n |
 | `ingress.enabled` | `false` | Standard Ingress (`auton.localhost`) |

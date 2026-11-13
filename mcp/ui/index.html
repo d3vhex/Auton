@@ -147,6 +147,7 @@
 <nav>
   <button data-tab="chat" class="active">Chat</button>
   <button data-tab="incidents">Incidents</button>
+  <button data-tab="approvals">Approvals</button>
   <button data-tab="tasks">Tasks</button>
   <button data-tab="audit">Audit</button>
   <button data-tab="provider">Provider</button>
@@ -254,6 +255,48 @@
         <button class="primary" id="m-submit">Queue repair</button>
         <span class="status" id="m-status"></span>
       </div>
+    </div>
+  </section>
+
+  <!-- Approvals -------------------------------------------------------- -->
+  <section class="pane" id="pane-approvals">
+    <div class="card">
+      <div class="row">
+        <select id="approval-filter" style="width:auto">
+          <option value="pending">pending</option>
+          <option value="">all</option>
+          <option value="approved">approved</option>
+          <option value="rejected">rejected</option>
+          <option value="executed">executed</option>
+          <option value="expired">expired</option>
+        </select>
+        <button id="approval-reload">Refresh</button>
+        <span class="status" id="approval-status"></span>
+      </div>
+      <p class="status" style="margin:0">
+        A repair plan that the policy engine rated above the automatic tier
+        waits here. Nothing in the cluster changes until somebody approves it;
+        rejecting sends the incident back to a human.
+      </p>
+      <div class="list" id="approval-list"></div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3 style="margin:0;font-size:12px;color:var(--dim)">Policy</h3>
+      <div class="row">
+        <label>mode
+          <select id="policy-mode">
+            <option value="">…</option>
+            <option value="disabled">disabled</option>
+            <option value="observe-only">observe-only</option>
+            <option value="safe-auto">safe-auto</option>
+            <option value="approval-required">approval-required</option>
+          </select>
+        </label>
+        <button id="policy-reload">Refresh</button>
+        <span class="status" id="policy-status"></span>
+      </div>
+      <div class="box" style="flex:1"><pre id="policy-view">…</pre></div>
     </div>
   </section>
 
@@ -569,6 +612,7 @@
   // -- tabs ------------------------------------------------------------- //
   function reloadTab() {
     if (currentTab === "incidents") loadIncidents();
+    if (currentTab === "approvals") { loadApprovals(); loadPolicy(); }
     if (currentTab === "tasks") loadTasks();
     if (currentTab === "audit") loadAudit();
     if (currentTab === "provider") loadProvider();
@@ -684,6 +728,105 @@
     } catch (e) { setStatus($("incident-status"), e.message, true); }
   }
 
+  // -- approvals --------------------------------------------------------- //
+  async function loadApprovals() {
+    if (tokenGuard($("approval-status"))) return;
+    setStatus($("approval-status"), "loading…");
+    try {
+      const status = $("approval-filter").value;
+      const data = await apiJson("/approvals?limit=50" + (status ? "&status=" + status : ""));
+      const list = $("approval-list");
+      list.innerHTML = "";
+      setStatus($("approval-status"), `${data.count} approval(s)`);
+      data.approvals.forEach((rec) => list.appendChild(approvalCard(rec)));
+      if (!data.approvals.length) {
+        const empty = document.createElement("div");
+        empty.className = "meta";
+        empty.textContent = "No approval requests. A repair plan appears here when the policy rates it above the automatic tier.";
+        list.appendChild(empty);
+      }
+    } catch (e) { setStatus($("approval-status"), e.message, true); }
+  }
+
+  function approvalCard(rec) {
+    const el = document.createElement("div");
+    el.className = "incident";
+    const plan = rec.plan || {};
+    const top = document.createElement("div");
+    top.className = "top";
+    const sum = document.createElement("div");
+    sum.className = "sum";
+    sum.textContent = plan.action || plan.root_cause || rec.id;
+    const tier = document.createElement("span");
+    tier.className = "badge";
+    tier.textContent = "tier " + (plan.tier != null ? plan.tier : "?");
+    const badge = document.createElement("span");
+    badge.className = "badge " + (rec.status || "");
+    badge.textContent = rec.status || "?";
+    const id = document.createElement("span");
+    id.className = "id";
+    id.textContent = rec.id;
+    top.append(sum, tier, badge, id);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = [plan.resource, plan.namespace, fmtTime(rec.created_at),
+      (rec.policy && rec.policy.reason) || ""].filter(Boolean).join(" · ");
+    el.append(top, meta);
+
+    if (plan.expected_effect || plan.verification) {
+      const detail = document.createElement("pre");
+      detail.textContent = [plan.expected_effect,
+        plan.verification ? "verify: " + plan.verification : "",
+        plan.rollback && plan.rollback.note ? "undo: " + plan.rollback.note : ""
+      ].filter(Boolean).join("\n");
+      el.append(detail);
+    }
+
+    if (rec.status === "pending") {
+      const row = document.createElement("div");
+      row.className = "row";
+      const approve = document.createElement("button");
+      approve.className = "primary";
+      approve.textContent = "Approve";
+      approve.onclick = () => decideApproval(rec.id, true);
+      const reject = document.createElement("button");
+      reject.className = "danger";
+      reject.textContent = "Reject";
+      reject.onclick = () => decideApproval(rec.id, false);
+      row.append(approve, reject);
+      el.append(row);
+    }
+    return el;
+  }
+
+  async function decideApproval(id, approve) {
+    const path = "/approvals/" + encodeURIComponent(id) + (approve ? "/approve" : "/reject");
+    try {
+      const data = await apiJson(path, {
+        method: "POST",
+        body: JSON.stringify({ by: "ui", comment: approve ? "approved in the UI" : "rejected in the UI" })
+      });
+      setStatus($("approval-status"), data.ok ? (approve ? "approved" : "rejected") : "failed");
+      loadApprovals();
+    } catch (e) { setStatus($("approval-status"), e.message, true); }
+  }
+
+  async function loadPolicy() {
+    if (tokenGuard($("policy-status"))) return;
+    try {
+      const data = await apiJson("/policy");
+      const select = $("policy-mode");
+      if (data.ok) {
+        select.value = data.policy.mode || "";
+        setStatus($("policy-status"), "mode: " + data.policy.mode + " · source: " + data.source);
+        $("policy-view").textContent = JSON.stringify(data.policy, null, 2);
+      } else {
+        setStatus($("policy-status"), "the policy is invalid: " + data.error, true);
+        $("policy-view").textContent = data.error;
+      }
+    } catch (e) { setStatus($("policy-status"), e.message, true); }
+  }
+
   function incidentCard(rec) {
     const el = document.createElement("div");
     el.className = "incident";
@@ -728,6 +871,11 @@
 
   $("incident-reload").onclick = loadIncidents;
   $("incident-filter").onchange = loadIncidents;
+
+  // -- approvals --------------------------------------------------------- //
+  $("approval-reload").onclick = loadApprovals;
+  $("approval-filter").onchange = loadApprovals;
+  $("policy-reload").onclick = loadPolicy;
 
   // -- tasks ------------------------------------------------------------ //
   // One list + one detail pane: the list polls every few seconds, the open
@@ -1046,6 +1194,7 @@
   // Keep the task list current while it is on screen (the detail pane is
   // written only on click, so a poll never closes what you are reading).
   setInterval(() => { if (currentTab === "tasks") loadTasks(); }, 5000);
+  setInterval(() => { if (currentTab === "approvals") loadApprovals(); }, 10000);
 })();
 </script>
 </body>

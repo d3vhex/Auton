@@ -96,16 +96,17 @@ manifests, trust the code/manifests.
 - `scripts/install.sh` is the executable runbook (cluster → GPU plugin → Ollama
   → model → image → Redis → API/executor/scanners/workers → n8n → ingress, then
   a verification pass). It is idempotent, keeps an existing token/PVC, and
-  `--verify` re-runs only the checks (11 of them). Use `AUTON_IMAGE` to deploy a
+  `--verify` re-runs only the checks (14 of them). Use `AUTON_IMAGE` to deploy a
   registry image instead of `auton:local`.
 - `mcp/Dockerfile` explicitly `COPY`s the Python modules (currently
   `agent_core.py agent_server.py agent_client.py agent_service.py
-  agent_worker.py audit.py incidents.py k8s_tools.py llm.py n8n_tools.py
-  ops_controller.py ops_queue.py ops_scanner.py ops_worker.py playbooks.py
-  provider_admin.py task_store.py`) **and** the `ui/` directory. Any new
-  module/page must be added there or it will be missing inside the pod. The
-  image also installs `git`, `ripgrep`, `bubblewrap` and **kubectl v1.35.5**
-  (matches the server minor); `tests/` and `.venv/` are excluded via
+  agent_worker.py approvals.py audit.py diagnosis.py evidence.py
+  incidents.py k8s_tools.py llm.py n8n_tools.py ops_controller.py
+  ops_queue.py ops_scanner.py ops_worker.py planner.py playbooks.py
+  policy.py provider_admin.py task_store.py`) **and** the `ui/` directory. Any
+  new module/page must be added there or it will be missing inside the pod.
+  The image also installs `git`, `ripgrep`, `bubblewrap` and **kubectl
+  v1.35.5** (matches the server minor); `tests/` and `.venv/` are excluded via
   `.dockerignore`.
 - Never apply `yamls/ollama-deployment.yaml.orig`; it creates a second Ollama in
   the `default` namespace that competes for the GPU.
@@ -231,20 +232,18 @@ manifests, trust the code/manifests.
   "both")` generates webhook -> Slack/Telegram HTTP nodes using
   `SLACK_OPS_WEBHOOK` / `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from `$env`
   (no n8n credential setup).
-- **Autonomous ops** (`ops_controller.py`, `playbooks.py`, `incidents.py`):
-  `ops_controller` snapshots `AGENT_OPS_NAMESPACES` (default `auton-apps`) every
-  `AGENT_OPS_INTERVAL` (60 s) using the same `k8s_tools._collect` the model
-  uses, maps pod/deployment/PVC symptoms to deterministic causes (`oom`,
-  `crashloop`, `stuck`, `rollout`, `replicas_zero`), and runs the matching
-  playbook from `playbooks.py`. The LLM is **not** in this path: a 7B model
-  explaining an OOMKill is useful, a 7B model choosing a kubectl patch is not.
+- **Autonomous ops** (`ops_controller.py`, `playbooks.py`, `incidents.py`,
+  `evidence.py`, `diagnosis.py`): `ops_controller` snapshots
+  `AGENT_OPS_NAMESPACES` (default `auton-apps`) every `AGENT_OPS_INTERVAL`
+  (60 s) using the same `k8s_tools._collect` the model uses, maps
+  pod/deployment/PVC symptoms to deterministic causes (`oom`, `crashloop`,
+  `stuck`, `rollout`, `replicas_zero`), and runs the matching playbook from
+  `playbooks.py`. The LLM is **not** in this path: a 7B model explaining an
+  OOMKill is useful, a 7B model choosing a kubectl patch is not.
   Image/config/scheduling/PVC problems are `report_only` -> `needs_human`.
   Each repair is wrapped in `k8s_tools.incident_scope(id)` so audit records
   carry the incident id; the playbook verifies its own result with a fresh
-  read. `incidents.py` stores one atomic JSON file per incident under
-  `AGENT_AUDIT_DIR/incidents` (shared with the API), statuses
-  `detected/acting/resolved/needs_human/failed`, plus a local retry queue.
-  Cooldown (`AGENT_OPS_COOLDOWN`, 1800 s) and an hourly action budget
+  read. Cooldown (`AGENT_OPS_COOLDOWN`, 1800 s) and an hourly action budget
   (`AGENT_OPS_MAX_ACTIONS_PER_HOUR`, 6) stop a flapping workload from being
   patched forever; `AGENT_OPS_DRY_RUN=1` reports without mutating.
   `AGENT_OPS_STARTUP_GRACE` (120 s) suppresses `Pending`/`NotReady` for a young
@@ -259,6 +258,82 @@ manifests, trust the code/manifests.
   labelled `auton.io/protect=true` are never touched. Detection rules are in
   `ops_controller.REASONS` / `REPORT_ONLY`; add a playbook and a test before
   adding a cause there.
+- **Incident Manager v2** (`incidents.py`): one atomic JSON file per incident
+  under `AGENT_INCIDENTS_DIR` (default `AGENT_AUDIT_DIR/incidents`, shared
+  with the API), plus an optional Redis index. The record carries a
+  `fingerprint` (sha1 of `cluster|kind|ns|name|cause`, 16 hex),
+  `occurrence_count`, `first_seen`/`last_seen`, `resource_uid`, `cluster_id`,
+  `type`, `diagnosis`, `repair_plan`, `resolution`, `timeline[]`,
+  `previous_incident_id`/`recurrence_ids` and `severity_changes[]`. The state
+  machine has 13 states (`incidents.TRANSITIONS` is the adjacency table;
+  `path_to()` finds the legal route, `transition()` raises `TransitionError`
+  on an illegal one, `reopen()` is the *only* way out of a terminal state).
+  `STATE_LABELS` maps them to the spec's uppercase spelling
+  (`triage` -> `TRIAGING`). `note_healthy()` auto-resolves after
+  `AGENT_OPS_HEALTHY_THRESHOLD` healthy passes. A recurrence opens a **new**
+  incident linked to the old one; a repair retry reuses the **same**
+  incident and reopens it.
+- **Evidence Collector** (`evidence.py`): `collect(namespace, kind, name)`
+  returns the structured document (`resource`/`problem`/`container`/
+  `resources`/`owner`/`evidence` + probes, node, events, logs, previous logs,
+  node metrics, deployment). It **never reads a Secret** — only whether an
+  image-pull secret is configured (boolean; the name never leaks) — and
+  unavailable evidence is marked with a `False` flag instead of being
+  invented. The worker's Role is namespace-scoped, so `node_available` is
+  `false` there; that is correct, not a bug.
+- **Diagnosis Engine** (`diagnosis.py`): 18 deterministic root causes
+  (`diagnosis.ROOT_CAUSES`), classified in priority order (pod status ->
+  events -> container termination -> node metrics/pressure -> logs ->
+  ownership -> remaining rules). A generic `Error` exit is only an
+  observation, so the engine keeps looking in the logs/events/probes instead
+  of concluding "application crash" early. The result is
+  `{root_cause, confidence, severity, evidence[], recommended_action,
+  requires_human, source}` and `recommended_action` is always one of the six
+  allowlisted actions. `validate_llm_analysis()` accepts a model proposal
+  only if it agrees with the evidence (known cause, same as the deterministic
+  one, confidence not lowered, known action); `AGENT_OPS_LLM_DIAGNOSIS=1`
+  enables that advisory pass.
+- **Policy Engine** (`policy.py`): the gate between a plan and an action.
+  Modes `disabled` / `observe-only` / `safe-auto` / `approval-required`;
+  tiers 0-3 describe the risk of the **action** (0 observe, 1 transient,
+  2 changes the workload spec, 3 data-affecting/irreversible). The policy
+  document is ConfigMap `auton-policy` (key `policy.json` plus a flat `mode`
+  key for the quick switch), mounted as a projected volume at
+  `AGENT_POLICY_DIR` so no SA needs read RBAC; it is read **per decision**, so
+  a change takes effect without a restart. **Fail closed**: an unreadable or
+  invalid document is treated as `disabled` and every decision is a denial.
+  A JSON array body is a *broken document*, not an absent one (it must not
+  fall back to the default). `scripts/set-policy.sh` writes it and validates
+  before writing.
+- **Repair Planner** (`planner.py`): turns a diagnosis into a `RepairPlan`
+  (`plan_id`, `incident_id`, namespace/kind/name/resource, `cause`,
+  `root_cause`, `action`, `playbook`, `tier`, `params`, `expected_effect`,
+  `verification`, `reversible`, `rollback`, `requires_human`, `labels`). The
+  plan is a **proposal**, never an order: it names a registered playbook and
+  fixed parameters, so there is no free-form command in the repair path.
+- **Approval Store** (`approvals.py`): atomic JSON approval requests under
+  `AGENT_APPROVALS_DIR` (default `AGENT_AUDIT_DIR/approvals`, shared PVC with
+  the API). States `pending/approved/rejected/expired/executed/cancelled`;
+  only `pending` may be decided and only **once** (a second click is a
+  conflict, never a second repair). Approving enqueues a **new** task
+  carrying `incident_id` + `approval_id` + `force:true`, so the same incident
+  continues; the worker marks the request `executed` after the repair. An
+  approved resume re-reads the policy but only the `disabled` off switch may
+  still stop it — the human is the authorisation. Rejecting sends the
+  incident to `needs_human`.
+- **Phase 2 pipeline order** (`ops_controller.execute_task`): evidence →
+  diagnosis → **plan** → **policy check** → `auto` | `require_approval` |
+  `observe` | `deny` → playbook → verify. `require_approval` parks the task
+  with the new terminal task status `awaiting_approval`; `observe` closes the
+  incident as `suppressed`; `deny` closes it as `needs_human`. The plan is
+  persisted **before** the state walk, because the walk reloads the record
+  from disk and would otherwise drop it.
+- **CPython 3.14 f-string compiler bug**: an f-string whose expression
+  contains a nested string literal (e.g. `f"{', '.join(x)}"`) can compile a
+  local as `LOAD_GLOBAL`, causing `NameError: name 'x' is not defined`.
+  Compute joined strings in a separate statement so f-string expressions
+  contain only plain names. The `edit` tool also fails to match anchors
+  containing `', '` — use a scripted replacement instead.
 - File/search tools are jailed to `AGENT_WORKSPACE` (default `./workspace`;
   container uses `/workspace`). `bash`/`run_tests`/`git` are deliberately not
   jailed and run a real shell; `AGENT_SANDBOX=bwrap` optionally wraps them.
@@ -325,7 +400,7 @@ point at the system Python, so a Python upgrade leaves it broken.
 
 - Run the agent test suite before rebuilding the image:
   `cd mcp && python -m pytest tests -q` (no cluster or GPU needed; expect
-  `246 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
+  `495 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
   grants secrets or PVC delete.
 - To measure real model behaviour, run the eval harness against a live Ollama:
   `cd mcp && python eval/run_eval.py` (or `--list`, `--only N`, `--verbose`).
@@ -349,15 +424,18 @@ point at the system Python, so a Python upgrade leaves it broken.
   with no token configured expect `503`.
 - UI: `curl -s http://localhost:8080/ | head` returns the HTML page and
   `curl -s http://localhost:8080/ui` the same (both open); `/health` must still
-  return JSON. In the browser, Chat → Incidents → Audit → Provider must each
-  load with the token and show `401` feedback without one.
+  return JSON. In the browser, Chat → Incidents → Approvals → Audit → Provider
+  must each load with the token and show `401` feedback without one. The
+  Approvals tab lists the pending repair plans with their tier, expected
+  effect, verification and rollback, and has the Approve / Reject buttons;
+  the policy view under it shows the effective mode.
 - Helm: `helm lint charts/auton` and
   `helm template auton charts/auton -n auton | kubectl apply --dry-run=server -f -`.
-  On an existing install the agent PVC must be adopted
-  (`--set agent.workspace.existingClaim=agent-workspace`) or the dry run fails on
-  the immutable `storageClassName`.
-- `scripts/install.sh --verify` runs the token/RBAC/provider/incidents checks
-  and must print six `ok` lines on a healthy install.
+  On an existing install **both** PVCs must be adopted or the dry run fails on
+  the immutable `storageClassName`:
+  `--set agent.workspace.existingClaim=agent-workspace --set redis.persistence.existingClaim=redis-data`.
+- `scripts/install.sh --verify` runs the token/RBAC/provider/incidents/policy
+  checks and must print fourteen `ok` lines on a healthy install.
 - Provider: `GET /provider` (auth) returns the active provider with a masked
   key; `POST /provider/test` sends one tiny completion and returns `ok`/`502`.
   `scripts/set-provider.sh --provider <name> ...` switches without a restart —
@@ -377,9 +455,10 @@ point at the system Python, so a Python upgrade leaves it broken.
   Simulate a broken log by pointing `AGENT_AUDIT_DIR` at a file — the mutation
   must be refused with `refused ... audit log is not writable` and kubectl must
   not run.
-- Ops controller: `kubectl -n auton logs deploy/auton-ops` must show
+- Ops controller: `kubectl -n auton logs deploy/auton-scanner` must show
   `pass complete: {... "findings": N ...}` every interval (empty `auton-apps`
-  -> `findings: 0`). `GET /incidents` lists records and
+  -> `findings: 0`); `kubectl -n auton logs deploy/auton-worker` shows the
+  claim/repair/verify lines. `GET /incidents` lists records and
   `GET /incidents/{id}` one record. Live checks:
   - OOM: create a Deployment in `auton-apps` that allocates more than its
     `limits.memory`; expect an `incident ... oom` log, the limit raised by
@@ -390,10 +469,30 @@ point at the system Python, so a Python upgrade leaves it broken.
     `needs_human` with action `report_only` and **no** audit rows.
   - `AGENT_OPS_DRY_RUN=1` must record `detected` + `dry_run` without changing
     the Deployment.
-  - From the ops pod, `kubectl auth can-i` must say `no` for
+  - From the worker pod, `kubectl auth can-i` must say `no` for
     `delete persistentvolumeclaims`, `get secrets`, and
     `patch deployments -n auton`, and `yes` for `patch deployments` in
     `auton-apps`.
+- Incident Manager v2 (Phase 1): `GET /incidents/{id}` must show
+  `fingerprint`, `state` (the uppercase spec name), `occurrence_count`,
+  `first_seen`/`last_seen`, `resource_uid`, `cluster_id`, `type`, a
+  `diagnosis` (`root_cause`/`confidence`/`recommended_action`), the full
+  `evidence_structured` document and a `timeline` that contains
+  `TRIAGING → DIAGNOSING → PLANNING → POLICY_CHECK → QUEUED → EXECUTING →
+  VERIFYING → RESOLVED`. `GET /incidents?severity=&cause=&namespace=&resource=&fingerprint=`
+  filters (each a comma list) must work, and an unauthenticated call must
+  answer `401`.
+- Phase 2 (policy + approvals): `GET /policy` must report the effective mode
+  (`safe-auto` by default) and `source: configmap`. Set the policy to require
+  an approval for tier 2
+  (`kubectl -n auton patch cm auton-policy --type merge -p
+  '{"data":{"mode":"approval-required"}}'`), trigger an OOM in `auton-apps`,
+  and expect: the incident reaches `AWAITING_APPROVAL`, a pending `apr-*`
+  request appears in `GET /approvals`, the Deployment is **unchanged** and
+  `/audit?incident_id=` is **empty**. Then `POST /approvals/{id}/approve`
+  (`{"by":"<name>"}`) must enqueue a repair, raise the limit, resolve the
+  same incident and mark the request `executed`; a second approve must answer
+  `409`. Restore `safe-auto` and re-verify the automatic OOM self-heal.
 - n8n ops reports: `n8n_create_ops_pipeline(kind="both")` creates and activates
   `/webhook/auton-ops`. Set `SLACK_OPS_WEBHOOK` and/or
   `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in n8n; POSTing the notification

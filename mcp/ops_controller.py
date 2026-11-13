@@ -45,9 +45,14 @@ import urllib.error
 import urllib.request
 
 import audit
+import approvals
+import diagnosis
+import evidence
 import incidents
 import k8s_tools
+import planner
 import playbooks
+import policy
 import task_store
 
 NAMESPACES = playbooks.ops_namespaces()
@@ -71,6 +76,9 @@ OPS_DIR = os.environ.get("AGENT_OPS_DIR", "").strip() or os.environ.get(
     "AGENT_AUDIT_DIR", "/workspace/.ops")
 STORE = incidents.IncidentStore(os.path.join(OPS_DIR, "incidents"),
                                 max_records=MAX_RECORDS)
+APPROVALS = approvals.ApprovalStore(
+    os.environ.get("AGENT_APPROVALS_DIR", "").strip()
+    or os.path.join(OPS_DIR, "approvals"))
 STOP = threading.Event()
 
 # Queue split (see ops_scanner.py / ops_worker.py).
@@ -308,12 +316,114 @@ def findings(snapshot: dict) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 def _diagnose(item: dict, namespace: str) -> str:
+    """The legacy text evidence blob (kept for the UI and the playbooks)."""
     if item["kind"] != "Pod":
         return ""
     try:
         return k8s_tools.k8s_diagnose(item["name"], namespace=namespace)
     except Exception as exc:  # evidence is best effort
         return f"(diagnose failed: {type(exc).__name__}: {exc})"
+
+
+def _structured_evidence(item: dict, namespace: str) -> dict:
+    """Collect structured evidence for a finding.
+
+    Never raises: a failed collection comes back as a document with the
+    availability flags set to ``False``. The structured document is what the
+    Diagnosis Engine reasons over; the text blob above stays for the UI.
+    """
+    try:
+        return evidence.collect(
+            namespace, item.get("kind", "Pod"), item.get("name", ""),
+            container=item.get("container", ""),
+            problem=item.get("cause", ""))
+    except Exception as exc:  # evidence must never break the repair path
+        log(f"evidence collection failed for {item.get('name')}: "
+            f"{type(exc).__name__}: {exc}")
+        return {"resource": {"kind": item.get("kind", ""),
+                             "name": item.get("name", ""),
+                             "namespace": namespace, "uid": ""},
+                "problem": item.get("cause", ""), "container": {},
+                "resources": {}, "owner": {}, "evidence": {},
+                "errors": [f"{type(exc).__name__}: {exc}"]}
+
+
+def _run_diagnosis(item: dict, namespace: str,
+                   document: dict) -> dict:
+    """Classify the root cause from the structured evidence.
+
+    The deterministic engine is always first. The model is only consulted
+    when it is asked for explicitly, and a model answer that the evidence
+    does not support is discarded.
+    """
+    try:
+        result = diagnosis.diagnose(document)
+    except Exception as exc:
+        log(f"diagnosis failed for {item.get('name')}: "
+            f"{type(exc).__name__}: {exc}")
+        return {"root_cause": diagnosis.UNKNOWN, "confidence": 0.0,
+                "severity": "medium", "evidence": [],
+                "recommended_action": diagnosis.NONE,
+                "requires_human": True, "source": "deterministic"}
+    if os.environ.get("AGENT_OPS_LLM_DIAGNOSIS", "0").strip().lower() in (
+            "1", "true", "yes", "on"):
+        prompt = json.dumps({"problem": document.get("problem", ""),
+                             "container": document.get("container", {}),
+                             "resources": document.get("resources", {}),
+                             "events": document.get("events", []),
+                             "logs": str(document.get("logs", ""))[-2000:]},
+                            indent=2, default=str)
+        result = diagnosis.llm_analyse(document, result, prompt)
+    return result
+
+
+def _attach_evidence(incident: dict, item: dict, namespace: str) -> dict:
+    """Collect the evidence and classify the root cause for an incident.
+
+    This happens for *every* incident, including the ones that are only
+    reported: the diagnosis is what tells a human what is actually wrong.
+    """
+    document = _structured_evidence(item, namespace)
+    incident["evidence_structured"] = document
+    text_evidence = incident.get("evidence") or _diagnose(item, namespace)
+    if text_evidence:
+        incident["evidence"] = text_evidence
+    incident["diagnosis"] = _run_diagnosis(item, namespace, document)
+    incident["resource_uid"] = (document.get("resource") or {}).get("uid", "")
+    incident["type"] = incident["diagnosis"].get("root_cause") or item["cause"]
+    STORE.save(incident)
+    return incident
+
+
+def _walk_incident(incident: dict, target: str, *, by: str = "worker",
+                   note: str = "") -> dict:
+    """Move an incident along the pipeline to ``target``.
+
+    The route is the legal path through the state machine; a closed incident
+    is re-opened explicitly (a repair retry reuses the same incident).
+    """
+    record = incident
+    current = incidents.normalize_state(record.get("status", "detected"))
+    steps = incidents.path_to(current, target)
+    if not steps and current != target:
+        # A closed incident has no legal path forward: it is re-opened
+        # explicitly, which is how a repair retry reuses the same incident.
+        if current not in incidents.TERMINAL_STATES:
+            raise incidents.TransitionError(
+                f"illegal transition {current} -> {target} for incident "
+                f"{record.get('id')}: there is no legal path")
+        steps = [target]
+    for step in steps:
+        try:
+            record = STORE.transition(record["id"], step, by=by, note=note)
+        except incidents.TransitionError:
+            if current not in incidents.TERMINAL_STATES:
+                raise
+            record = STORE.reopen(record["id"], step, by=by, note=note)
+        if record is None:
+            break
+        current = incidents.normalize_state(record.get("status", ""))
+    return record or incident
 
 
 def _run_playbook(item: dict, namespace: str, evidence: str) -> dict:
@@ -341,6 +451,18 @@ def build_report(record: dict) -> str:
     """Deterministic, short report (the UI and Slack/Telegram use this)."""
     cause = CAUSE_TEXT.get(record.get("cause"), record.get("cause") or "problem")
     lines = [f"{record.get('resource')} in {record.get('namespace')}: {cause}."]
+    diagnosis_record = record.get("diagnosis") or {}
+    if diagnosis_record.get("root_cause"):
+        confidence = diagnosis_record.get("confidence")
+        confidence_text = (f" (confidence {confidence})"
+                           if confidence is not None else "")
+        lines.append(f"Root cause: {diagnosis_record['root_cause']}"
+                     f"{confidence_text}")
+        for item in (diagnosis_record.get("evidence") or [])[:5]:
+            lines.append(f"  - {item}")
+        if diagnosis_record.get("recommended_action"):
+            lines.append(f"Suggested action: "
+                         f"{diagnosis_record['recommended_action']}")
     if record.get("observation"):
         lines.append(f"Observed: {record['observation']}")
     for action in record.get("actions") or []:
@@ -378,13 +500,21 @@ def _post(url: str, payload: dict, token: str = "", timeout: int = 15) -> int:
 
 def notification_payload(record: dict) -> dict:
     last = (record.get("actions") or [{}])[-1]
+    diagnosis_record = record.get("diagnosis") or {}
     return {
         "incident_id": record.get("id"),
         "severity": record.get("severity"),
         "status": record.get("status"),
+        "state": record.get("state", record.get("status", "")),
         "namespace": record.get("namespace"),
         "resource": record.get("resource"),
         "summary": record.get("observation"),
+        "root_cause": diagnosis_record.get("root_cause", ""),
+        "confidence": diagnosis_record.get("confidence", 0),
+        "recommended_action": diagnosis_record.get("recommended_action", ""),
+        "requires_human": bool(diagnosis_record.get("requires_human")
+                               or record.get("needs_human")),
+        "occurrence_count": record.get("occurrence_count", 1),
         "action": last.get("detail") or last.get("action") or "",
         "verification": record.get("verification", ""),
         "report": record.get("report", ""),
@@ -472,20 +602,18 @@ def handle(item: dict, namespace: str) -> None:
         return
 
     try:
-        record = STORE.create(
-            namespace=namespace, kind=item["kind"], name=item["name"],
-            cause=item["cause"], observation=item["observation"],
-            severity=item["severity"])
+        record = _create_incident(item, namespace, source="controller")
     except incidents.IncidentError as exc:
         log(f"cannot create incident for {resource}: {exc}")
         return
     log(f"incident {record['id']}: {resource} {item['cause']} "
         f"({item['severity']})")
 
-    evidence = _diagnose(item, namespace)
-    if evidence:
-        record["evidence"] = evidence
-        STORE.save(record)
+    # Collect the evidence and classify the root cause before anything is
+    # changed. The incident records both, so the UI can show *why* the
+    # system decided what it decided.
+    _attach_evidence(record, item, namespace)
+    text_evidence = record.get("evidence") or ""
 
     if item["cause"] in REPORT_ONLY:
         record.update({
@@ -494,6 +622,7 @@ def handle(item: dict, namespace: str) -> None:
             "actions": [{"action": "report_only", "ok": False,
                          "detail": _human_action(item["cause"])}],
         })
+        record["state"] = incidents.STATE_LABELS["needs_human"]
         record["report"] = build_report(record)
         STORE.save(record)
         notify(record)
@@ -506,16 +635,21 @@ def handle(item: dict, namespace: str) -> None:
             "actions": [{"action": "dry_run", "ok": True, "detail": plan}],
             "verification": "dry run: nothing was changed",
         })
+        record["state"] = incidents.STATE_LABELS["detected"]
         record["report"] = build_report(record)
         STORE.save(record)
         notify(record)
         return
 
-    record.update({"status": "acting", "attempts": (record.get("attempts") or 0) + 1})
+    record = _walk_incident(record, "executing", by="controller",
+                            note="playbook starting")
+    record.update({"status": "acting", "needs_human": False,
+                   "attempts": int(record.get("attempts") or 0) + 1})
+    record["state"] = incidents.STATE_LABELS["executing"]
     STORE.save(record)
     try:
         with k8s_tools.incident_scope(record["id"]):
-            result = _run_playbook(item, namespace, evidence)
+            result = _run_playbook(item, namespace, text_evidence)
     except Exception as exc:
         result = {"action": "playbook_error", "ok": False,
                   "detail": f"{type(exc).__name__}: {exc}",
@@ -540,11 +674,19 @@ def handle(item: dict, namespace: str) -> None:
         status = "failed"
     record.update({
         "status": status,
-        "needs_human": bool(result.get("needs_human")),
+        "needs_human": status == "needs_human",
         "actions": actions,
         "verification": result.get("verification", ""),
         "audit_ids": audit_ids,
+        "resolution": {
+            "status": status,
+            "action": result.get("action", ""),
+            "detail": result.get("detail", ""),
+            "verification": result.get("verification", ""),
+            "at": round(time.time(), 3),
+        },
     })
+    record["state"] = incidents.STATE_LABELS.get(status, status.upper())
     record["report"] = build_report(record)
     STORE.save(record)
     log(f"incident {record['id']} -> {status}: {result.get('detail')}")
@@ -640,7 +782,7 @@ def manual_task_fields(payload: dict) -> dict:
     severity = str(body.get("severity") or "").strip().lower()
     if severity not in ("critical", "warning", "info"):
         severity = default_severity
-    return {
+    fields = {
         "namespace": namespace,
         "kind": kind,
         "name": name,
@@ -656,6 +798,19 @@ def manual_task_fields(payload: dict) -> dict:
         "source": "manual",
         "resource": incidents.resource_key(kind, name),
     }
+    # An approved plan continues the incident it belongs to, and names the
+    # approval that authorised it. Both are optional and both are validated.
+    incident_id = str(body.get("incident_id") or "").strip()
+    if incident_id:
+        if not re.match(r"^inc-[0-9a-f]{8,32}$", incident_id):
+            raise ValueError("incident_id must be an incident id")
+        fields["incident_id"] = incident_id
+    approval_id = str(body.get("approval_id") or "").strip()
+    if approval_id:
+        if not re.match(r"^apr-[0-9a-f]{8,32}$", approval_id):
+            raise ValueError("approval_id must be an approval id")
+        fields["approval_id"] = approval_id
+    return fields
 
 
 def submit_manual(store, payload: dict, actor: str = "api",
@@ -729,16 +884,44 @@ def _task_item(task: dict) -> dict:
                     container=task.get("container", ""))
 
 
+def _create_incident(item: dict, namespace: str, source: str = "") -> dict:
+    """Create an incident, linking it to the one it came back from.
+
+    A recurrence (the same problem on the same resource after the previous
+    incident closed) opens a *new* incident that points at the previous one
+    and continues its occurrence count — the history stays linked instead of
+    being split into unrelated records.
+    """
+    fingerprint_value = incidents.fingerprint(
+        item["kind"], namespace, item["name"], item["cause"])
+    previous = None
+    try:
+        candidate = STORE.find_by_fingerprint(fingerprint_value)
+    except incidents.IncidentError:
+        candidate = None
+    if candidate and candidate.get("status") not in incidents.OPEN_STATUSES:
+        previous = candidate
+    record = STORE.create(
+        namespace=namespace, kind=item["kind"], name=item["name"],
+        cause=item["cause"], observation=item["observation"],
+        severity=item["severity"], fingerprint_value=fingerprint_value,
+        previous=previous, source=source or item.get("source", ""))
+    if previous:
+        try:
+            STORE.link_recurrence(previous["id"], record["id"])
+        except incidents.IncidentError as exc:
+            log(f"cannot link recurrence {previous['id']} -> "
+                f"{record['id']}: {exc}")
+    return record
+
+
 def _incident_for(task: dict, item: dict, namespace: str) -> dict:
     """Reuse the incident a retry already created, or create a new one."""
     if task.get("incident_id"):
         incident = STORE.get(task["incident_id"])
         if incident is not None:
             return incident
-    return STORE.create(
-        namespace=namespace, kind=item["kind"], name=item["name"],
-        cause=item["cause"], observation=item["observation"],
-        severity=item["severity"])
+    return _create_incident(item, namespace, source=task.get("source", ""))
 
 
 def _append_action(incident: dict, result: dict) -> None:
@@ -769,6 +952,82 @@ def _retry(store, claim, reason: str) -> dict:
     store.append_log(claim.id, f"retry: {reason} -> {outcome}")
     log(f"task {claim.id}: {reason} -> {outcome}")
     return {"task": outcome, "task_id": claim.id, "reason": reason}
+
+
+def _approved_resume(task: dict) -> dict | None:
+    """The approval record that lets this task run without asking again.
+
+    A task that carries an ``approval_id`` is the continuation of a plan a
+    human already approved. The approval itself is the authorisation; the
+    policy engine is still consulted, but only its off switch can stop it.
+    """
+    approval_id = str(task.get("approval_id") or "").strip()
+    if not approval_id:
+        return None
+    try:
+        record = APPROVALS.get(approval_id)
+    except approvals.ApprovalError:
+        return None
+    if not record or record.get("status") != "approved":
+        return None
+    return record
+
+
+def _await_approval(store, claim, incident: dict, plan: dict,
+                    decision: dict) -> dict:
+    """Park a repair that the policy says needs a human.
+
+    Nothing in the cluster changes. The plan becomes an approval request and
+    the incident waits in ``AWAITING_APPROVAL``. When somebody approves, the
+    API enqueues a new task that carries the same incident, so the history
+    stays in one record.
+    """
+    timeout = 3600
+    try:
+        current, _ = policy.load()
+        timeout = int(current.get("approval_timeout_seconds", 3600))
+    except policy.PolicyError:
+        pass
+    try:
+        request = APPROVALS.create(plan=plan, policy=decision,
+                                   incident_id=incident["id"],
+                                   task_id=claim.id, timeout=timeout,
+                                   by="worker",
+                                   note=decision.get("reason", ""))
+    except approvals.ApprovalError as exc:
+        return _retry(store, claim, f"approval store failed: {exc}")
+
+    incident = _walk_incident(incident, "awaiting_approval", by="worker",
+                              note=f"waiting for approval {request['id']}")
+    incident.update({
+        "status": "awaiting_approval",
+        "needs_human": True,
+        "approval_id": request["id"],
+        "actions": [{"action": "awaiting_approval", "ok": False,
+                     "detail": decision.get("reason", "an approval is required")}],
+        "verification": "waiting for an approval; nothing was changed",
+    })
+    incident["state"] = incidents.STATE_LABELS["awaiting_approval"]
+    incident["report"] = build_report(incident)
+    try:
+        STORE.save(incident)
+    except incidents.IncidentError as exc:
+        return _retry(store, claim, f"incident store failed: {exc}")
+
+    notify(incident)
+    record = store.finish(
+        claim, status="awaiting_approval",
+        result={"action": "awaiting_approval",
+                "incident_id": incident["id"],
+                "approval_id": request["id"],
+                "plan_id": plan.get("plan_id", "")},
+        verification="waiting for an approval; nothing was changed",
+        note=f"approval {request['id']} requested")
+    store.append_log(claim.id, f"awaiting approval {request['id']}")
+    log(f"task {claim.id} -> awaiting_approval: {request['id']} "
+        f"({decision.get('reason', '')})")
+    return {"task": "awaiting_approval", "incident": incident["id"],
+            "approval_id": request["id"], "task_id": record["id"]}
 
 
 def execute_task(store, claim, namespace: str = "") -> dict:
@@ -807,12 +1066,14 @@ def execute_task(store, claim, namespace: str = "") -> dict:
         try:
             incident = _incident_for(task, item, namespace)
             store.update(task_id, incident_id=incident["id"])
+            _attach_evidence(incident, item, namespace)
             incident.update({
                 "status": "needs_human", "needs_human": True,
                 "verification": "no automatic action taken",
                 "actions": [{"action": "report_only", "ok": False,
                              "detail": _human_action(item["cause"])}],
             })
+            incident["state"] = incidents.STATE_LABELS["needs_human"]
             incident["report"] = build_report(incident)
             STORE.save(incident)
         except incidents.IncidentError as exc:
@@ -831,12 +1092,14 @@ def execute_task(store, claim, namespace: str = "") -> dict:
         try:
             incident = _incident_for(task, item, namespace)
             store.update(task_id, incident_id=incident["id"])
+            _attach_evidence(incident, item, namespace)
             incident.update({
                 "status": "detected", "needs_human": False,
                 "actions": [{"action": "dry_run", "ok": True,
                              "detail": f"would run the {item['cause']} playbook"}],
                 "verification": "dry run: nothing was changed",
             })
+            incident["state"] = incidents.STATE_LABELS["detected"]
             incident["report"] = build_report(incident)
             STORE.save(incident)
         except incidents.IncidentError as exc:
@@ -864,18 +1127,118 @@ def execute_task(store, claim, namespace: str = "") -> dict:
         incident = _incident_for(task, item, namespace)
         store.update(task_id, incident_id=incident["id"])
         incident["attempts"] = int(incident.get("attempts") or 0) + 1
-        incident.update({"status": "acting", "needs_human": False})
-        evidence = incident.get("evidence") or _diagnose(item, namespace)
-        if evidence:
-            incident["evidence"] = evidence
+        incident.update({"needs_human": False})
+        # Structured evidence + deterministic diagnosis before anything is
+        # changed. The incident records what was found and why.
+        _attach_evidence(incident, item, namespace)
+        # --- planning ---------------------------------------------------- #
+        # The plan is a proposal, not an instruction: it says what *would* be
+        # done, at which tier, and how it would be verified and undone.
+        document = incident.get("evidence_structured") or {}
+        plan = planner.build(item, namespace, incident.get("diagnosis") or {},
+                             document, incident_id=incident["id"],
+                             labels=(document.get("resource") or {}).get(
+                                 "labels") or {})
+        incident["repair_plan"] = plan
+        # Persist the plan *before* the walk: the walk reloads the record
+        # from disk, so an unsaved plan would be lost.
         STORE.save(incident)
+        approval = _approved_resume(task)
+        if approval is not None:
+            # A human already approved this plan. The policy is re-read, but
+            # only the off switch (`disabled`) may still stop the repair.
+            decision = policy.decide(plan)
+            if decision.get("mode") == "disabled":
+                decision = dict(decision, action="deny",
+                                reason="the policy engine is disabled")
+            else:
+                decision = dict(
+                    decision, action="auto", allowed=True,
+                    requires_approval=False,
+                    reason=f"approved by {approval.get('decided_by') or 'a human'}"
+                           f" (approval {approval.get('id')})")
+            incident["policy"] = decision
+            incident["policy_decision"] = decision
+            incident["approval_id"] = approval.get("id", "")
+            STORE.save(incident)
+        else:
+            # detected → triage → diagnosing → planning → policy_check
+            incident = _walk_incident(incident, "policy_check", by="worker",
+                                      note="repair plan built")
+            # --- policy check -------------------------------------------- #
+            decision = policy.decide(plan)
+            incident["policy"] = decision
+            incident["policy_decision"] = decision
+            STORE.save(incident)
     except incidents.IncidentError as exc:
         return _retry(store, claim, f"incident store failed: {exc}")
+
+    action = decision.get("action", "deny")
+
+    if action == "require_approval":
+        return _await_approval(store, claim, incident, plan, decision)
+
+    if action == "observe":
+        # Shadow mode: the plan is recorded, nothing is changed.
+        incident.update({
+            "status": "suppressed", "needs_human": False,
+            "actions": [{"action": "observed", "ok": True,
+                         "detail": decision.get("reason", "observe-only")}],
+            "verification": "observe-only: nothing was changed",
+        })
+        incident["state"] = incidents.STATE_LABELS["suppressed"]
+        incident["report"] = build_report(incident)
+        try:
+            STORE.save(incident)
+        except incidents.IncidentError as exc:
+            return _retry(store, claim, f"incident store failed: {exc}")
+        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        notify(incident)
+        return _finish_skipped(store, claim,
+                               f"observed only: {decision.get('reason', '')}",
+                               {"action": "observed",
+                                "incident_id": incident["id"],
+                                "plan_id": plan.get("plan_id", "")})
+
+    if action == "deny":
+        incident.update({
+            "status": "needs_human", "needs_human": True,
+            "actions": [{"action": "denied", "ok": False,
+                         "detail": decision.get("reason", "denied by policy")}],
+            "verification": "denied by policy: nothing was changed",
+        })
+        incident["state"] = incidents.STATE_LABELS["needs_human"]
+        incident["report"] = build_report(incident)
+        try:
+            STORE.save(incident)
+        except incidents.IncidentError as exc:
+            return _retry(store, claim, f"incident store failed: {exc}")
+        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        notify(incident)
+        record = store.finish(
+            claim, status="needs_human",
+            result={"action": "denied", "incident_id": incident["id"],
+                    "reason": decision.get("reason", "")},
+            verification="denied by policy: nothing was changed")
+        store.append_log(task_id, f"needs_human: denied by policy "
+                                  f"({decision.get('reason', '')})")
+        return {"task": "needs_human", "incident": incident["id"],
+                "task_id": record["id"]}
+
+    # --- allowed ---------------------------------------------------------- #
+    # policy_check → queued → executing
+    incident = _walk_incident(incident, "queued", by="worker",
+                              note=f"policy allowed the repair "
+                                   f"({decision.get('reason', '')})")
+    incident["status"] = "acting"
+    incident["state"] = incidents.STATE_LABELS["executing"]
+    evidence_text = incident.get("evidence") or ""
+    STORE.save(incident)
 
     store.append_log(task_id, f"incident {incident['id']} acting")
     try:
         with k8s_tools.incident_scope(incident["id"]):
-            result = _run_playbook(item, namespace, evidence)
+            result = _run_playbook(item, namespace, evidence_text)
     except Exception as exc:
         result = {"action": "playbook_error", "ok": False,
                   "detail": f"{type(exc).__name__}: {exc}",
@@ -911,12 +1274,26 @@ def execute_task(store, claim, namespace: str = "") -> dict:
     status = ("resolved" if result.get("ok")
               else "needs_human" if result.get("needs_human")
               else "failed")
+    # Persist the action *before* the walk: the walk reloads the record from
+    # disk, so an unsaved action would be lost.
+    STORE.save(incident)
+    # executing → verifying
+    incident = _walk_incident(incident, "verifying", by="worker",
+                              note="repair applied, verifying")
     incident.update({
         "status": status,
         "needs_human": status == "needs_human",
         "verification": result.get("verification", ""),
         "audit_ids": _audit_ids(incident["id"]),
+        "resolution": {
+            "status": status,
+            "action": result.get("action", ""),
+            "detail": result.get("detail", ""),
+            "verification": result.get("verification", ""),
+            "at": round(time.time(), 3),
+        },
     })
+    incident["state"] = incidents.STATE_LABELS.get(status, status.upper())
     incident["report"] = build_report(incident)
     try:
         STORE.save(incident)
@@ -925,12 +1302,22 @@ def execute_task(store, claim, namespace: str = "") -> dict:
 
     store.set_cooldown(resource, item["cause"], COOLDOWN)
     notify(incident)
+    approval_id = str(task.get("approval_id") or "").strip()
+    if approval_id:
+        # The approved plan has now run: close the approval request so the
+        # UI does not offer it again.
+        try:
+            APPROVALS.mark(approval_id, "executed", by="worker",
+                            note=result.get("detail", "")[:200])
+        except approvals.ApprovalError as exc:
+            log(f"task {task_id}: cannot close approval {approval_id}: {exc}")
     record = store.finish(
         claim, status=status,
         result={"action": result.get("action"),
                 "ok": bool(result.get("ok")),
                 "detail": result.get("detail", ""),
-                "incident_id": incident["id"]},
+                "incident_id": incident["id"],
+                "approval_id": approval_id},
         verification=result.get("verification", ""),
         note=result.get("detail", "")[:200])
     store.append_log(task_id, f"{status}: {result.get('detail', '')}")

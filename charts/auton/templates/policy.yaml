@@ -1,0 +1,27 @@
+{{- if .Values.policy.create }}
+{{- $policy := dict
+      "mode" .Values.policy.mode
+      "default_tier" .Values.policy.defaultTier
+      "auto_approve_tiers" .Values.policy.autoApproveTiers
+      "approval_tiers" .Values.policy.approvalTiers
+      "deny_tiers" .Values.policy.denyTiers
+      "protected_namespaces" .Values.policy.protectedNamespaces
+      "protected_labels" .Values.policy.protectedLabels
+      "namespace_tiers" (dict)
+      "rules" .Values.policy.rules
+      "approval_timeout_seconds" .Values.policy.approvalTimeoutSeconds
+      "max_plan_age_seconds" .Values.policy.maxPlanAgeSeconds
+}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.policy.configMapName }}
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+data:
+  # The flat key is the quick switch: one `kubectl patch` flips the mode.
+  mode: {{ .Values.policy.mode | quote }}
+  policy.json: |
+    {{ toPrettyJson $policy | nindent 4 }}
+{{- end }}

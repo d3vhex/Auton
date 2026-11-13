@@ -228,6 +228,33 @@ provider:
   secretName: auton-model
   apiKey: ""
 
+# The repair policy: what Auton may do, and when it may do it. The policy
+# engine reads ConfigMap `auton-policy` on every decision, so a change takes
+# effect without a restart.
+#
+#   mode       disabled | observe-only | safe-auto | approval-required
+#   tiers      0 observe/report · 1 transient · 2 changes the spec · 3 risky
+policy:
+  create: true
+  configMapName: auton-policy
+  mode: safe-auto
+  defaultTier: 1
+  autoApproveTiers: [0, 1, 2]
+  approvalTiers: [3]
+  denyTiers: []
+  protectedNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+  protectedLabels:
+    - key: auton.io/protect
+      value: "true"
+  # First match wins. `match` accepts cause, namespace, kind, resource, action
+  # and tier; `action` is auto | require_approval | deny | observe.
+  rules: []
+  approvalTimeoutSeconds: 3600
+  maxPlanAgeSeconds: 900
+
 ollama:
   enabled: false
   image: ollama/ollama:latest

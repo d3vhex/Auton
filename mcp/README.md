@@ -1,17 +1,24 @@
-# Auton — Local Coding Agent (MCP + Ollama)
+# Auton — Autonomous Kubernetes Operations Platform
 
-The `auton` service: an autonomous coding agent that runs entirely on a local
-k3d cluster and drives a model in a tool-calling loop. Local Ollama is the
-default; OpenAI, Gemini, Claude and any OpenAI-compatible endpoint can be
-selected instead. Besides the workspace, it can read and change its own
-Kubernetes namespace and manage n8n.
+Auton is a self-healing Kubernetes operations platform that runs entirely on a
+local k3d cluster. It has two halves that share one image and one queue:
+
+- **The autonomous ops half** — detect → analyze → diagnose → plan → policy
+  check → repair → verify → learn. Detection, diagnosis and repair are
+  **deterministic** (the LLM is not in the repair path); the model is used for
+  the coding-agent half and, optionally, as an *advisory* second opinion on a
+  diagnosis.
+- **The coding-agent half** — an MCP agent that drives a model in a
+  tool-calling loop over a workspace, Kubernetes and n8n. Local Ollama is the
+  default; OpenAI, Gemini, Claude and any OpenAI-compatible endpoint can be
+  selected instead.
 
 - **Ollama** serves `qwen2.5-coder:7b-instruct` on the AMD RX 6600
   (Vulkan backend, full GPU offload) — the default provider.
 - **`llm.py`** is the provider layer; configuration is read per request, so a
   switch needs no restart, and a remote provider never falls back to local.
-- **`agent_service.py`** is the HTTP front end that runs in the pod (sync
-  `/run` plus an async jobs API), with bearer-token auth.
+- **`agent_service.py`** is the HTTP front end (sync `/run` plus an async jobs
+  API), with bearer-token auth.
 - **`agent_core.py`** is the reusable agent loop, including context budgeting
   and cancellation.
 - **`agent_server.py`** is the MCP stdio server that gives the model workspace,
@@ -21,22 +28,39 @@ Kubernetes namespace and manage n8n.
 For cluster creation, GPU setup, Ollama, n8n and ingress, see the
 [root README](../README.md). This document covers only the agent.
 
+## The pod shape
+
+Five Auton pods, four ServiceAccounts, two queues:
+
 ```
-                 auton pod (:8080, ClusterIP)
-  ┌───────────────────────────────────────────────────────┐
-  │  agent_service.py                                     │
-  │    └─ job queue ─▶ agent_core.run_agent()             │
-  │         │ spawns (stdio, local subprocess)            │
-  │         ▼                                             │
-  │  agent_server.py   MCP tools                          │
-  │    workspace · search · patch · shell · git           │
-  │    kubectl (SA auton-agent) · n8n REST                │
-  │         │ HTTP                          │ kubectl / HTTP
-  │         ▼                               ▼             │
-  │  ollama-service:11434          kube-apiserver · n8n   │
-  │  → ollama pod (GPU)            (:443, in-cluster)     │
-  └───────────────────────────────────────────────────────┘
+                         ┌──────────────────────────────────────────┐
+                         │  Redis (auton:6379, ClusterIP)           │
+                         │  repair queue · agent queue · locks ·     │
+                         │  cooldowns · budget · GPU slot           │
+                         └───────▲──────────────▲───────────────▲─────┘
+                                 │              │               │
+  ┌──────────────┐      ┌────────┴───┐   ┌──────┴──────┐  ┌─────┴────────┐
+  │ auton        │      │ auton-     │   │ auton-ops   │  │ auton-worker │
+  │ HTTP + UI    │      │ scanner ×2 │   │ LLM         │  │ ×2           │
+  │ SA auton-api │      │ SA scanner │   │ executor    │  │ SA worker    │
+  │ producer     │      │ read-only  │   │ SA agent    │  │ the only     │
+  │ only         │      │ detection  │   │ advisory    │  │ writers      │
+  └──────────────┘      └────────────┘   └──────┬──────┘  └─────┬────────┘
+                                                 │               │
+                                          kube-apiserver (in-cluster)
 ```
+
+| Pod | Role | ServiceAccount | May write |
+|---|---|---|---|
+| `auton` | HTTP API + bundled UI | `auton-api` | only `patch` on ConfigMap `auton-model-config` and Secret `auton-model` (by name) |
+| `auton-scanner` ×2 | read-only detection | `auton-scanner` | nothing |
+| `auton-worker` ×2 | the playbooks | `auton-worker` | pods (delete) + Deployments (patch/scale) in `auton-apps` only |
+| `auton-ops` | the LLM executor | `auton-agent` | workloads in `auton` + `auton-apps` |
+| `redis` | queue + locks + budget | *(none)* | — |
+
+RBAC — not the Python code — is the security boundary. No identity can read
+Secrets, delete a PVC, or touch roles/serviceaccounts/namespaces. Cluster scope
+is read-only (`auton-cluster-reader`, bound to `auton-agent`).
 
 The namespace, Service and Deployment are all named `auton`; the Service is
 **ClusterIP**, so use `kubectl port-forward` (or the Traefik ingress) from the
@@ -48,22 +72,32 @@ host.
 
 | File | Purpose |
 |---|---|
-| `agent_server.py` | MCP server over stdio: registers the 33 tools below (plus a deprecated `run_command` alias) |
+| `agent_server.py` | MCP server over stdio: registers the 34 tools below (plus a deprecated `run_command` alias) |
 | `audit.py` | Write-ahead audit log: JSONL + SQLite, fail-closed, `begin`/`finish`/`record` |
 | `k8s_tools.py` | `kubectl` wrapper: 13 Kubernetes tools (diagnosis + audit-gated mutations) |
 | `llm.py` | Provider layer: `ollama`/`openai`/`gemini`/`anthropic`/`custom`, config read per request, redaction, no fallback |
 | `provider_admin.py` | Validated provider writes behind `POST /provider`: ConfigMap/Secret patch (or files), audit without the key, `400` for a config the agent would reject |
 | `n8n_tools.py` | n8n public-API + webhook client: 6 tools, stdlib HTTP only |
-| `incidents.py` | Atomic incident records (`detected`…`failed`) + local report retry queue |
+| `incidents.py` | **Incident Manager v2**: fingerprint, occurrence count, timeline, 13-state machine, recurrence linking, auto-resolve, optional Redis index |
+| `evidence.py` | **Evidence Collector**: the structured §5 evidence document (resource/problem/container/resources/owner/evidence) — never reads a Secret |
+| `diagnosis.py` | **Diagnosis Engine**: 18 deterministic root causes, 6-action allowlist, advisory-only LLM refinement |
+| `policy.py` | **Policy Engine**: modes (disabled/observe-only/safe-auto/approval-required), risk tiers 0–3, rules, protected targets, fail-closed load |
+| `planner.py` | **Repair Planner**: the `RepairPlan` schema — action, tier, playbook, expected effect, verification, rollback |
+| `approvals.py` | **Approval Store**: atomic JSON requests that park a plan until a human decides (decide-once, expiry, prune) |
 | `playbooks.py` | Deterministic repairs: OOM memory bump, stuck pod, crashloop recreate, rollout undo, replica restore |
-| `ops_controller.py` | Autonomous loop: snapshot → rule-based findings → playbook → verify → incident/report |
+| `ops_controller.py` | The pipeline: snapshot → finding → evidence → diagnosis → incident state machine → playbook → verify → report |
+| `ops_queue.py` | The queue backends: `memory` (default, local) and `redis` (the cluster manifests) — **no silent fallback** |
+| `task_store.py` | Task lifecycle: lease (300 s), retry with the same incident, cooldown, hourly action budget, dead-letter handling |
+| `ops_scanner.py` | The scanner loop (Deployment `auton-scanner`): detect → submit → dedupe |
+| `ops_worker.py` | The worker loop (Deployment `auton-worker`): claim → repair → verify |
+| `agent_worker.py` | The executor loop (Deployment `auton-ops`): run the agent for the `agent` queue |
 | `agent_core.py` | Agent loop: dual-path tool calling, observation caps, compaction, corrective retry, cancellation |
 | `agent_client.py` | CLI entry point (`python agent_client.py "task"`) |
 | `agent_service.py` | HTTP front end: bearer auth, sync `POST /run`, async `/jobs`, SSE, cancel, `/audit`, `/incidents` |
 | `Dockerfile` | Builds `auton:local` (`python:3.11-slim` + git, ripgrep, bubblewrap, kubectl) |
 | `ui/index.html` | Single-page UI served at `/`: chat, incidents, audit, provider; no bundler or CDN |
 | `requirements.txt` | `mcp>=2.0,<3`, `ollama>=0.4.0`, `pathspec>=0.12` |
-| `tests/` | pytest suite (tools, loop helpers, MCP transport, HTTP service, auth, k8s/n8n) |
+| `tests/` | pytest suite (tools, loop helpers, MCP transport, HTTP service, auth, k8s/n8n, incident pipeline) |
 | `eval/run_eval.py` | 8 coding tasks + 4 optional live tasks; needs a live Ollama |
 
 > `mcp.server.mcpserver.MCPServer` is the **MCP v2** API. Do not downgrade
@@ -395,23 +429,268 @@ local_model_enabled, api_key_set, api_key_hint}` — never the raw key.
 
 ---
 
-## Autonomous ops (`ops_controller.py`)
+## Autonomous ops (`ops_controller.py` + `incidents.py` + `evidence.py` + `diagnosis.py`)
 
-The operations controller runs as Deployment `auton-ops` (not a thread in the
-API pod) with ServiceAccount `auton-ops`. It is deliberately **LLM-free**: the
-same `k8s_tools._collect` snapshot the model uses feeds a rule table, and a
-matching deterministic playbook runs. A 7B model explaining an OOMKill is
-useful; a 7B model choosing a kubectl patch is not.
+The operations half is split across three pods so a bug in one stage cannot
+widen the other's permissions:
 
 ```
-every AGENT_OPS_INTERVAL (60s):
-  snapshot each namespace in AGENT_OPS_NAMESPACES (default auton-apps)
-    → findings()            rule-based symptoms → cause
-    → cooldown + budget      skip a flapping resource
-    → playbooks.fix_*()      audit-gated mutation + verify
-    → IncidentStore          one JSON record, status resolved/needs_human/failed
-    → POST /incidents/ingest + N8N_OPS_WEBHOOK (queued locally if the API is down)
+auton-scanner (×2)          auton-worker (×2)           auton-ops
+  snapshot auton-apps          claim from the             LLM executor:
+  → rule-based findings        `repair` queue             advisory diagnosis
+  → dedupe                     → evidence collection       + agent queue
+  → submit a task              → diagnosis                 (never in the
+                                → repair plan                 repair path)
+                                → policy check  ─┬─ auto → playbook
+                                               ├─ observe → SUPPRESSED
+                                               ├─ deny → NEEDS_HUMAN
+                                               └─ approval → AWAITING_APPROVAL
+                                → verify (audit-gated)
+                                → incident + report
 ```
+
+The repair path is **LLM-free**. The same `k8s_tools._collect` snapshot feeds a
+rule table and a matching deterministic playbook runs. A 7B model explaining an
+OOMKill is useful; a 7B model choosing a kubectl patch is not. The model may
+only *refine* a diagnosis (`AGENT_OPS_LLM_DIAGNOSIS=1`), and even then it may
+not invent a root cause, lower the confidence, or choose an action outside the
+six-item allowlist.
+
+### The incident pipeline
+
+Every incident walks an explicit state machine. The route is the legal path
+through the adjacency table; an illegal transition raises and writes nothing.
+
+```
+DETECTED → TRIAGING → DIAGNOSING → PLANNING → POLICY_CHECK → QUEUED
+        → EXECUTING → VERIFYING → RESOLVED
+                     ↘ AWAITING_APPROVAL → (approved) → QUEUED → …
+                     ↘ SUPPRESSED (observe-only / cooldown / budget)
+          ↘ FAILED → NEEDS_HUMAN
+```
+
+`incidents.py` stores one atomic JSON file per incident and records:
+
+| Field | Meaning |
+|---|---|
+| `fingerprint` | sha1 of `cluster\|kind\|namespace\|name\|cause` — the stable identity of *this problem on this resource* (16 hex) |
+| `occurrence_count`, `first_seen`, `last_seen` | how often and when the problem was seen |
+| `previous_incident_id`, `recurrence_ids` | a recurrence opens a *new* incident linked to the old one; a repair retry reuses the *same* incident |
+| `resource_uid`, `cluster_id`, `type` | which object, on which cluster, with which classified root cause |
+| `timeline[]` | every transition: `from` → `to`, `by`, `note`, ISO timestamp |
+| `diagnosis` | root cause, confidence, severity, evidence, recommended action, `requires_human` |
+| `evidence_structured` | the full evidence document (see below) |
+| `repair_plan`, `policy` | the plan that was proposed and the decision the policy engine made about it |
+| `resolution` | what was done, and how it was verified |
+| `severity_changes[]` | the severity history |
+
+A closed incident may only be re-opened through `reopen()` — a silent status
+write back to `detected` is refused.
+
+### The evidence document (`evidence.py`)
+
+`evidence.collect(namespace, kind, name)` returns the structured document the
+platform spec asks for:
+
+```json
+{
+  "resource":  {"kind": "Pod", "name": "api-1", "namespace": "auton-apps", "uid": "…"},
+  "problem":   "OOMKilled",
+  "container": {"name": "api", "restart_count": 4, "last_termination_reason": "OOMKilled",
+                "exit_code": 137, "state": "waiting", "ready": false,
+                "resources": {"memory_limit": "512Mi", …},
+                "probes": {"liveness": {"configured": true, "path": "/healthz"}},
+                "image_pull_secret_configured": false},
+  "resources": {"memory_request": "256Mi", "memory_limit": "512Mi", …},
+  "owner":     {"kind": "Deployment", "name": "api", "chain": [...]},
+  "evidence":  {"pod_available": true, "logs_available": true,
+                "events_available": true, "node_available": false,
+                "node_metrics_available": false, "owner_available": true},
+  "events": [...], "logs": "…", "previous_logs": "…",
+  "node": {...}, "node_metrics": {...}, "deployment": {...},
+  "errors": []
+}
+```
+
+Two invariants, both covered by `tests/test_evidence.py`:
+
+1. **Secrets are never read.** The collector only reports *whether* an image-pull
+   secret is configured — never its name, never its value — and no env var value
+   or credential-like string reaches the document.
+2. **Unavailable evidence is marked, never invented.** A node the worker may not
+   read (the worker's Role is namespace-scoped, so `node_available` is `false`)
+   is reported as unavailable instead of being guessed.
+
+### The diagnosis engine (`diagnosis.py`)
+
+Eighteen root causes, classified deterministically in priority order: pod
+status → events → container termination → node metrics/pressure → logs →
+ownership → remaining rules. A generic `Error` exit is only an *observation*:
+the reason why the container died is in the logs, the events or the probes, so
+the engine keeps looking instead of concluding "application crash" early.
+
+The result is `{root_cause, confidence, severity, evidence[], recommended_action,
+requires_human, source}`. `recommended_action` is always one of the six
+allowlisted actions (`INCREASE_MEMORY_LIMIT`, `RESTART_POD`,
+`ROLLBACK_DEPLOYMENT`, `RESTORE_REPLICAS`, `REPORT_ONLY`, `NONE`).
+
+`validate_llm_analysis()` accepts a model proposal only when it agrees with the
+evidence: the cause must be known, must equal the deterministic cause (or the
+engine must have been unable to decide), the confidence may not be lowered, and
+an unknown action is replaced by the deterministic one. A model answer that
+violates any of those is discarded, not partially applied.
+
+### The policy engine (`policy.py`)
+
+Deterministic is not the same as *allowed*. The policy engine is the gate
+between a **plan** and an **action**: nothing reaches a playbook without a
+decision from it.
+
+The policy document lives in ConfigMap `auton-policy` (key `policy.json`) and
+is mounted into the pods as a **projected volume**, so no ServiceAccount needs
+permission to read it. It is read **per decision**, so an operator can tighten
+it without a restart. The flat key `mode` is the quick switch: one
+`kubectl patch` flips the whole platform.
+
+```json
+{
+  "mode": "safe-auto",
+  "default_tier": 1,
+  "auto_approve_tiers": [0, 1, 2],
+  "approval_tiers": [3],
+  "deny_tiers": [],
+  "protected_namespaces": ["kube-system", "kube-public", "kube-node-lease"],
+  "protected_labels": [{"key": "auton.io/protect", "value": "true"}],
+  "namespace_tiers": {},
+  "rules": [],
+  "approval_timeout_seconds": 3600,
+  "max_plan_age_seconds": 900
+}
+```
+
+#### The modes
+
+| Mode | Behaviour |
+|---|---|
+| `disabled` | **The off switch.** Every decision is a denial. Nothing runs. |
+| `observe-only` | Shadow mode: plans are computed and recorded, never executed. The incident closes as `SUPPRESSED`. |
+| `safe-auto` | The tiers in `auto_approve_tiers` run unattended; the tiers in `approval_tiers` wait for a human; the tiers in `deny_tiers` are refused. |
+| `approval-required` | Every mutating tier waits for a human. Tier 0 runs, because there is nothing to approve. |
+
+The shipped default is `safe-auto` with `auto_approve_tiers: [0, 1, 2]` and
+`approval_tiers: [3]` — exactly today's behaviour, with the irreversible tier
+gated.
+
+#### The tiers
+
+The tier describes the **risk of the action**, not the severity of the symptom:
+
+| Tier | Meaning | Examples |
+|---|---|---|
+| 0 | No mutation at all | observe, report, escalate |
+| 1 | Transient and recreated by a controller | restart a pod, undo a rollout, scale replicas back up |
+| 2 | Changes the workload's specification | raise a memory limit |
+| 3 | Data-affecting or irreversible | never automatic |
+
+#### The rules
+
+`rules` is an ordered list; the **first match wins**. A rule may set a tier
+and/or an action:
+
+```json
+{"match": {"cause": "oom"}, "tier": 3}
+{"match": {"namespace": "auton"}, "action": "deny",
+ "reason": "the platform never repairs itself"}
+```
+
+`match` accepts `cause`, `namespace`, `kind`, `resource` (a prefix match on
+`kind/name`), `action` and `tier`. A rule may not unlock a tier the mode
+denies outright.
+
+#### Fail closed
+
+An unreadable or invalid policy document is treated as `disabled`: the decision
+is a denial that names the problem, and `GET /policy` reports the error. A typo
+in the ConfigMap must never silently *widen* what the platform may do. A
+document that is valid JSON but not an object (e.g. `[]`) is a **broken
+document, not an absent one** — it denies, it does not fall back to the
+default.
+
+#### Changing it
+
+```bash
+scripts/set-policy.sh --show
+scripts/set-policy.sh --mode observe-only
+scripts/set-policy.sh --mode safe-auto --auto-tiers 0,1,2 --approval-tiers 3
+scripts/set-policy.sh --deny-cause crashloop
+scripts/set-policy.sh --require-approval-cause oom
+scripts/set-policy.sh --reset
+```
+
+The script validates the document before it writes it, and it never resets a
+policy that already exists.
+
+### The repair planner (`planner.py`)
+
+The planner turns a diagnosis into a **proposal** — enough detail that a human
+can approve it and an operator can audit it afterwards:
+
+```json
+{
+  "plan_id": "plan-1f0c8b2d4e5a",
+  "incident_id": "inc-e96239a771",
+  "namespace": "auton-apps", "kind": "Pod", "name": "api-1",
+  "resource": "pod/api-1", "cause": "oom", "root_cause": "OOMKilled",
+  "action": "INCREASE_MEMORY_LIMIT", "playbook": "oom_bump_memory",
+  "tier": 2,
+  "params": {"container": "hog"},
+  "expected_effect": "the deployment's memory limit … is raised by 25% …",
+  "verification": "deployment/api ready=1/1 available=1",
+  "reversible": true,
+  "rollback": {"action": "RESTORE_MEMORY_LIMIT",
+               "params": {"memory_limit": "64Mi"}},
+  "requires_human": false,
+  "labels": {"app": "api"},
+  "created_at": 1794602994.059
+}
+```
+
+The plan is **not** an instruction to the cluster. It names a *registered*
+playbook and a fixed set of parameters — there is no free-form command
+anywhere in this path. The `plan_id` is stable for the same problem, so the
+same defect always produces the same plan.
+
+### The approval workflow (`approvals.py`)
+
+When the policy engine answers `require_approval`, **nothing in the cluster
+changes**. The plan is written to the approval store as an approval request and
+the incident waits in `AWAITING_APPROVAL`.
+
+```
+policy check ──require_approval──▶ approval request (pending)
+                                      │
+                        approve ──────┴────── reject
+                           │                      │
+             new task, same incident      incident → NEEDS_HUMAN
+             (approval_id + force)        request  → rejected
+                           │
+                     repair runs → approval → executed
+```
+
+* One atomic JSON file per request under `AGENT_APPROVALS_DIR` (default:
+  `AGENT_AUDIT_DIR/approvals`), so the worker that parks a plan and the API
+  that decides it see the same files on the workspace PVC.
+* States: `pending` → `approved` | `rejected` | `expired`, then `executed`
+  (the repair ran) or `cancelled`.
+* **Decide-once**: a second click on an already-decided request is a `409`,
+  never a second repair.
+* Approving enqueues a **new** task that carries `incident_id` +
+  `approval_id` + `force: true`. The same incident continues — the history
+  stays in one record instead of being split.
+* The approved resume re-reads the policy, but only the `disabled` off switch
+  may still stop it: **the human is the authorisation**.
+
+### The playbooks
 
 | Symptom | Cause | Playbook |
 |---|---|---|
@@ -431,9 +710,7 @@ verified, not attempted.
 
 Each repair is wrapped in `k8s_tools.incident_scope(id)`; every audit record
 (`begin`/`end`) then carries that `incident_id`, and `/audit?incident_id=`
-returns the pair. The incident record keeps `actions`, `verification`,
-`audit_ids`, a deterministic `report`, and a `notified` flag. Cooldown
-(`AGENT_OPS_COOLDOWN`, 1800 s) and an hourly budget
+returns the pair. Cooldown (`AGENT_OPS_COOLDOWN`, 1800 s) and an hourly budget
 (`AGENT_OPS_MAX_ACTIONS_PER_HOUR`, 6) bound a flapping workload;
 `AGENT_OPS_DRY_RUN=1` records `detected` + `dry_run` and mutates nothing.
 
@@ -462,9 +739,12 @@ Slack/Telegram templates stay trivial:
 
 ```json
 {"incident_id": "inc-…", "severity": "critical", "status": "resolved",
- "namespace": "auton-apps", "resource": "pod/api-1", "summary": "OOMKilled",
- "action": "raised memory 64Mi -> 96Mi", "verification": "ready=1/1",
- "report": "…", "url": "http://auton.localhost/incidents/inc-…"}
+ "state": "RESOLVED", "namespace": "auton-apps", "resource": "pod/api-1",
+ "summary": "OOMKilled", "root_cause": "OOMKilled", "confidence": 0.97,
+ "recommended_action": "INCREASE_MEMORY_LIMIT", "requires_human": false,
+ "occurrence_count": 1, "action": "raised memory 64Mi -> 96Mi",
+ "verification": "ready=1/1", "report": "…",
+ "url": "http://auton.localhost/incidents/inc-…"}
 ```
 
 ## HTTP API
@@ -501,6 +781,10 @@ curl -s "http://localhost:8080/audit?incident_id=inc-..." -H "Authorization: Bea
 # incidents recorded by auton-ops (auth required; 503 if the store is unwritable)
 curl -s "http://localhost:8080/incidents?limit=20" -H "Authorization: Bearer $TOKEN"
 curl -s "http://localhost:8080/incidents?status=needs_human" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents?severity=critical&cause=oom" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents?namespace=auton-apps" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents?resource=pod/api-1" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/incidents?fingerprint=62b2dc54f7ce6775" -H "Authorization: Bearer $TOKEN"
 curl -s "http://localhost:8080/incidents/inc-..." -H "Authorization: Bearer $TOKEN"
 
 # active model provider (key masked) and a one-line round-trip
@@ -522,9 +806,14 @@ curl -s -X DELETE http://localhost:8080/provider/key -H "Authorization: Bearer $
 | `DELETE /provider/key` | Remove the stored key (a remote provider then fails, no fallback) |
 | `POST /provider/test` | One tiny completion through the active provider |
 | `GET /audit?limit=&incident_id=` | JSONL-backed mutation records |
-| `GET /incidents?limit=&status=` | Newest-first incident list (`status` is a comma list) |
-| `GET /incidents/{id}` | One incident: observations, actions, verification, report, audit ids |
+| `GET /incidents?limit=&status=&severity=&cause=&namespace=&resource=&fingerprint=` | Newest-first incident list (every filter is a comma list) |
+| `GET /incidents/{id}` | One incident: diagnosis, structured evidence, timeline, repair plan, policy decision, actions, verification, report, audit ids |
 | `POST /incidents/ingest` | What `auton-ops` calls; idempotent by `id`, validates the file name |
+| `GET /policy` | The effective policy, its source (`configmap`/`default`/`invalid`), the modes, actions and tiers |
+| `GET /approvals?limit=&status=&incident_id=` | Approval requests, newest first |
+| `GET /approvals/{id}` | One approval request: the plan, the policy decision, the decision timeline |
+| `POST /approvals/{id}/approve` | Approve a pending plan and enqueue the repair (`409` if it was already decided) |
+| `POST /approvals/{id}/reject` | Reject a pending plan; the incident goes to `NEEDS_HUMAN` |
 
 Response: `{job_id, final, steps, stop_reason, elapsed}`. A missing `task`
 returns `400`; a queue overflow `429`; a failed job `500`; a sync wait that times
@@ -649,17 +938,31 @@ python -m pytest tests -q
 
 The suite covers workspace escape, unique-match editing, atomic patches,
 gitignore-aware search, background jobs, git tools, context compaction, the real
-MCP stdio transport (all 33 tools), the HTTP jobs API, bearer auth (401/503 and
+MCP stdio transport (all 34 tools), the HTTP jobs API, bearer auth (401/503 and
 fail-closed startup), the kubectl wrapper (namespace allowlist, validation,
 write gate, snapshot/diagnose/events/wait/exec), the write-ahead audit log
 (fail-closed, begin/end pairing, SQLite index), the provider layer
 (config precedence, both remote adapters, redaction, no fallback), the n8n
-client (mocked HTTP, generated agent/ops pipelines), the incident store
-(atomic writes, statuses, retry queue, pruning), the playbooks (OOM math,
-owner-chain and protect/namespace guards, report-only causes), the ops
-controller (rule table, cooldown, hourly budget, dry-run, report payload) and
+client (mocked HTTP, generated agent/ops pipelines), the **Incident Manager v2**
+(fingerprint, the state machine and its adjacency table, recurrence linking,
+auto-resolve, severity history, the Redis index and its rebuild), the
+**Evidence Collector** (shape, no-Secret guarantee, unavailable-marked-not-
+invented), the **Diagnosis Engine** (root-cause discrimination, the action
+allowlist, the advisory LLM validation), the **Policy Engine** (the four
+modes, the tiers, the rules, protected targets, fail-closed loading), the
+**Repair Planner** (the plan shape, the tier map, the rollback record), the
+**Approval Store** (decide-once, expiry, filtering), the **policy-gated
+pipeline** (auto / observe / deny / await-approval → approve → repair →
+executed), the **incident pipeline** (detect →
+diagnose → repair → verify, report-only, dry run, retry-reuses-the-incident),
+the playbooks (OOM math, owner-chain and protect/namespace guards, report-only
+causes), the ops controller (rule table, cooldown, hourly budget, dry-run,
+report payload), the queue backends (`memory`/`redis`, no silent fallback) and
 the RBAC manifests (`tests/test_rbac.py` fails if a Role ever grants secrets or
 PVC delete, and checks the ops identity is read-only in `auton`).
+
+The suite is the only automated check in this repository — there is no build
+system, linter or CI. Expect **495 passed**.
 
 ### Eval harness
 
@@ -809,6 +1112,30 @@ delete it and recreate it.
 | `AGENT_NAMESPACE` | `auton` | k8s | Default namespace for the Kubernetes tools |
 | `AGENT_NAMESPACES` | `AGENT_NAMESPACE` | k8s | Comma allowlist; deployment sets `auton,auton-apps` |
 | `AGENT_AUDIT_DIR` | `$AGENT_WORKSPACE/.ops` | k8s | Write-ahead audit log + SQLite index |
+| `AGENT_INCIDENTS_DIR` | `$AGENT_AUDIT_DIR/incidents` | incidents | Where the incident JSON files live (shared PVC) |
+| `AGENT_APPROVALS_DIR` | `$AGENT_AUDIT_DIR/approvals` | approvals | Where the approval requests live (shared PVC) |
+| `AGENT_POLICY_DIR` | `/etc/auton-policy` | policy | Where the projected policy ConfigMap is mounted |
+| `AGENT_POLICY_MODE` | *(none)* | policy | Mode override when no policy document is present |
+| `AGENT_OPS_NAMESPACES` | `auton-apps` | ops | Namespaces the ops loop watches and may repair |
+| `AGENT_OPS_INTERVAL` | `60` | ops | Snapshot interval, seconds |
+| `AGENT_OPS_COOLDOWN` | `1800` | ops | Per-resource/cause cooldown, seconds |
+| `AGENT_OPS_MAX_ACTIONS_PER_HOUR` | `6` | ops | Hourly repair budget |
+| `AGENT_OPS_STARTUP_GRACE` | `120` | ops | Suppress `Pending`/`NotReady` for a young pod, seconds |
+| `AGENT_OPS_TERMINATION_GRACE` | `120` | ops | A `DeletionTimestamp` alone is not "stuck", seconds |
+| `AGENT_OPS_MAX_MEMORY` | *(none)* | playbooks | Cap for the raised memory limit |
+| `AGENT_OPS_HEALTHY_THRESHOLD` | `3` | incidents | Healthy passes needed before an incident auto-resolves |
+| `AGENT_OPS_MAX_INCIDENTS` | `500` | incidents | Incident files kept before the oldest are pruned |
+| `AGENT_OPS_PRUNE_EVERY` | `60` | incidents | Prune interval, seconds |
+| `AGENT_OPS_DRY_RUN` | `0` | ops | `1` records the diagnosis and mutates nothing |
+| `AGENT_OPS_LLM_DIAGNOSIS` | `0` | diagnosis | `1` lets the model *refine* a diagnosis (advisory only) |
+| `AGENT_QUEUE` | `memory` | queue | `memory` (local) or `redis` (the cluster manifests) — **no silent fallback** |
+| `AGENT_REDIS_URL` | `redis://redis:6379/0` | queue | Redis endpoint for the queue backend |
+| `AGENT_REDIS_PASSWORD` | *(none)* | queue | Redis password (Phase 5 turns auth on by default) |
+| `AGENT_REDIS_PASSWORD_FILE` | *(none)* | queue | File the Redis password is read from |
+| `AGENT_QUEUE_PREFIX` | `auton` | queue | Redis key prefix |
+| `AGENT_QUEUE_MAX` | *(queue-dependent)* | queue | Maximum queued tasks |
+| `AGENT_SCAN_INTERVAL` | `60` | scanner | Scan interval, seconds |
+| `AGENT_SCAN_DEDUPE_WINDOW` | `300` | scanner | Window in which the same finding is not resubmitted, seconds |
 | `AGENT_K8S_ENABLED` | `1` | k8s | `0` disables the Kubernetes tools |
 | `AGENT_K8S_WRITE` | `0` (image) / `1` (deployment) | k8s | Allows apply/patch/scale/rollout/delete/exec |
 | `N8N_API_URL` | `http://n8n:5678/api/v1` | n8n | n8n public API base |

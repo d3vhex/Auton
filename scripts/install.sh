@@ -144,6 +144,12 @@ EOF
   else
     run kubectl apply -f yamls/auton-model.yaml
   fi
+  # Same for the repair policy: never reset a policy an operator tightened.
+  if kubectl -n "$NS" get configmap auton-policy >/dev/null 2>&1; then
+    info "repair policy exists; keeping it (set-policy.sh changes it)"
+  else
+    run kubectl apply -f yamls/auton-policy.yaml
+  fi
 
   # ------------------------------------------------------------------------- #
   # 2. GPU device plugin (skipped when the node already advertises the GPU)
@@ -287,6 +293,23 @@ check "API serves /incidents with the token" \
   'import json,os,urllib.request
 r=urllib.request.Request("http://127.0.0.1:8080/incidents?limit=1",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
 print(json.load(urllib.request.urlopen(r, timeout=5)).get("count", 0))'
+
+check "API serves /approvals with the token" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import json,os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/approvals?limit=1",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+print(json.load(urllib.request.urlopen(r, timeout=5)).get("count", 0))'
+
+check "API serves the effective policy" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import json,os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/policy",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+d=json.load(urllib.request.urlopen(r, timeout=5))
+assert d["ok"] is True, d.get("error")
+print(d["policy"]["mode"])'
+
+check "the repair policy is mounted in the workers" \
+  kubectl -n "$NS" exec deploy/auton-worker -- test -f /etc/auton-policy/policy.json
 
 check "provider is configured (masked key)" \
   kubectl -n "$NS" exec deploy/auton -- python -c \

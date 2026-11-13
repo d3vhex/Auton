@@ -75,6 +75,7 @@ spec:
             "AGENT_INCIDENTS_DIR" "/workspace/.ops/incidents"
             "AGENT_MODEL" .Values.agent.model
             "AGENT_MODEL_DIR" "/etc/auton-model"
+            "AGENT_POLICY_DIR" "/etc/auton-policy"
             "OLLAMA_HOST" .Values.provider.baseUrl
             "AGENT_MAX_QUEUE" (toString .Values.agent.maxQueue)
             "AGENT_JOB_TIMEOUT" (toString .Values.agent.jobTimeout)
@@ -129,6 +130,11 @@ spec:
             - name: n8n-api
               mountPath: /etc/n8n-api
               readOnly: true
+            {{- if .Values.policy.create }}
+            - name: policy
+              mountPath: /etc/auton-policy
+              readOnly: true
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /health
@@ -158,6 +164,12 @@ spec:
           secret:
             secretName: {{ default .Values.n8n.apiKey.secretName .Values.n8n.apiKey.existingSecret }}
             optional: true
+        {{- if .Values.policy.create }}
+        - name: policy
+          configMap:
+            name: {{ .Values.policy.configMapName }}
+            optional: true
+        {{- end }}
       {{- with .Values.agent.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -175,7 +175,7 @@ DOCKERHUB_USER=<user> DOCKERHUB_TOKEN=<token> ./scripts/publish.sh
   │                               │                                   │  │
   │                               │ auton :8080  (ClusterIP)          │  │
   │                               │   API + UI, producer only         │  │
-  │                               │   SA auton-api (patch 2 objects)  │  │
+  │                               │   SA auton-api (patch 3 objects)  │  │
   │                               │        │ enqueue                 │  │
   │                               │        ▼                          │  │
   │                               │  2× auton-scanner  SA: read-only  │  │
@@ -206,7 +206,10 @@ the only thing the pod roles share:
   `repair` task per finding. Two replicas collapse duplicate findings on the
   queue's idempotency key.
 - **`auton-worker`** claims repair tasks. Two workers repair *different*
-  workloads in parallel; a per-resource lock serialises the same workload.
+  workloads in parallel; a per-resource lock serialises the same workload. Each
+  task is **planned** and **policy-checked** before anything is changed: a plan
+  the policy rates above the automatic tier is parked as an approval request and
+  the incident waits in `AWAITING_APPROVAL` until a human decides.
 - **`auton-ops`** claims `agent` tasks and runs the LLM loop. One replica, and a
   global GPU slot in Redis keeps two model calls from overlapping.
 
@@ -214,7 +217,7 @@ Four identities, one per pod role (`yamls/auton-rbac.yaml`):
 
 | ServiceAccount | May do |
 |---|---|
-| `auton-api` | `patch` exactly `configmaps/auton-model-config` + `secrets/auton-model` |
+| `auton-api` | `patch` exactly `configmaps/auton-model-config` + `configmaps/auton-policy` + `secrets/auton-model` |
 | `auton-scanner` | `get/list/watch` in `auton-apps` |
 | `auton-worker` | read + delete pods + patch/scale Deployments in `auton-apps` |
 | `auton-agent` | repair in `auton` + `auton-apps`, cluster read-only (LLM executor) |
@@ -233,6 +236,7 @@ manage `serviceaccounts`, touch Roles/RoleBindings or delete PVCs/namespaces.
 | `namespace.yaml` | — | `auton` namespace | — | — |
 | `auton-apps.yaml` | — | `auton-apps` namespace + quota + LimitRange | — | — |
 | `auton-rbac.yaml` | `auton`, `auton-apps` | SAs `auton-agent`/`auton-api`/`auton-scanner`/`auton-worker` + Roles/Bindings + cluster read-only | — | — |
+| `auton-policy.yaml` | `auton` | The repair policy ConfigMap `auton-policy` (mode + `policy.json`), mounted into the API and the workers | — | — |
 | `ollama-deployment.yaml` | `auton` | Ollama Deployment + PVC + **ClusterIP** | `ollama/ollama:latest` | `ollama-service:11434` |
 | `redis.yaml` | `auton` | Queue Deployment + AOF PVC + **ClusterIP** | `redis:7-alpine` | `redis:6379` |
 | `agent-deployment.yaml` | `auton` | API + UI Deployment (producer) + workspace PVC + **ClusterIP** | `auton:local` (built from `mcp/`) | `auton:8080` |
@@ -251,7 +255,7 @@ would deadlock trying to mount the same volume in two pods).
 
 | Secret | Key | Used by | Notes |
 |---|---|---|---|
-| `auton-api-token` | `token` | API, scanners (none), workers, executor, n8n | Bearer token for `/run`, `/jobs*`, `/tasks*`, `/audit`, `/provider*`, `/incidents*`; also passed to n8n, the workers and the executor |
+| `auton-api-token` | `token` | API, scanners (none), workers, executor, n8n | Bearer token for `/run`, `/jobs*`, `/tasks*`, `/audit`, `/provider*`, `/incidents*`, `/policy`, `/approvals*`; also passed to n8n, the workers and the executor |
 | `n8n-api` | `api-key` | Executor (and a local memory-mode API) | n8n public-API key; mounted at `/etc/n8n-api/api-key` and read **per call**, so rotation needs no restart (projected volume lags up to ~1 min; use `scripts/rotate-n8n-api-key.sh`) |
 | `auton-model` | `api-key` | Executor (and the API for `/provider/test`) | Key for the active remote model provider (empty for local Ollama). Written by `scripts/set-provider.sh`, read per call |
 
@@ -274,6 +278,7 @@ provider settings.
 │   ├── auton-apps.yaml        autonomous-repair namespace + quota + LimitRange
 │   ├── auton-rbac.yaml        SA + Roles (auton, auton-apps) + cluster read-only
 │   ├── auton-model.yaml       provider ConfigMap (ollama/openai/…) + API-key Secret
+│   ├── auton-policy.yaml      repair-policy ConfigMap (mode + policy.json)
 │   ├── k8s-ds-amdgpu-dp.yaml  AMD GPU device plugin (kube-system)
 │   ├── gpu-test.yaml          rocminfo smoke-test pod
 │   ├── ollama-deployment.yaml Ollama + GPU + model PVC + ClusterIP
@@ -289,7 +294,8 @@ provider settings.
 │   ├── install.sh             idempotent bootstrap + verification
 │   ├── publish.sh             build/push the Docker Hub image and chart
 │   ├── rotate-n8n-api-key.sh  Secret update + projected-volume wait + verify
-│   └── set-provider.sh        switch model provider + verify (no restart)
+│   ├── set-provider.sh        switch model provider + verify (no restart)
+│   └── set-policy.sh          switch the repair policy (mode/tiers/rules)
 ├── charts/auton/              Helm chart (API + scanner + worker + executor)
 ├── mcp/                       container for auton:local  (see mcp/README.md)
 │   ├── agent_server.py        MCP stdio server (fs/shell/git/k8s/n8n/queue)
@@ -300,7 +306,12 @@ provider settings.
 │   ├── n8n_tools.py           n8n REST client (6 tools)
 │   ├── ops_queue.py           memory/Redis queue backends
 │   ├── task_store.py          task lifecycle, locks, cooldown, budget, GPU slot
-│   ├── incidents.py           atomic incident records + retry queue
+│   ├── incidents.py           incident records v2 (fingerprint, timeline, 13 states)
+│   ├── evidence.py            structured evidence collector (never reads a Secret)
+│   ├── diagnosis.py           deterministic root causes + action allowlist
+│   ├── policy.py              policy engine (modes, tiers, rules, fail closed)
+│   ├── planner.py             repair planner (the RepairPlan schema)
+│   ├── approvals.py           approval store (plans waiting for a human)
 │   ├── playbooks.py           deterministic repairs (OOM/stuck/rollout/replicas)
 │   ├── ops_controller.py      detection rules + scan_once/execute_task
 │   ├── ops_scanner.py         scanner entry point (read-only, enqueues)
@@ -480,6 +491,7 @@ registry:
 ```bash
 docker build -t auton:local ./mcp
 k3d image import auton:local -c ai-cluster
+kubectl apply -f yamls/auton-policy.yaml
 kubectl apply -f yamls/agent-deployment.yaml
 kubectl apply -f yamls/auton-ops-deployment.yaml
 kubectl apply -f yamls/auton-scanner-deployment.yaml
@@ -510,6 +522,12 @@ v1.35.5** (matching the cluster's server minor) on top of the agent modules and
 the `ui/` page. New Python modules must be added to the `COPY` line in
 `mcp/Dockerfile` (and new pages under `ui/`), or they will be missing inside the
 pod.
+
+`yamls/auton-policy.yaml` creates the repair policy the workers read before
+every action. It is optional in the sense that the pods start without it (the
+policy volume is `optional: true`), but apply it — without it the engine uses
+its built-in default, which is the same `safe-auto` policy, and `GET /policy`
+reports `source: default` instead of `source: configmap`.
 
 ### 6. Deploy n8n and create its API key
 
@@ -651,6 +669,10 @@ day-to-day work:
   the final answer while the job runs; cancel is cooperative.
 - **Incidents** — the records the workers write, newest first, filterable by
   status; click one for the full observation/actions/verification JSON.
+- **Approvals** — the repair plans the policy parked for a human: the action,
+  its risk tier, the expected effect, how it would be verified and how it would
+  be undone, with **Approve** / **Reject** buttons. The effective policy (mode,
+  tiers, rules) is shown next to it.
 - **Tasks** — both queues (`/tasks`): queue depth, active counts, worker
   heartbeats and the hourly budget as chips, a filterable task list, a detail
   pane with the log tail, cancel, and a **manual repair** form (kind / name /
@@ -739,10 +761,11 @@ the mounted volume, no restart) and audited as `provider_update` with only
 returns the key masked (`sk-…3456`), never the raw value, plus `providers`,
 `policies`, `defaults` and `editable` for the form.
 
-RBAC keeps this narrow: the API runs as ServiceAccount `auton-api`, whose only
-Role rule allows `patch` on the named ConfigMap `auton-model-config` and the
-named Secret `auton-model`. It cannot read secrets, cannot touch workloads, and
-no other Role may touch secrets at all.
+RBAC keeps this narrow: the API runs as ServiceAccount `auton-api`, whose Role
+rules allow `patch` on the named ConfigMaps `auton-model-config` and
+`auton-policy` and on the named Secret `auton-model` — and nothing else. It
+cannot read secrets, cannot touch workloads, and no other Role may touch
+secrets at all.
 
 Two rules are enforced in code, not by configuration:
 
@@ -842,8 +865,10 @@ precondition, not a best-effort side effect.
 
 `auton-scanner` detects problems without being asked; `auton-worker` repairs the
 deterministic ones, verifies the result and records what it did. Every incident
-is one atomic JSON file under `/workspace/.ops/incidents` (shared PVC), with a
-status of `detected`, `acting`, `resolved`, `needs_human` or `failed`:
+is one atomic JSON file under `/workspace/.ops/incidents` (shared PVC). It
+carries a stable `fingerprint`, an occurrence count, a full `timeline[]` of
+state transitions, the structured evidence document, the deterministic
+diagnosis, the repair plan and the policy decision that was made about it:
 
 ```bash
 # newest first; filter by one or more statuses
@@ -852,10 +877,18 @@ curl -s "http://localhost:8080/incidents?limit=20" \
 curl -s "http://localhost:8080/incidents?status=needs_human" \
   -H "Authorization: Bearer $TOKEN"
 
-# one record: observation, evidence, actions, verification, report, audit ids
+# one record: diagnosis, evidence, timeline, plan, policy, actions, report
 curl -s "http://localhost:8080/incidents/inc-8173cfab0b" \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+The incident walks an explicit state machine — `DETECTED → TRIAGING →
+DIAGNOSING → PLANNING → POLICY_CHECK → QUEUED → EXECUTING → VERIFYING →
+RESOLVED`, with `AWAITING_APPROVAL`, `SUPPRESSED` and `NEEDS_HUMAN` as the
+side exits. A closed incident can only be re-opened through `reopen()`, and a
+repair retry reuses the *same* incident; a recurrence opens a *new* one linked
+to the old. `GET /incidents` filters by `severity`, `cause`, `namespace`,
+`resource` and `fingerprint` (each a comma list).
 
 `POST /incidents/ingest` is what the workers call; it is idempotent by
 `id` and lets a worker move to its own PVC later without changing the API. The
@@ -891,6 +924,70 @@ Two scanners writing the same finding at the same time submit the same
 idempotency key (`scan:<namespace>|<resource>|<cause>|<bucket>`), so the queue
 keeps one task; an active task or a live cooldown suppresses the finding before
 it is queued.
+
+### Repair policy and approvals (`/policy`, `/approvals`)
+
+A repair is never executed just because it was detected. Every task is first
+**planned** (what would be done, at which risk tier, how it would be verified
+and undone) and then **policy-checked**. The policy lives in ConfigMap
+`auton-policy` and is mounted into the API and the workers as a projected
+volume, so it is read per decision and a change takes effect without a
+restart.
+
+```bash
+# the effective policy
+curl -s http://localhost:8080/policy -H "Authorization: Bearer $TOKEN"
+
+# change it (validated before it is written)
+scripts/set-policy.sh --show
+scripts/set-policy.sh --mode observe-only
+scripts/set-policy.sh --mode safe-auto --auto-tiers 0,1,2 --approval-tiers 3
+scripts/set-policy.sh --deny-cause crashloop
+scripts/set-policy.sh --require-approval-cause oom
+scripts/set-policy.sh --reset
+```
+
+| Mode | Behaviour |
+|---|---|
+| `disabled` | **The off switch.** Nothing runs; every decision is a denial. |
+| `observe-only` | Shadow mode: plans are computed and recorded, never executed. |
+| `safe-auto` | The tiers in `auto_approve_tiers` run unattended, the tiers in `approval_tiers` wait for a human. |
+| `approval-required` | Every mutating tier waits for a human. |
+
+The tier describes the **risk of the action**, not the severity of the symptom:
+0 = observe/report, 1 = transient (restart a pod, undo a rollout, scale up),
+2 = changes the workload's specification (raise a memory limit), 3 =
+data-affecting or irreversible. The shipped default is `safe-auto` with
+`auto_approve_tiers: [0, 1, 2]` and `approval_tiers: [3]` — exactly the
+behaviour before the policy engine existed.
+
+**Fail closed.** An unreadable or invalid policy document is treated as
+`disabled`: the decision is a denial that names the problem, and `GET /policy`
+reports the error. A typo must never silently *widen* what the platform may do.
+
+When the policy asks for an approval, **nothing in the cluster changes**. The
+plan becomes an approval request and the incident waits in
+`AWAITING_APPROVAL`:
+
+```bash
+# the pending plans
+curl -s http://localhost:8080/approvals?status=pending \
+  -H "Authorization: Bearer $TOKEN"
+
+# approve one: the repair is enqueued and the same incident continues
+curl -s -X POST http://localhost:8080/approvals/apr-569317262639/approve \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"by":"alice","comment":"safe to bump the limit"}'
+
+# or reject it: the incident goes to needs_human
+curl -s -X POST http://localhost:8080/approvals/apr-569317262639/reject \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"by":"alice","comment":"not now"}'
+```
+
+An approval can be decided **once**: a second click answers `409` instead of
+running the repair twice. The UI has an **Approvals** tab with the same
+buttons and the policy view next to it.
 
 ### Task queue (`/tasks`)
 
@@ -961,6 +1058,10 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:8080/jobs/$J
 | `GET /audit` | Mutation log, optionally `?incident_id=` |
 | `GET /incidents`, `GET /incidents/{id}` | Incident records |
 | `POST /incidents/ingest` | Idempotent incident ingest from a worker |
+| `GET /policy` | The effective repair policy (mode, tiers, rules) and its source |
+| `GET /approvals`, `GET /approvals/{id}` | Approval requests for repair plans the policy parked |
+| `POST /approvals/{id}/approve` | Approve a pending plan and enqueue the repair (`409` if already decided) |
+| `POST /approvals/{id}/reject` | Reject a pending plan; the incident goes to `NEEDS_HUMAN` |
 | `GET /tasks`, `GET /tasks/{id}`, `GET /tasks/stats` | Both queues (repair + agent) |
 | `POST /tasks` | Queue a manual repair, or an agent job (`queue="agent"`) |
 | `POST /tasks/{id}/cancel` | Cancel a queued task |
@@ -1136,6 +1237,9 @@ Enable the workflow first (toggle **Active** in the n8n UI, or use
 | `AGENT_NAMESPACES` | `AGENT_NAMESPACE` | Comma list the tools may target; deployment sets `auton,auton-apps` |
 | `AGENT_AUDIT_DIR` | `$AGENT_WORKSPACE/.ops` | Write-ahead audit log + SQLite index; mutations refuse if unwritable |
 | `AGENT_INCIDENTS_DIR` | `$AGENT_AUDIT_DIR/incidents` | Incident JSON files (`/incidents*`) |
+| `AGENT_APPROVALS_DIR` | `$AGENT_AUDIT_DIR/approvals` | Approval-request JSON files (`/approvals*`) |
+| `AGENT_POLICY_DIR` | `/etc/auton-policy` | Where the projected policy ConfigMap is mounted (the API + the workers) |
+| `AGENT_POLICY_MODE` | *(none)* | Mode override when no policy document is present |
 | `AGENT_K8S_ENABLED` | `1` | `0` disables the Kubernetes tools |
 | `AGENT_K8S_WRITE` | `0` (image) / `1` (deployment) | Allows apply/patch/scale/rollout/delete/exec |
 | `N8N_API_URL` | `http://n8n:5678/api/v1` | n8n public API base |
@@ -1407,6 +1511,8 @@ Queue, incident and RBAC checks (with `TOKEN` and a port-forward on `:8080`):
 curl -s "http://localhost:8080/tasks?limit=5" -H "Authorization: Bearer $TOKEN"
 curl -s "http://localhost:8080/tasks/stats" -H "Authorization: Bearer $TOKEN"
 curl -s "http://localhost:8080/incidents?limit=5" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/policy" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/approvals?status=pending" -H "Authorization: Bearer $TOKEN"
 curl -s "http://localhost:8080/audit?incident_id=<id>" -H "Authorization: Bearer $TOKEN"
 kubectl -n auton exec deploy/auton-worker -- \
   sh -c 'kubectl auth can-i patch deployments -n auton-apps;
@@ -1427,7 +1533,8 @@ kubectl -n auton exec deploy/auton-worker -- \
   inherently powerful: a pod spec can reference a Secret by name, so do not put
   long-lived credentials in these namespaces that the agent should never see.
 - **Four identities, one per pod role.** The API (`auton-api`) can only
-  `patch` the provider ConfigMap/Secret; the scanners (`auton-scanner`) are
+  `patch` the provider ConfigMap, the repair-policy ConfigMap and the provider
+  Secret; the scanners (`auton-scanner`) are
   read-only; the workers (`auton-worker`) may delete pods and patch/scale
   Deployments only in `auton-apps`; the LLM executor (`auton-agent`) has repair
   rights in `auton` and `auton-apps` plus the read-only cluster view its
@@ -1435,6 +1542,14 @@ kubectl -n auton exec deploy/auton-worker -- \
   or Roles/RoleBindings, delete a PVC or a namespace, and cluster scope is
   read-only. RBAC is the boundary, not the Python code. Image, config,
   scheduling, PVC and StatefulSet problems stay report-only.
+- **Every repair is planned and policy-checked first.** A repair only reaches
+  the cluster through a registered playbook, and only after the policy engine
+  has allowed it. The modes are `disabled` (nothing runs), `observe-only`
+  (plans are recorded, nothing is executed), `safe-auto` (the low-risk tiers
+  run unattended) and `approval-required` (every mutating tier waits for a
+  human). An unreadable or invalid policy **fails closed** — it denies, it
+  never falls back to a permissive default. The LLM is not in this path: it
+  cannot choose a repair, a command or a tier.
 - **A bug in the HTTP layer cannot change the cluster.** `deployment/auton`
   runs as `auton-api` and only enqueues work; every mutation happens in a
   worker pod with its own narrow identity. The agent loop also runs in its own

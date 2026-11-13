@@ -46,6 +46,12 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["auton-model-config"]
     verbs: ["patch"]
+  # The repair policy is the other object the API may write: the UI can
+  # tighten or loosen what the workers are allowed to do.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["auton-policy"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: ["auton-model"]
