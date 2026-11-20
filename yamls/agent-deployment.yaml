@@ -1,243 +1,284 @@
-# Auton: the coding-agent HTTP service.
+# GENERATED — DO NOT EDIT.
 #
-# Namespace/service/deployment are all called "auton" (namespace names must be
-# lowercase DNS labels, so "Auton" is impossible there and we keep one name).
-# Reaches Ollama in-cluster via DNS (ollama-service:11434) — no port-forward.
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
 #
-# The agent also controls this namespace through kubectl (see auton-rbac.yaml) and
-# n8n through its REST API. Image is built locally and imported into k3d:
-#   docker build -t auton:local ./mcp && k3d image import auton:local -c ai-cluster
----
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/pvc.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: agent-workspace
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: [ReadWriteOnce]
   storageClassName: local-path
   resources:
     requests:
       storage: 5Gi
 ---
+# Source: auton-chart/templates/deployment-agent.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: auton
   namespace: auton
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
     app: auton
-    # The ops controller (P3) never repairs itself or its own namespace/SA.
     auton.io/protect: "true"
 spec:
   replicas: 1
   strategy:
-    type: Recreate
+    type: Recreate          # RWO workspace PVC
   selector:
     matchLabels:
       app: auton
   template:
     metadata:
       labels:
+        helm.sh/chart: auton-chart-0.3.0
+        app.kubernetes.io/name: auton
+        app.kubernetes.io/instance: auton
+        app.kubernetes.io/version: "0.3.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: auton
         app: auton
+        # The workers never repair this pod or its namespace.
         auton.io/protect: "true"
     spec:
-      # Narrow identity: the API pod may only patch the two provider objects.
-      # The agent loop (and its kubectl tools) runs in `deployment/auton-ops`
-      # under `auton-agent`, so this pod needs no cluster read/write at all.
+      # The API is a producer: it validates, enqueues and serves the UI. The
+      # agent loop (and every kubectl tool) runs in auton-ops under auton-agent.
       serviceAccountName: auton-api
+      # The API patches the provider ConfigMap/Secret through kubectl, so it
+      # needs its (narrow) token.
+      automountServiceAccountToken: true
       securityContext:
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      # local-path volumes do not get fsGroup chown applied by the kubelet, so
-      # the (root) init container fixes ownership of the existing workspace
-      # once. It uses the same image the pod already has (no extra pull).
+      # local-path does not apply fsGroup, so a root init container fixes the
+      # existing workspace once. Without it /workspace stays unwritable.
       initContainers:
-      - name: fix-workspace-owner
-        image: auton:local
-        imagePullPolicy: IfNotPresent
-        command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
-        securityContext:
-          runAsUser: 0
-          runAsNonRoot: false
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop: ["ALL"]
-            add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
-        volumeMounts:
-        - name: workspace
-          mountPath: /workspace
+        - name: fix-workspace-owner
+          image: auton:local
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "chown -R 10001:10001 /workspace && chmod 0770 /workspace"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
       containers:
-      - name: auton
-        image: auton:local
-        imagePullPolicy: IfNotPresent   # use the k3d-imported local image
-        ports:
-        - containerPort: 8080
-        securityContext:
-          runAsUser: 10001
-          runAsGroup: 10001
-          runAsNonRoot: true
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop: ["ALL"]
-        env:
-        - name: HOME
-          value: "/tmp"
-        - name: TMPDIR
-          value: "/tmp"
-        - name: PYTHONDONTWRITEBYTECODE
-          value: "1"
-        - name: OLLAMA_HOST
-          value: "http://ollama-service:11434"
-        - name: AGENT_MODEL
-          value: "qwen2.5-coder:7b-instruct"
-        - name: AGENT_WORKSPACE
-          value: "/workspace"
-        # Provider config is read per request from this projected volume.
-        - name: AGENT_MODEL_DIR
-          value: "/etc/auton-model"
-        # The UI writes provider settings through POST /provider. These are the
-        # only objects the API identity may patch (see the auton-api Role).
-        - name: AGENT_PROVIDER_STORE
-          value: "kubectl"
-        - name: AGENT_PROVIDER_NAMESPACE
-          value: "auton"
-        - name: AGENT_PROVIDER_CONFIGMAP
-          value: "auton-model-config"
-        - name: AGENT_PROVIDER_SECRET
-          value: "auton-model"
-        # The repair policy, read per request by GET /policy. The UI patches
-        # the named ConfigMap `auton-policy` (see the auton-api Role).
-        - name: AGENT_POLICY_DIR
-          value: "/etc/auton-policy"
-        - name: MAX_STEPS
-          value: "25"
-        # Context budget: ollama defaults to a small num_ctx, which truncates
-        # long tool schemas / observations. Give the loop room.
-        - name: AGENT_NUM_CTX
-          value: "16384"
-        - name: AGENT_MAX_OBSERVATION_CHARS
-          value: "8000"
-        - name: AGENT_MAX_HISTORY_CHARS
-          value: "60000"
-        # Jobs: the API is the producer when AGENT_QUEUE=redis; `deployment/auton-ops`
-        # is the executor. `memory` keeps the old single-process worker for
-        # local runs and tests. There is no silent fallback: with redis and an
-        # unreachable Redis the service refuses to start.
-        - name: AGENT_QUEUE
-          value: "redis"
-        - name: AGENT_REDIS_URL
-          value: "redis://redis.auton.svc.cluster.local:6379/0"
-        - name: AGENT_QUEUE_PREFIX
-          value: "auton"
-        - name: AGENT_MAX_QUEUE
-          value: "8"
-        - name: AGENT_JOB_TIMEOUT
-          value: "900"
-        # The container is the sandbox; bwrap is for host CLI runs.
-        - name: AGENT_SANDBOX
-          value: "off"
-        # --- Kubernetes access -------------------------------------------- #
-        # kubectl runs inside the pod as the auton-agent ServiceAccount; the
-        # namespace Role is the real boundary. AGENT_K8S_WRITE=0 makes the k8s
-        # tools read-only without touching RBAC.
-        - name: AGENT_NAMESPACE
-          valueFrom:
-            fieldRef: { fieldPath: metadata.namespace }
-        # The model can only target these namespaces (k8s_tools allowlist).
-        - name: AGENT_NAMESPACES
-          value: "auton,auton-apps"
-        # Write-ahead audit log; lives on the workspace PVC so it survives a
-        # pod restart and is readable through GET /audit.
-        - name: AGENT_AUDIT_DIR
-          value: "/workspace/.ops"
-        - name: AGENT_K8S_ENABLED
-          value: "1"
-        - name: AGENT_K8S_WRITE
-          value: "1"
-        # --- n8n access ---------------------------------------------------- #
-        - name: N8N_API_URL
-          value: "http://n8n.auton.svc.cluster.local:5678/api/v1"
-        - name: N8N_WEBHOOK_BASE
-          value: "http://n8n.auton.svc.cluster.local:5678/webhook"
-        # The key is read per request, so rotating the Secret needs no restart.
-        - name: N8N_API_KEY_FILE
-          value: "/etc/n8n-api/api-key"
-        # --- API auth ------------------------------------------------------ #
-        # Required by agent_service.py on /run and /jobs*; /health stays open.
-        - name: AGENT_API_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: auton-api-token
-              key: token
-        resources:
-          requests:
-            cpu: "250m"
-            memory: "512Mi"
-          limits:
-            cpu: "2"
-            memory: "2Gi"
-        volumeMounts:
-        - name: workspace
-          mountPath: /workspace
-        - name: tmp
-          mountPath: /tmp
-        - name: model-config
-          mountPath: /etc/auton-model/config
-          readOnly: true
-        - name: model-secret
-          mountPath: /etc/auton-model/secret
-          readOnly: true
-        - name: policy
-          mountPath: /etc/auton-policy
-          readOnly: true
-        # optional: the agent starts even before the n8n API key exists.
-        - name: n8n-api
-          mountPath: /etc/n8n-api
-          readOnly: true
-        readinessProbe:
-          httpGet: { path: /health, port: 8080 }
-          initialDelaySeconds: 3
-          periodSeconds: 10
-        livenessProbe:
-          httpGet: { path: /health, port: 8080 }
-          initialDelaySeconds: 10
-          periodSeconds: 30
+        - name: auton
+          image: auton:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # valueFrom entries cannot live in the map above.
+            - name: AGENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AGENT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: auton-api-token
+                  key: token
+            # The queue password comes from a mounted Secret: never a literal
+            # in a manifest, never an environment variable.
+            - name: AGENT_REDIS_PASSWORD_FILE
+              value: "/etc/auton-redis/password"
+            - name: AGENT_AUDIT_DIR
+              value: "/workspace/.ops"
+            - name: AGENT_INCIDENTS_DIR
+              value: "/workspace/.ops/incidents"
+            - name: AGENT_JOB_TIMEOUT
+              value: "900"
+            - name: AGENT_K8S_DIRECT
+              value: "1"
+            - name: AGENT_K8S_ENABLED
+              value: "1"
+            - name: AGENT_K8S_WRITE
+              value: "0"
+            - name: AGENT_LEARN_DIR
+              value: "/workspace/.ops/learning"
+            - name: AGENT_LEARN_ENABLED
+              value: "1"
+            - name: AGENT_MAX_HISTORY_CHARS
+              value: "60000"
+            - name: AGENT_MAX_OBSERVATION_CHARS
+              value: "8000"
+            - name: AGENT_MAX_QUEUE
+              value: "8"
+            - name: AGENT_MODEL
+              value: "qwen2.5-coder:7b-instruct"
+            - name: AGENT_MODEL_DIR
+              value: "/etc/auton-model"
+            - name: AGENT_NAMESPACES
+              value: "auton,auton-apps"
+            - name: AGENT_NUM_CTX
+              value: "16384"
+            - name: AGENT_POLICY_DIR
+              value: "/etc/auton-policy"
+            - name: AGENT_PROVIDER_CONFIGMAP
+              value: "auton-model-config"
+            - name: AGENT_PROVIDER_NAMESPACE
+              value: "auton"
+            - name: AGENT_PROVIDER_SECRET
+              value: "auton-model"
+            - name: AGENT_PROVIDER_STORE
+              value: "kubectl"
+            - name: AGENT_QUEUE
+              value: "redis"
+            - name: AGENT_QUEUE_PREFIX
+              value: "auton"
+            - name: AGENT_REDIS_URL
+              value: "redis://redis.auton.svc.cluster.local:6379/0"
+            - name: AGENT_SANDBOX
+              value: "off"
+            - name: AGENT_WORKSPACE
+              value: "/workspace"
+            - name: AUTON_VERSION
+              value: "0.3.0"
+            - name: HOME
+              value: "/tmp"
+            - name: MAX_STEPS
+              value: "25"
+            - name: N8N_API_KEY_FILE
+              value: "/etc/n8n-api/api-key"
+            - name: N8N_API_URL
+              value: "http://n8n.auton.svc.cluster.local:5678/api/v1"
+            - name: N8N_WEBHOOK_BASE
+              value: "http://n8n.auton.svc.cluster.local:5678/webhook"
+            - name: OLLAMA_HOST
+              value: "http://ollama-service:11434"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: TMPDIR
+              value: "/tmp"
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+            # The queue password (Secret auton-redis), read once at startup.
+            - name: redis-auth
+              mountPath: /etc/auton-redis
+              readOnly: true
+            - name: model-config
+              mountPath: /etc/auton-model/config
+              readOnly: true
+            - name: model-secret
+              mountPath: /etc/auton-model/secret
+              readOnly: true
+            # Optional: only a local `AGENT_QUEUE=memory` run puts the n8n tools
+            # in this process. In the cluster they run in auton-ops.
+            - name: n8n-api
+              mountPath: /etc/n8n-api
+              readOnly: true
+            - name: policy
+              mountPath: /etc/auton-policy
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
       volumes:
-      - name: workspace
-        persistentVolumeClaim:
-          claimName: agent-workspace
-      - name: tmp
-        emptyDir: {}
-      - name: model-config
-        configMap:
-          name: auton-model-config
-      - name: model-secret
-        secret:
-          secretName: auton-model
-          optional: true
-      - name: policy
-        configMap:
-          name: auton-policy
-          optional: true
-      - name: n8n-api
-        secret:
-          secretName: n8n-api
-          optional: true
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: agent-workspace
+        - name: tmp
+          emptyDir: {}
+        - name: redis-auth
+          secret:
+            secretName: auton-redis
+            items:
+              - key: password
+                path: password
+            defaultMode: 0444
+        - name: model-config
+          configMap:
+            name: auton-model-config
+        - name: model-secret
+          secret:
+            secretName: auton-model
+            optional: true
+        - name: n8n-api
+          secret:
+            secretName: n8n-api
+            optional: true
+        - name: policy
+          configMap:
+            name: auton-policy
+            optional: true
 ---
+# Source: auton-chart/templates/deployment-agent.yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: auton
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+    app: auton
 spec:
   type: ClusterIP
   selector:
     app: auton
   ports:
-  - port: 8080
-    targetPort: 8080
+    - name: http
+      port: 8080
+      targetPort: 8080

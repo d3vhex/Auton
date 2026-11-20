@@ -49,7 +49,9 @@ import approvals
 import diagnosis
 import evidence
 import incidents
+import k8s_api  # noqa: F401 - re-exported as ops.k8s_api for the scanner
 import k8s_tools
+import learning
 import planner
 import playbooks
 import policy
@@ -79,6 +81,10 @@ STORE = incidents.IncidentStore(os.path.join(OPS_DIR, "incidents"),
 APPROVALS = approvals.ApprovalStore(
     os.environ.get("AGENT_APPROVALS_DIR", "").strip()
     or os.path.join(OPS_DIR, "approvals"))
+# The Learn stage (Phase 7): outcomes and learned profiles. The worker writes
+# them on the shared workspace PVC, so the API reads exactly what was learned.
+# A missing/unwritable directory makes the service inert, never fatal.
+LEARNING = learning.LearningService()
 STOP = threading.Event()
 
 # Queue split (see ops_scanner.py / ops_worker.py).
@@ -228,13 +234,34 @@ def _workload_for(snapshot_pod: dict, namespace: str) -> tuple[str, str]:
     return playbooks.workload_for_pod(pod, namespace)
 
 
-def findings(snapshot: dict) -> list[dict]:
-    """Deterministic list of things to act on for one namespace snapshot."""
-    namespace = snapshot["namespace"]
+def pod_findings(pods: list[dict], namespace: str,
+                 resolve_workload=None) -> tuple[list[dict], set[str]]:
+    """Pod-level detection from a list of pod summaries.
+
+    The summaries are the same shape the snapshot produces
+    (``k8s_tools._pod_summary``), so this works on a live watch cache just as
+    well as on a polled snapshot — no API call is made here.
+
+    ``resolve_workload`` is an optional ``(pod, namespace) -> (kind, name)``
+    callback. It is only used to remember which Deployment a pod belongs to,
+    so the workload-level rules can avoid reporting the same problem twice.
+    The watch path passes ``None``: the cache does not know the Deployment
+    behind a ReplicaSet without asking the API server, and the fast path does
+    not evaluate workloads anyway.
+
+    Returns the findings and the set of covered Deployment names.
+    """
     found: list[dict] = []
     covered: set[str] = set()
 
-    for pod in snapshot["pods"]:
+    def remember(pod: dict) -> None:
+        if resolve_workload is None:
+            return
+        kind, name = resolve_workload(pod, namespace)
+        if kind == "Deployment" and name:
+            covered.add(name)
+
+    for pod in pods:
         if pod.get("protected"):
             continue
         if pod["deleting"]:
@@ -250,9 +277,7 @@ def findings(snapshot: dict) -> list[dict]:
                         for reason in pod["reasons"])):
             # Still starting: remember the workload so the rollout is not
             # re-reported as "deployment has 0 available replicas" either.
-            kind, name = _workload_for(pod, namespace)
-            if kind == "Deployment" and name:
-                covered.add(name)
+            remember(pod)
             continue
         reason = _primary_reason(pod["reasons"])
         mapped = REASONS.get(reason)
@@ -263,9 +288,14 @@ def findings(snapshot: dict) -> list[dict]:
             "Pod", pod["name"], cause, severity,
             f"pod/{pod['name']} reports {reason} "
             f"(restarts={pod['restarts']}, phase={pod['phase']})"))
-        kind, name = _workload_for(pod, namespace)
-        if kind == "Deployment" and name:
-            covered.add(name)
+        remember(pod)
+    return found, covered
+
+
+def findings(snapshot: dict) -> list[dict]:
+    """Deterministic list of things to act on for one namespace snapshot."""
+    namespace = snapshot["namespace"]
+    found, covered = pod_findings(snapshot["pods"], namespace, _workload_for)
     for name, work in (("deployments", "Deployment"),
                        ("statefulsets", "StatefulSet")):
         for item in snapshot[name]:
@@ -426,11 +456,13 @@ def _walk_incident(incident: dict, target: str, *, by: str = "worker",
     return record or incident
 
 
-def _run_playbook(item: dict, namespace: str, evidence: str) -> dict:
+def _run_playbook(item: dict, namespace: str, evidence: str,
+                  step: float = 0.25) -> dict:
     cause = item["cause"]
     name = item["name"]
     if cause == "oom":
-        return playbooks.fix_oom(name, namespace, container=item["container"])
+        return playbooks.fix_oom(name, namespace, container=item["container"],
+                                 step=step)
     if cause == "stuck":
         return playbooks.fix_stuck(name, namespace, age="")
     if cause == "crashloop":
@@ -823,6 +855,64 @@ def submit_manual(store, payload: dict, actor: str = "api",
     return store.submit("repair", fields, priority=priority, actor=actor)
 
 
+def _submit_findings(store, items: list[dict], namespace: str,
+                     summary: dict) -> None:
+    """Suppress and enqueue a list of findings.
+
+    A queue cooldown, a recent incident or an active task for the same
+    resource all suppress a submission, so two scanners (or a second pass
+    while a slow playbook is still running) cannot create duplicate work.
+    """
+    for item in items:
+        summary["findings"] += 1
+        resource = incidents.resource_key(item["kind"], item["name"])
+        cause = item["cause"]
+        if store.in_cooldown(resource, cause):
+            summary["suppressed"] += 1
+            continue
+        try:
+            recent = STORE.find_recent(resource, cause, within=COOLDOWN)
+        except incidents.IncidentError as exc:
+            log(f"scan: cannot read incidents: {exc}")
+            summary["errors"] += 1
+            continue
+        if recent:
+            summary["suppressed"] += 1
+            continue
+        if store.active_for(resource, cause):
+            summary["suppressed"] += 1
+            continue
+        try:
+            record = _submit_finding(store, item, namespace)
+        except task_store.TaskError as exc:
+            log(f"scan: cannot enqueue {resource} {cause}: {exc}")
+            summary["errors"] += 1
+            continue
+        if record.get("duplicate"):
+            summary["duplicates"] += 1
+        else:
+            summary["queued"] += 1
+            summary["tasks"].append(record["id"])
+            log(f"queued {record['id']}: {resource} {cause} in {namespace}")
+
+
+def scan_pods(store, pods: list[dict], namespace: str) -> dict:
+    """The fast path: pod-level detection over the watch cache.
+
+    No API call is made: the pod summaries come from the live watch stream.
+    The workload-level rules (Deployments, StatefulSets, PVCs) are the job of
+    the full reconciliation, which runs on its own, slower interval.
+    """
+    touch_heartbeat()
+    store.heartbeat("scanner")
+    summary = {"namespaces": [namespace], "findings": 0, "queued": 0,
+               "duplicates": 0, "suppressed": 0, "errors": 0, "tasks": [],
+               "source": "watch"}
+    items, _ = pod_findings(pods, namespace)
+    _submit_findings(store, items, namespace, summary)
+    return summary
+
+
 def scan_once(store) -> dict:
     """Read-only pass: collect findings and enqueue repair tasks.
 
@@ -834,7 +924,8 @@ def scan_once(store) -> dict:
     touch_heartbeat()
     store.heartbeat("scanner")
     summary = {"namespaces": list(NAMESPACES), "findings": 0, "queued": 0,
-               "duplicates": 0, "suppressed": 0, "errors": 0, "tasks": []}
+               "duplicates": 0, "suppressed": 0, "errors": 0, "tasks": [],
+               "source": "snapshot"}
     for namespace in NAMESPACES:
         if STOP.is_set():
             break
@@ -843,37 +934,7 @@ def scan_once(store) -> dict:
             log(f"scan: snapshot failed for {namespace}: {error}")
             summary["errors"] += 1
             continue
-        for item in findings(snapshot):
-            summary["findings"] += 1
-            resource = incidents.resource_key(item["kind"], item["name"])
-            cause = item["cause"]
-            if store.in_cooldown(resource, cause):
-                summary["suppressed"] += 1
-                continue
-            try:
-                recent = STORE.find_recent(resource, cause, within=COOLDOWN)
-            except incidents.IncidentError as exc:
-                log(f"scan: cannot read incidents: {exc}")
-                summary["errors"] += 1
-                continue
-            if recent:
-                summary["suppressed"] += 1
-                continue
-            if store.active_for(resource, cause):
-                summary["suppressed"] += 1
-                continue
-            try:
-                record = _submit_finding(store, item, namespace)
-            except task_store.TaskError as exc:
-                log(f"scan: cannot enqueue {resource} {cause}: {exc}")
-                summary["errors"] += 1
-                continue
-            if record.get("duplicate"):
-                summary["duplicates"] += 1
-            else:
-                summary["queued"] += 1
-                summary["tasks"].append(record["id"])
-                log(f"queued {record['id']}: {resource} {cause} in {namespace}")
+        _submit_findings(store, findings(snapshot), namespace, summary)
     return summary
 
 
@@ -938,6 +999,48 @@ def _audit_ids(incident_id: str) -> list[str]:
         return []
     return list(dict.fromkeys(
         row.get("audit_id") for row in rows if row.get("audit_id")))
+
+
+def _learned_cooldown(namespace: str, resource: str, cause: str) -> int:
+    """The cooldown of this resource — the learned one may only be longer."""
+    if not LEARNING.enabled:
+        return COOLDOWN
+    try:
+        return LEARNING.learned_cooldown(namespace, resource, COOLDOWN, cause)
+    except Exception:
+        return COOLDOWN
+
+
+def _quarantined(namespace: str, resource: str, cause: str) -> bool:
+    """True when learning handed this resource to a human."""
+    if not LEARNING.enabled:
+        return False
+    try:
+        return LEARNING.quarantined(namespace, resource, cause)
+    except Exception:
+        return False
+
+
+def _learning_resource(item: dict, namespace: str, resource: str) -> str:
+    """The resource the learning belongs to: the **workload**, not the pod.
+
+    An OOM kills a *pod*, but the repair changes the *Deployment* — and the
+    rollout creates a new pod. A profile per pod would therefore forget
+    everything after the first repair, which is exactly the case learning is
+    for. The profile belongs to the workload.
+    """
+    if str(item.get("kind") or "") != "Pod":
+        return resource
+    try:
+        pod, err = playbooks._get("pod", item["name"], namespace)
+        if err or not pod:
+            return resource
+        kind, name = playbooks.workload_for_pod(pod, namespace)
+        if kind == "Deployment" and name:
+            return f"deployment/{name}"
+    except Exception:
+        pass
+    return resource
 
 
 def _finish_skipped(store, claim, reason: str, result: dict) -> dict:
@@ -1049,6 +1152,14 @@ def execute_task(store, claim, namespace: str = "") -> dict:
     store.append_log(task_id, f"{namespace}/{resource} {item['cause']} "
                               f"(attempt {task.get('attempts')})")
     log(f"task {task_id}: {resource} {item['cause']} in {namespace}")
+    started_at = time.time()
+    cause = str(item["cause"] or "")
+    # The Learn stage: the profile belongs to the workload (the Deployment),
+    # not to the pod instance, so the learning survives a rollout.
+    learn_resource = _learning_resource(item, namespace, resource)
+    # The cooldown of this resource and its per-resource action budget. Both
+    # may only make the platform *more* cautious.
+    cooldown_seconds = _learned_cooldown(namespace, learn_resource, cause)
 
     if namespace not in playbooks.ops_namespaces():
         return _finish_skipped(
@@ -1056,8 +1167,38 @@ def execute_task(store, claim, namespace: str = "") -> dict:
             f"namespace {namespace!r} is outside AGENT_OPS_NAMESPACES",
             {"action": "refused", "namespace": namespace})
 
-    if not task.get("force") and store.in_cooldown(resource, item["cause"]):
-        remaining = store.cooldown_remaining(resource, item["cause"])
+    if _quarantined(namespace, learn_resource, cause):
+        # Learning decided this resource needs a human: it is not repaired
+        # automatically any more.
+        try:
+            incident = _incident_for(task, item, namespace)
+            store.update(task_id, incident_id=incident["id"])
+            _attach_evidence(incident, item, namespace)
+            incident.update({
+                "status": "needs_human", "needs_human": True,
+                "actions": [{"action": "quarantined", "ok": False,
+                             "detail": ("the resource was quarantined after "
+                                        "repeated failed repairs")}],
+                "verification": "quarantined: nothing was changed",
+            })
+            incident["state"] = incidents.STATE_LABELS["needs_human"]
+            incident["report"] = build_report(incident)
+            STORE.save(incident)
+        except incidents.IncidentError as exc:
+            return _retry(store, claim, f"incident store failed: {exc}")
+        store.set_cooldown(resource, cause, cooldown_seconds)
+        notify(incident)
+        record = store.finish(
+            claim, status="needs_human",
+            result={"action": "quarantined", "incident_id": incident["id"]},
+            verification="quarantined: nothing was changed")
+        store.append_log(task_id, "needs_human: quarantined")
+        log(f"task {task_id} -> needs_human: {resource} is quarantined")
+        return {"task": "needs_human", "incident": incident["id"],
+                "task_id": record["id"]}
+
+    if not task.get("force") and store.in_cooldown(resource, cause):
+        remaining = store.cooldown_remaining(resource, cause)
         return _finish_skipped(store, claim,
                                f"cooldown ({remaining}s remaining)",
                                {"action": "cooldown", "remaining": remaining})
@@ -1078,7 +1219,7 @@ def execute_task(store, claim, namespace: str = "") -> dict:
             STORE.save(incident)
         except incidents.IncidentError as exc:
             return _retry(store, claim, f"incident store failed: {exc}")
-        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        store.set_cooldown(resource, cause, cooldown_seconds)
         notify(incident)
         record = store.finish(
             claim, status="needs_human",
@@ -1104,18 +1245,40 @@ def execute_task(store, claim, namespace: str = "") -> dict:
             STORE.save(incident)
         except incidents.IncidentError as exc:
             return _retry(store, claim, f"incident store failed: {exc}")
-        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        store.set_cooldown(resource, cause, cooldown_seconds)
         notify(incident)
         return _finish_skipped(store, claim,
                                "dry run: nothing was changed",
                                {"action": "dry_run",
                                 "incident_id": incident["id"]})
 
+    # The Learn stage: a per-resource budget, so one broken workload cannot
+    # eat the whole hourly budget of the platform.
+    resource_budget = MAX_ACTIONS_PER_HOUR
+    recent_actions = 0
+    if LEARNING.enabled:
+        try:
+            resource_budget = LEARNING.learned_budget(namespace, learn_resource,
+                                                       MAX_ACTIONS_PER_HOUR,
+                                                       cause)
+            recent_actions = LEARNING.recent_actions(namespace, learn_resource,
+                                                     3600)
+        except Exception:
+            resource_budget = MAX_ACTIONS_PER_HOUR
+    if recent_actions >= resource_budget:
+        store.set_cooldown(resource, cause, max(60, min(COOLDOWN or 900, 900)))
+        return _finish_skipped(
+            store, claim,
+            f"per-resource action budget reached "
+            f"({recent_actions}/{resource_budget})",
+            {"action": "resource_budget", "used": recent_actions,
+             "limit": resource_budget})
+
     allowed, used = store.take_budget(MAX_ACTIONS_PER_HOUR)
     if not allowed:
         # A short cooldown stops the scanner from re-queueing the same finding
         # on every pass; the hourly counter resets on its own.
-        store.set_cooldown(resource, item["cause"],
+        store.set_cooldown(resource, cause,
                            max(60, min(COOLDOWN or 900, 900)))
         return _finish_skipped(
             store, claim,
@@ -1135,10 +1298,19 @@ def execute_task(store, claim, namespace: str = "") -> dict:
         # The plan is a proposal, not an instruction: it says what *would* be
         # done, at which tier, and how it would be verified and undone.
         document = incident.get("evidence_structured") or {}
+        # The learned profile may only make the plan more cautious: a higher
+        # tier (a human has to approve) and a bigger memory bump.
+        learned = None
+        if LEARNING.enabled:
+            try:
+                learned = LEARNING.profile(namespace, learn_resource, cause)
+            except Exception:
+                learned = None
         plan = planner.build(item, namespace, incident.get("diagnosis") or {},
                              document, incident_id=incident["id"],
                              labels=(document.get("resource") or {}).get(
-                                 "labels") or {})
+                                 "labels") or {},
+                             learned=learned)
         incident["repair_plan"] = plan
         # Persist the plan *before* the walk: the walk reloads the record
         # from disk, so an unsaved plan would be lost.
@@ -1192,7 +1364,7 @@ def execute_task(store, claim, namespace: str = "") -> dict:
             STORE.save(incident)
         except incidents.IncidentError as exc:
             return _retry(store, claim, f"incident store failed: {exc}")
-        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        store.set_cooldown(resource, cause, cooldown_seconds)
         notify(incident)
         return _finish_skipped(store, claim,
                                f"observed only: {decision.get('reason', '')}",
@@ -1213,7 +1385,7 @@ def execute_task(store, claim, namespace: str = "") -> dict:
             STORE.save(incident)
         except incidents.IncidentError as exc:
             return _retry(store, claim, f"incident store failed: {exc}")
-        store.set_cooldown(resource, item["cause"], COOLDOWN)
+        store.set_cooldown(resource, cause, cooldown_seconds)
         notify(incident)
         record = store.finish(
             claim, status="needs_human",
@@ -1236,9 +1408,16 @@ def execute_task(store, claim, namespace: str = "") -> dict:
     STORE.save(incident)
 
     store.append_log(task_id, f"incident {incident['id']} acting")
+    # The memory bump comes from the plan (which already carries the learned
+    # step), so the plan and the execution always agree.
+    try:
+        memory_step = float((plan.get("params") or {}).get("memory_step") or 0.25)
+    except (TypeError, ValueError):
+        memory_step = 0.25
     try:
         with k8s_tools.incident_scope(incident["id"]):
-            result = _run_playbook(item, namespace, evidence_text)
+            result = _run_playbook(item, namespace, evidence_text,
+                                    step=memory_step)
     except Exception as exc:
         result = {"action": "playbook_error", "ok": False,
                   "detail": f"{type(exc).__name__}: {exc}",
@@ -1300,7 +1479,46 @@ def execute_task(store, claim, namespace: str = "") -> dict:
     except incidents.IncidentError as exc:
         log(f"task {task_id}: cannot save incident: {exc}")
 
-    store.set_cooldown(resource, item["cause"], COOLDOWN)
+    # --- learn ------------------------------------------------------------ #
+    # The repair is done and verified: write the outcome and let the platform
+    # adapt. Learning never breaks the repair path — every call is guarded.
+    learning_info: dict = {}
+    if LEARNING.enabled:
+        try:
+            record = LEARNING.record_outcome({
+                "task_id": task_id,
+                "incident_id": incident["id"],
+                "namespace": namespace,
+                "resource": learn_resource,
+                "pod": resource,
+                "cause": cause,
+                "action": result.get("action", ""),
+                "ok": bool(result.get("ok")),
+                "needs_human": bool(result.get("needs_human")),
+                "detail": str(result.get("detail") or "")[:400],
+                "verification": str(result.get("verification") or "")[:400],
+                "duration_seconds": round(max(0.0, time.time() - started_at), 3),
+                "policy_mode": decision.get("mode", ""),
+                "tier": plan.get("tier", 0),
+            })
+            applied = LEARNING.adapt(namespace, learn_resource, cause,
+                                     policy_mode=decision.get("mode", ""),
+                                     actor="worker")
+            learning_info = {
+                "outcome_id": (record or {}).get("id", ""),
+                "adaptations": applied,
+            }
+            if applied:
+                log(f"task {task_id}: learned "
+                    f"{', '.join(c['name'] for c in applied)} for {resource}")
+            incident["learning"] = learning_info
+            incident["report"] = build_report(incident)
+            STORE.save(incident)
+        except Exception as exc:
+            log(f"task {task_id}: learning failed (ignored): "
+                f"{type(exc).__name__}: {exc}")
+
+    store.set_cooldown(resource, cause, cooldown_seconds)
     notify(incident)
     approval_id = str(task.get("approval_id") or "").strip()
     if approval_id:

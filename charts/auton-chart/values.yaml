@@ -1,0 +1,449 @@
+# Default values for the Auton chart.
+#
+# The chart mirrors yamls/ in the repository, but is meant to be installable
+# from Docker Hub images without a local build:
+#
+#   helm install auton oci://registry-1.docker.io/d3vhec/auton-chart \
+#     --namespace auton --create-namespace \
+#     --set agent.auth.token="$(openssl rand -hex 24)"
+#
+# The system has five pod roles, each with its own identity:
+#
+#   auton          the HTTP API + UI          (auton-api)     producer only
+#   auton-scanner  read-only detection ×2     (auton-scanner) fills the queue
+#   auton-worker   repair playbooks ×2        (auton-worker)  the only writer
+#   auton-ops      LLM executor ×1            (auton-agent)   runs agent tasks
+#   redis          shared queue ×1            (no SA)         state, locks, budget
+#
+# Everything the agent needs to be safe (RBAC, audit PVC, namespace split) is
+# created by the chart. Ollama and n8n are optional so the chart also works on
+# a cluster that already has them.
+
+# Fixed resource names are intentional: the agent's own docs, the generated n8n
+# workflow and the workers all address "auton:8080" by DNS.
+nameOverride: ""
+
+namespace:
+  # Create the application namespace. Set to false when installing with
+  # --create-namespace or into an existing namespace.
+  create: true
+  name: auton
+
+appsNamespace:
+  # Namespace the operation agent may repair without being asked. Keep it
+  # separate from the control plane namespace so a bad repair cannot take the
+  # API down.
+  create: true
+  name: auton-apps
+
+image:
+  repository: docker.io/d3vhec/auton
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  # IfNotPresent is right for a pinned tag; use Always with a moving tag.
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# --------------------------------------------------------------------------- #
+# The API pod: validation, UI, /run producer, /tasks and /audit reads.
+# --------------------------------------------------------------------------- #
+agent:
+  replicas: 1
+  # The LLM executor is READ-ONLY by default (Phase 4): its RBAC grants
+  # get/list/watch only and the k8s tools refuse every mutation. Set this to
+  # true to give the executor write rights — the write Role is then created
+  # too, and every action stays audit-gated.
+  allowWrites: false
+  # Talk to the Kubernetes API server directly over HTTPS (D6) instead of
+  # forking kubectl for every read and write. `false` forces the kubectl
+  # path — useful to compare the two, not needed in production.
+  kubernetes:
+    direct: true
+  service:
+    type: ClusterIP
+    port: 8080
+  auth:
+    # Either point at a Secret you manage (it must have key `token`) or let the
+    # chart generate/keep one. A generated token is stable across upgrades.
+    existingSecret: ""
+    secretName: auton-api-token
+    token: ""
+    # Create the Secret. `false` when something else owns it — the raw
+    # manifests in yamls/ are generated with this off, because
+    # scripts/install.sh creates the token itself.
+    create: true
+  workspace:
+    # Use a claim you already have (e.g. a RWX volume on a multi-node cluster).
+    existingClaim: ""
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 5Gi
+    # Keep the PVC on `helm uninstall`: it holds the audit log, incidents and
+    # the agent's workspace.
+    keep: true
+  # Agent loop tuning (see mcp/README.md). Used by the ops executor.
+  model: qwen2.5-coder:7b-instruct
+  numCtx: 16384
+  maxSteps: 25
+  maxObservationChars: 8000
+  maxHistoryChars: 60000
+  maxQueue: 8
+  jobTimeout: 900
+  # Extra env vars for the API pod, e.g. AGENT_AUTH_DISABLED: "1" (never in a
+  # shared cluster).
+  env: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --------------------------------------------------------------------------- #
+# Queue backend shared by every pod. `redis` is the cluster default; there is
+# no memory fallback — with `redis` and an unreachable server the API refuses to
+# start instead of silently losing repair tasks to a private in-memory queue.
+# --------------------------------------------------------------------------- #
+queue:
+  backend: redis           # redis | memory (memory is for local/test only)
+  prefix: auton
+  # Empty derives redis://redis.<namespace>.svc.cluster.local:6379/0
+  redisUrl: ""
+  # Authentication (Phase 5): the queue requires a password by default.
+  # `redisAuth: false` is only for an *external* passwordless Redis
+  # (redis.enabled=false) — the Redis this chart runs always requires one.
+  redisAuth: true
+  # Inline password. Empty = generated once and kept in the Secret.
+  # Must be at least 16 characters from [A-Za-z0-9_-].
+  redisPassword: ""
+  # Use a Secret you manage instead (key `password`).
+  redisExistingSecret: ""
+  redisSecretName: auton-redis
+  # Create the Secret. `false` when something else owns it — the raw manifests
+  # in yamls/ are generated with this off, because scripts/install.sh creates
+  # the queue password itself.
+  redisSecret:
+    create: true
+  # Global LLM slot: one model call at a time even if ops is scaled by accident.
+  lease: 300               # a crashed worker's task is requeued after this
+  maxAttempts: 3
+  backoff: "30,120,300"
+  maxTaskQueue: 500
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  imagePullPolicy: IfNotPresent
+  # noeviction is deliberate: a full Redis refuses the write and the worker
+  # fails closed instead of dropping a repair.
+  maxMemory: 256mb
+  appendFsync: everysec
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 1Gi
+    keep: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 320Mi
+
+# --------------------------------------------------------------------------- #
+# Scanner: read-only detection. Replicas > 1 is safe by design; the dedupe
+# window collapses concurrent submissions of the same finding into one task.
+# --------------------------------------------------------------------------- #
+scanner:
+  enabled: true
+  replicas: 2
+  interval: 60
+  dedupeWindow: 300
+  cooldown: 1800
+  startupGrace: 120
+  terminationGrace: 120
+  heartbeat: /tmp/scanner-heartbeat
+  # Kubernetes watch (Phase 3): the scanner is pushed the changes instead of
+  # asking for a snapshot every `interval` seconds. The watch is an
+  # optimisation, never a dependency: when it is unavailable the scanner
+  # falls back to polling.
+  watch:
+    enabled: true
+    # The fast tier reads the watch cache (pod-level rules only).
+    fastInterval: 60
+    # The full tier takes a real snapshot (every rule).
+    fullInterval: 300
+    # How long the API server keeps one watch stream open.
+    timeout: 300
+    # The smallest gap between two event-triggered scans.
+    minGap: 5
+    # How long a watched Event stays in the cache. Events are high churn, so
+    # they expire; everything else is kept until it is deleted.
+    eventTtl: 900
+  # Namespaces it watches; must be covered by its read-only Role.
+  namespaces:
+    - auton-apps
+  env: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --------------------------------------------------------------------------- #
+# Repair worker: executes the playbooks. The only component with write verbs.
+# Two workers repair different Deployments in parallel; the per-resource lock
+# serialises the same one.
+# --------------------------------------------------------------------------- #
+worker:
+  enabled: true
+  replicas: 2
+  cooldown: 1800
+  maxActionsPerHour: 6
+  maxMemory: 2Gi
+  maxIncidents: 500
+  pruneEvery: 300
+  dryRun: false
+  heartbeat: /tmp/worker-heartbeat
+  # Namespaces a playbook may repair. RBAC is created for appsNamespace only;
+  # add namespaces here together with your own Role if you extend it.
+  namespaces:
+    - auton-apps
+  apiUrl: http://auton:8080
+  uiUrl: http://auton.localhost
+  # n8n webhook that fans reports out to Slack/Telegram. Empty disables it.
+  n8nWebhook: ""
+  env: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --------------------------------------------------------------------------- #
+# Learn stage (Phase 7): automatic, bounded adaptation.
+# Learning may only make the platform *more cautious* or tune a bounded
+# number: a bigger OOM bump, a higher risk tier, a longer cooldown, a smaller
+# per-resource budget, or a quarantine. It never widens permissions, never
+# lowers a tier, never changes the action and never bypasses the audit gate.
+# --------------------------------------------------------------------------- #
+learning:
+  enabled: true
+  # Shared between the worker (writes) and the API (reads): both mount the
+  # workspace PVC.
+  dir: /workspace/.ops/learning
+  # How many repairs of the same cause are needed before anything is adapted.
+  minSamples: 3
+  # The hard cap of the memory bump (the limit may at most double).
+  maxStep: 1.0
+  # The hard cap of a learned cooldown (6 hours).
+  cooldownMax: 21600
+  # The floor of a learned per-resource action budget (per hour).
+  budgetMin: 1
+  # How many consecutive failures quarantine a resource.
+  maxEscalations: 3
+  # How many outcome records are kept.
+  maxOutcomes: 500
+
+# --------------------------------------------------------------------------- #
+# Ops executor: the single pod that runs LLM agent tasks from the queue.
+# One replica; a second is safe (it defers while the GPU slot is held) but a
+# single GPU cannot run two agent loops faster.
+# --------------------------------------------------------------------------- #
+ops:
+  enabled: true
+  replicas: 1
+  poll: 5
+  heartbeat: /tmp/agent-heartbeat
+  env: {}
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+provider:
+  name: ollama            # ollama | openai | gemini | anthropic | custom
+  baseUrl: http://ollama-service:11434
+  model: qwen2.5-coder:7b-instruct
+  maxTokens: 1024
+  dataPolicy: redact      # redact | allow | local-only
+  # The ConfigMap the provider settings live in. The API identity may patch
+  # exactly this object and the Secret below.
+  configMapName: auton-model-config
+  # Create Secret auton-model from apiKey, or reuse an existing Secret with
+  # key `api-key`. An empty key is valid for ollama.
+  existingSecret: ""
+  secretName: auton-model
+  apiKey: ""
+
+# The repair policy: what Auton may do, and when it may do it. The policy
+# engine reads ConfigMap `auton-policy` on every decision, so a change takes
+# effect without a restart.
+#
+#   mode       disabled | observe-only | safe-auto | approval-required
+#   tiers      0 observe/report · 1 transient · 2 changes the spec · 3 risky
+policy:
+  create: true
+  configMapName: auton-policy
+  mode: safe-auto
+  defaultTier: 1
+  autoApproveTiers: [0, 1, 2]
+  approvalTiers: [3]
+  denyTiers: []
+  protectedNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+  protectedLabels:
+    - key: auton.io/protect
+      value: "true"
+  # First match wins. `match` accepts cause, namespace, kind, resource, action
+  # and tier; `action` is auto | require_approval | deny | observe.
+  rules: []
+  approvalTimeoutSeconds: 3600
+  maxPlanAgeSeconds: 900
+
+ollama:
+  enabled: false
+  image: ollama/ollama:latest
+  imagePullPolicy: IfNotPresent
+  model: qwen2.5-coder:7b-instruct
+  # Pull the model into the PVC after install/upgrade. This is idempotent.
+  pullModel: true
+  gpu:
+    enabled: true
+    resourceName: amd.com/gpu
+    count: 1
+  env:
+    HSA_OVERRIDE_GFX_VERSION: "10.3.0"
+    OLLAMA_KEEP_ALIVE: 30m
+    OLLAMA_FLASH_ATTENTION: "1"
+    OLLAMA_KV_CACHE_TYPE: q8_0
+    OLLAMA_NUM_PARALLEL: "1"
+    # Free VRAM margin (MiB) that llama.cpp's automatic fit must leave on the
+    # device. The default is far too conservative when the card is shared with
+    # the host's desktop: ollama sees the desktop's allocations as "unaccounted"
+    # and keeps ~4 of 29 layers on the CPU (81% GPU instead of 100%) even
+    # though the model fits. 128 MiB is enough for a 7B q4 model at a 16k
+    # context on an 8 GiB card and still keeps the whole model on the GPU.
+    # Raise it (256) if the host's GPU clients grow and you would rather have
+    # headroom than a full offload.
+    LLAMA_ARG_FIT_TARGET: "128"
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 20Gi
+    keep: true
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      memory: 12Gi
+
+n8n:
+  enabled: false
+  image: docker.n8n.io/n8nio/n8n:latest
+  imagePullPolicy: IfNotPresent
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 5Gi
+    keep: true
+  # Public-API key used by the agent's n8n tools. Create it in the n8n UI and
+  # either set it here or point at a Secret you manage; the mount is optional,
+  # so an absent key only makes the n8n tools return a clear error.
+  apiKey:
+    existingSecret: ""
+    secretName: n8n-api
+    value: ""
+  notify:
+    # Optional ops notification targets (n8n environment variables). Leave
+    # empty to skip the Secret; the generated workflow then logs an error.
+    existingSecret: ""
+    secretName: n8n-notify
+    slackWebhook: ""
+    telegramBotToken: ""
+    telegramChatId: ""
+  host: n8n.localhost
+  env:
+    GENERIC_TIMEZONE: Europe/Istanbul
+    TZ: Europe/Istanbul
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+ingress:
+  enabled: false
+  # Ingress (networking.k8s.io/v1) or IngressRoute (Traefik's CRD). The k3d
+  # lab ships Traefik, so the raw manifests use IngressRoute; a plain cluster
+  # gets the portable Ingress.
+  kind: Ingress
+  name: auton
+  className: traefik
+  annotations: {}
+  # Traefik entry points (IngressRoute only).
+  entryPoints:
+    - web
+  # One entry per host. Hosts that point at the same service share one route
+  # in the IngressRoute form.
+  hosts:
+    - host: auton.localhost
+      service: auton
+      port: 8080
+    - host: agent.localhost
+      service: auton
+      port: 8080
+  tls: []
+
+rbac:
+  create: true
+  # Cluster-scoped read-only access for diagnosis (nodes, PVs, CRDs, ...).
+  clusterReader: true
+
+serviceAccount:
+  # The HTTP API: may only PATCH the provider ConfigMap and Secret.
+  api:
+    create: true
+    name: auton-api
+  # Read-only detection in the apps namespace.
+  scanner:
+    create: true
+    name: auton-scanner
+  # The playbooks: pod delete + Deployment patch/scale in the apps namespace.
+  worker:
+    create: true
+    name: auton-worker
+  # The LLM executor: repair rights in both namespaces + cluster read-only.
+  agent:
+    create: true
+    name: auton-agent
+
+# Namespace labels applied to both created namespaces (the standard
+# app.kubernetes.io/* labels are added by the helpers).
+namespaceLabels: {}

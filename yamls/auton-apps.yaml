@@ -1,24 +1,43 @@
-# The namespace the agent is allowed to repair without being asked.
+# GENERATED — DO NOT EDIT.
 #
-# Keep the autonomous blast radius small: apps that should be self-healing go
-# here, anything sensitive stays in "auton" (or another namespace the agent
-# cannot target). A ResourceQuota and a LimitRange make a runaway playbook
-# (e.g. "raise memory until it works") fail fast instead of eating the node.
----
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
+#
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/namespace.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
   name: auton-apps
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: auton
-    # Read by the ops controller (P3) to skip a namespace entirely.
+    # Read by the scanners and workers.
     auton.io/ops: "enabled"
+  annotations:
+    helm.sh/resource-policy: keep
 ---
+# Source: auton-chart/templates/namespace.yaml
+# Keep the repair target small: a runaway playbook ("raise memory until it
+# works") should fail fast instead of eating the node.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
   name: auton-apps-quota
   namespace: auton-apps
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
 spec:
   hard:
     requests.cpu: "2"
@@ -31,20 +50,28 @@ spec:
     count/deployments.apps: "10"
     count/statefulsets.apps: "5"
 ---
+# Source: auton-chart/templates/namespace.yaml
 apiVersion: v1
 kind: LimitRange
 metadata:
   name: auton-apps-limits
   namespace: auton-apps
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
 spec:
   limits:
-  - type: Container
-    default:
-      cpu: "500m"
-      memory: 512Mi
-    defaultRequest:
-      cpu: "100m"
-      memory: 128Mi
-    max:
-      cpu: "2"
-      memory: 4Gi
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "2"
+        memory: 4Gi

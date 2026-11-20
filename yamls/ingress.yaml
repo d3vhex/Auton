@@ -1,17 +1,27 @@
-# Traefik IngressRoutes for the Auton services (k3s ships Traefik).
-# Reachable from the host only if the k3d cluster maps port 80 to the
-# loadbalancer (see README "Option B"). Then:
-#   curl -H 'Host: agent.localhost' http://localhost/health
-# All Services are ClusterIP; this is the only host-facing entry point.
+# GENERATED — DO NOT EDIT.
+#
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
+#
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/ingress.yaml
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: auton-routes
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
 spec:
   entryPoints: ["web"]
   routes:
-  # "auton" is also the agent workload name.
   - match: Host(`auton.localhost`) || Host(`agent.localhost`)
     kind: Rule
     services:

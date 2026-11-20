@@ -1,0 +1,195 @@
+{{- if and .Values.redis.enabled (eq .Values.queue.backend "redis") }}
+{{- if not .Values.redis.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: redis
+  {{- if .Values.redis.persistence.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.redis.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: redis
+    # Never let a playbook touch the queue itself.
+    auton.io/protect: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: never run two Redis pods at once
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        {{- include "auton.labels" . | nindent 8 }}
+        app: redis
+        auton.io/protect: "true"
+    spec:
+      # Redis needs no Kubernetes API access at all.
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # local-path does not reliably apply fsGroup; fix the data dir once per
+        # pod start (idempotent and fast on an already-owned volume).
+        #
+        # The same init container writes the server configuration, so the
+        # password ends up in a file (mode 0640, owned by the redis user) and
+        # never in the process arguments.
+        - name: fix-data-owner
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.imagePullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              chown -R 999:999 /data
+              chmod 0770 /data
+              pw="$(cat /etc/auton-redis/password)"
+              if [ -z "$pw" ]; then
+                echo "auton: the Redis password (Secret auton-redis, key password) is empty" >&2
+                exit 1
+              fi
+              if [ "${#pw}" -lt 16 ]; then
+                echo "auton: the Redis password must be at least 16 characters" >&2
+                exit 1
+              fi
+              case "$pw" in
+                *[!A-Za-z0-9_-]*)
+                  echo "auton: the Redis password must only use letters, digits, '-' and '_'" >&2
+                  exit 1 ;;
+              esac
+              mkdir -p /tmp/redis
+              cat > /tmp/redis/redis.conf <<REDISCONF
+              dir /data
+              appendonly yes
+              appendfsync {{ .Values.redis.appendFsync }}
+              aof-use-rdb-preamble yes
+              save ""
+              maxmemory {{ .Values.redis.maxMemory }}
+              maxmemory-policy noeviction
+              tcp-keepalive 60
+              requirepass $pw
+              REDISCONF
+              chown 999:999 /tmp/redis/redis.conf
+              chmod 0640 /tmp/redis/redis.conf
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: redis-auth
+              mountPath: /etc/auton-redis
+              readOnly: true
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.imagePullPolicy }}
+          # The configuration file was written by the init container from the
+          # mounted Secret; the password is not in this argument list.
+          command: ["redis-server", "/tmp/redis/redis.conf"]
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: redis-auth
+              mountPath: /etc/auton-redis
+              readOnly: true
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          # The probes must authenticate: an unauthenticated PING answers
+          # "NOAUTH Authentication required." and redis-cli still exits 0, so
+          # the probe checks the *answer*, not only the exit code.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping 2>/dev/null | grep -qx PONG'
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping 2>/dev/null | grep -qx PONG'
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 4
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ default "redis-data" .Values.redis.persistence.existingClaim }}
+        - name: tmp
+          emptyDir: {}
+        - name: redis-auth
+          secret:
+            secretName: {{ include "auton.redisSecretName" . }}
+            items:
+              - key: password
+                path: password
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+{{- end }}

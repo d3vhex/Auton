@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import time
 
+import k8s_ops
 import k8s_tools
 
 #: Reasons that mean "the container could not start at all".
@@ -72,8 +73,66 @@ def _error(message: str) -> str:
 
 
 def _query(args: list[str], namespace: str, timeout: int = 30):
-    """Read a Kubernetes object; returns ``(data, error)``."""
+    """Read a Kubernetes object with kubectl; returns ``(data, error)``."""
     return k8s_tools._query(args, namespace=namespace, timeout=timeout)
+
+
+#: The kubectl spelling of the resources the collector reads. The fallback
+#: path keeps the exact command line it always used, so a fallback is a
+#: fallback and not a behaviour change.
+_KUBECTL_NAMES = {
+    "pods": "pod",
+    "replicasets": "replicaset",
+    "deployments": "deployment",
+    "statefulsets": "statefulset",
+    "daemonsets": "daemonset",
+    "jobs": "job",
+    "nodes": "node",
+    "events": "events",
+    "persistentvolumeclaims": "pvc",
+}
+
+
+def _get(resource: str, name: str, namespace: str) -> tuple[dict | None, str]:
+    """Read one object: the direct HTTPS path first, kubectl as the fallback.
+
+    Returns ``(document, error)`` — exactly one of the two is set.
+    """
+    document = k8s_tools._direct_json(
+        f"evidence {resource}",
+        lambda: k8s_ops.get_object(resource, name, namespace))
+    if isinstance(document, str):
+        # A refusal from the API server (404/403): that is a final answer.
+        return None, document
+    if document is not None:
+        return document, ""
+    k8s_tools._fallback(f"evidence {resource}")
+    data, error = _query(["get", _KUBECTL_NAMES.get(resource, resource),
+                           name, "-o", "json"], namespace)
+    if error:
+        return None, error
+    return data, ""
+
+
+def _list(resource: str, namespace: str,
+          field_selector: str = "") -> tuple[list[dict], str]:
+    """List objects: the direct HTTPS path first, kubectl as the fallback."""
+    items = k8s_tools._direct_json(
+        f"evidence {resource}",
+        lambda: k8s_ops.list_objects(resource, namespace,
+                                     field_selector=field_selector))
+    if isinstance(items, str):
+        return [], items
+    if items is not None:
+        return items, ""
+    k8s_tools._fallback(f"evidence {resource}")
+    args = ["get", _KUBECTL_NAMES.get(resource, resource), "-o", "json"]
+    if field_selector:
+        args[2:2] = ["--field-selector", field_selector]
+    data, error = _query(args, namespace)
+    if error:
+        return [], error
+    return list((data or {}).get("items") or []), ""
 
 
 def _owner_chain(pod: dict) -> list[dict]:
@@ -96,8 +155,8 @@ def _owner_chain(pod: dict) -> list[dict]:
                              "Job", "CronJob"):
             break
         # One level deeper: the ReplicaSet that owns the pod.
-        data, error = _query(["get", "replicaset", entry["name"], "-o", "json"],
-                             (current.get("metadata") or {}).get("namespace", ""))
+        data, error = _get("replicasets", entry["name"],
+                           (current.get("metadata") or {}).get("namespace", ""))
         if error or not data:
             break
         current = data
@@ -236,14 +295,13 @@ def _probe_report(probe: dict) -> dict:
 
 def _pod_events(namespace: str, name: str) -> tuple[list[dict], bool]:
     """Warning events for one pod. Returns ``(events, available)``."""
-    data, error = _query(
-        ["get", "events", "--field-selector",
-         f"involvedObject.name={name},type=Warning", "-o", "json"],
-        namespace)
-    if error or not data:
+    items, error = _list("events", namespace,
+                         field_selector=f"involvedObject.name={name},"
+                                        f"type=Warning")
+    if error:
         return [], False
     events = []
-    for item in (data.get("items") or []):
+    for item in items:
         events.append({
             "reason": item.get("reason", ""),
             "message": (item.get("message") or "")[:500],
@@ -260,6 +318,12 @@ def _pod_events(namespace: str, name: str) -> tuple[list[dict], bool]:
 def _pod_logs(namespace: str, name: str, container: str = "",
               previous: bool = False) -> tuple[str, bool]:
     """Container logs. Returns ``(text, available)``."""
+    text = k8s_tools._direct_text(
+        "evidence logs",
+        lambda: k8s_ops.pod_logs(name, container, 100, previous, namespace))
+    if text is not None:
+        return (text or "").strip()[-4000:], True
+    k8s_tools._fallback("evidence logs")
     args = ["logs", name]
     if container:
         args += ["-c", container]
@@ -278,11 +342,9 @@ def _node_report(node_name: str) -> dict:
               "capacity": {}, "conditions": [], "pressure": {}}
     if not node_name:
         return report
-    data, error = _query(["get", "node", node_name, "-o", "json"], "default")
-    if error or not data:
-        # A namespaced read of a cluster object does not work; ask explicitly.
-        data, error = k8s_tools._query(["get", "node", node_name, "-o", "json"],
-                                       namespace=None)
+    # A node is a cluster-scoped object: the direct path knows that, so it
+    # needs no namespace.
+    data, error = _get("nodes", node_name, "")
     if error or not data:
         return report
     report["available"] = True
@@ -315,28 +377,52 @@ def _node_metrics(namespace: str, node_name: str) -> tuple[dict, bool]:
     if cached and now - cached[0] < _NODE_METRICS_CACHE_TTL:
         return cached[1], bool(cached[1])
     report: dict = {"nodes": [], "pods": []}
-    # `kubectl top nodes` is cluster scoped, so the namespace argument that
-    # `_execute` injects is ignored by the server.
-    nodes, error = k8s_tools._query(["top", "nodes", "--no-headers"],
-                                    namespace=None, timeout=15)
-    if not error:
-        for line in (nodes or "").splitlines():
-            parts = line.split()
-            if len(parts) >= 4:
-                report["nodes"].append({
-                    "name": parts[0], "cpu": parts[1], "memory": parts[2],
-                    "memory_percent": parts[3],
-                })
-    pods, error = k8s_tools._query(["top", "pods", "--no-headers"],
-                                    namespace=namespace, timeout=15)
-    if not error:
-        for line in (pods or "").splitlines():
-            parts = line.split()
-            if len(parts) >= 4:
-                report["pods"].append({
-                    "namespace": parts[0], "pod": parts[1],
-                    "cpu": parts[2], "memory": parts[3],
-                })
+    # The metrics API is cluster scoped for nodes and namespaced for pods.
+    nodes = k8s_tools._direct_json("evidence metrics",
+                                   lambda: k8s_ops.top_nodes())
+    if isinstance(nodes, list):
+        for item in nodes:
+            usage = ((item.get("usage") or {}))
+            report["nodes"].append({
+                "name": (item.get("metadata") or {}).get("name", ""),
+                "cpu": usage.get("cpu", ""),
+                "memory": usage.get("memory", ""),
+            })
+    elif nodes is None:
+        k8s_tools._fallback("evidence metrics")
+        nodes_text, error = k8s_tools._query(["top", "nodes", "--no-headers"],
+                                             namespace=None, timeout=15)
+        if not error:
+            for line in (nodes_text or "").splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    report["nodes"].append({
+                        "name": parts[0], "cpu": parts[1], "memory": parts[2],
+                        "memory_percent": parts[3],
+                    })
+    pods = k8s_tools._direct_json("evidence metrics",
+                                  lambda: k8s_ops.top_pods(namespace))
+    if isinstance(pods, list):
+        for item in pods:
+            usage = (item.get("usage") or {})
+            report["pods"].append({
+                "namespace": (item.get("metadata") or {}).get("namespace", ""),
+                "pod": (item.get("metadata") or {}).get("name", ""),
+                "cpu": usage.get("cpu", ""),
+                "memory": usage.get("memory", ""),
+            })
+    elif pods is None:
+        k8s_tools._fallback("evidence metrics")
+        pods_text, error = k8s_tools._query(["top", "pods", "--no-headers"],
+                                            namespace=namespace, timeout=15)
+        if not error:
+            for line in (pods_text or "").splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    report["pods"].append({
+                        "namespace": parts[0], "pod": parts[1],
+                        "cpu": parts[2], "memory": parts[3],
+                    })
     available = bool(report["nodes"] or report["pods"])
     _NODE_METRICS_CACHE[node_name] = (now, report if available else {})
     return (report if available else {}), available
@@ -382,10 +468,10 @@ def collect(namespace: str, kind: str = "Pod", name: str = "",
     if kind.lower() != "pod":
         # Deployments/StatefulSets are handled through their pods; there is
         # nothing pod-shaped to collect.
-        data, error = _query(["get", _plural(kind), name, "-o", "json"],
-                             namespace)
-        if error:
-            errors.append(_error(f"cannot read {kind.lower()}/{name}: {error}"))
+        data, error = _get(_plural(kind), name, namespace)
+        if error or not data:
+            errors.append(_error(
+                f"cannot read {kind.lower()}/{name}: {error or 'not found'}"))
             return document
         document["resource"]["uid"] = (data.get("metadata") or {}).get("uid", "")
         document["resource"]["labels"] = dict(
@@ -396,7 +482,7 @@ def collect(namespace: str, kind: str = "Pod", name: str = "",
         document["evidence"]["owner_available"] = True
         return document
 
-    pod, error = _query(["get", "pod", name, "-o", "json"], namespace)
+    pod, error = _get("pods", name, namespace)
     if error or not pod:
         errors.append(_error(f"cannot read pod/{name}: {error or 'not found'}"))
         return document
@@ -457,15 +543,22 @@ def collect(namespace: str, kind: str = "Pod", name: str = "",
 
 
 def _plural(kind: str) -> str:
+    """The API's plural name for a kind."""
     value = (kind or "").strip().lower()
     return {
-        "deployment": "deployment",
-        "statefulset": "statefulset",
-        "daemonset": "daemonset",
-        "replicaset": "replicaset",
-        "job": "job",
-        "persistentvolumeclaim": "pvc",
-    }.get(value, value or "pod")
+        "deployment": "deployments",
+        "statefulset": "statefulsets",
+        "daemonset": "daemonsets",
+        "replicaset": "replicasets",
+        "job": "jobs",
+        "pod": "pods",
+        "persistentvolumeclaim": "persistentvolumeclaims",
+        "pvc": "persistentvolumeclaims",
+        "service": "services",
+        "configmap": "configmaps",
+        "event": "events",
+        "node": "nodes",
+    }.get(value, value or "pods")
 
 
 def _workload_resources(workload: dict) -> dict:
@@ -493,8 +586,7 @@ def _deployment_for(namespace: str, chain: list[dict]) -> dict:
             break
     if deployment is None:
         return {}
-    data, error = _query(["get", "deployment", deployment["name"], "-o", "json"],
-                         namespace)
+    data, error = _get("deployments", deployment["name"], namespace)
     if error or not data:
         return {"kind": "Deployment", "name": deployment["name"],
                 "available": False}

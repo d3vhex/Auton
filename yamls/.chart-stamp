@@ -1,0 +1,23 @@
+{
+  "chart": "charts/auton-chart",
+  "chart_inputs_sha256": "0e5f8bc4b46529abade1a2c1a560e3ba316c646d64be8bda5086d3ec7f16b5ee",
+  "files": {
+    "agent-deployment.yaml": "0c650c62431e395f53e826a784110a5ffa1d7aaf66082c559d05afd60ea20060",
+    "auton-apps.yaml": "2b06064ea599eaf61225ad2ac3a168bda42726258180cd2f9c5bb2773c890a6b",
+    "auton-model.yaml": "76cf2a866696338e0f8ec5724b5c87b811c84c8c449a77980cc8047b170924bc",
+    "auton-ops-deployment.yaml": "d09106e9adc04ce428e2c5dd901bf216724087d30b6af9e1a181374b7ee55810",
+    "auton-policy.yaml": "2e3f28a01b30f7864d9c303c1c67de1ed77e4a3298d13e635a07f14fa47cbdd1",
+    "auton-rbac-write.yaml": "9a95463f0cd1503f18cb8b8732985afa29bcaa76bdc02b340d33b16d851aa6bb",
+    "auton-rbac.yaml": "fdf7f0b20565aabeb708671df850831e2d3bc3321b787d81e1b13900eff2665d",
+    "auton-scanner-deployment.yaml": "6450c1713f9c99f4c98f446a2e9fe5497b4f542d02bcecaf82ae12a69fca7a40",
+    "auton-worker-deployment.yaml": "1313362166df47a7e81bc3d6a88c11aade92050b8517ca57252d3f49eff29d9a",
+    "ingress.yaml": "817def07518e52614fbced299549437cd2d1129a09ae42a357ca579d129852f5",
+    "n8n-deployment.yaml": "069b32ec4748b7b043d65dd15eb75cc1719a5dfb7566ae80e75403b521afb7da",
+    "namespace.yaml": "a0d7482572d67a9da4615ee0121234d14121bdf3d11fcc833c0e3d7609f84c54",
+    "ollama-deployment.yaml": "50730c2302eb61dc51f3e2201d904206d3375933dca751fdbd752752b59e3c4e",
+    "redis.yaml": "c9bf415e10a671cacea0bcf431d98e948bcf58b91bce33d9e8ce5ea00d3a2519"
+  },
+  "render_sha256": "62b01cb387e5ed4cca10b0aff7ddf275d3460bfa38d5d29c8730e4dd1d312dd6",
+  "render_write_scope_sha256": "cd314cd78703a809e0a6d2fd288a11f29107a0642ca9382677bebaeafb512c94",
+  "values": "charts/auton-chart/values-k3d.yaml"
+}

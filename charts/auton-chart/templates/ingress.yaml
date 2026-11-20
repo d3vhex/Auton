@@ -1,0 +1,83 @@
+{{- if .Values.ingress.enabled }}
+{{- /* Two kinds, one values block:
+       Ingress      — the portable networking.k8s.io/v1 object.
+       IngressRoute — Traefik's CRD, which the k3d lab ships. It can put
+                      several hosts on one route, which the portable Ingress
+                      cannot express cleanly.
+     The raw manifests in yamls/ are generated from this template with
+     kind: IngressRoute (see charts/auton-chart/values-k3d.yaml). */ -}}
+{{- if eq .Values.ingress.kind "IngressRoute" }}
+{{- /* Group the hosts by service so two host names can share one route. */ -}}
+{{- $groups := dict }}
+{{- $order := list }}
+{{- range $host := .Values.ingress.hosts }}
+  {{- $svc := $host.service }}
+  {{- if not (hasKey $groups $svc) }}
+    {{- $_ := set $groups $svc (list) }}
+    {{- $order = append $order $svc }}
+  {{- end }}
+  {{- $_ := set $groups $svc (append (get $groups $svc) $host) }}
+{{- end }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ .Values.ingress.name }}
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  entryPoints: {{ .Values.ingress.entryPoints | toJson }}
+  routes:
+  {{- range $svc := $order }}
+    {{- $entries := get $groups $svc }}
+    {{- $match := (first $entries).match }}
+    {{- if not $match }}
+      {{- $parts := list }}
+      {{- range $entry := $entries }}
+        {{- $parts = append $parts (printf "Host(`%s`)" $entry.host) }}
+      {{- end }}
+      {{- $match = join " || " $parts }}
+    {{- end }}
+  - match: {{ $match }}
+    kind: Rule
+    services:
+    - name: {{ $svc }}
+      port: {{ (first $entries).port }}
+  {{- end }}
+{{- else }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.ingress.name }}
+  namespace: {{ include "auton.namespace" . }}
+  labels:
+    {{- include "auton.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .service }}
+                port:
+                  number: {{ .port }}
+    {{- end }}
+{{- end }}
+{{- end }}

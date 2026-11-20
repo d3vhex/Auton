@@ -1,380 +1,1148 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>Auton — Kubernetes operation agent</title>
 <style>
-  :root {
-    --bg: #0b0e14; --panel: #141922; --panel2: #1b2230; --line: #263043;
-    --text: #dbe3f0; --dim: #8b98ad; --accent: #4da3ff; --ok: #3ecf8e;
-    --warn: #f2b544; --bad: #ff6b6b; --mono: ui-monospace, SFMono-Regular,
-      Menlo, Consolas, monospace;
+/* ==========================================================================
+   Auton console — design system
+   --------------------------------------------------------------------------
+   Three token tiers, all in this file (the page ships without a bundler, a
+   CDN or an external asset, so there is nowhere else they could live):
+
+     primitive  --raw ramps, spacing, radii, motion (never used directly)
+     semantic   --the role a colour plays (bg, surface, text, border, …)
+     component  --how a component consumes the semantic tokens
+
+   The light theme overrides the *semantic* layer only, so every component
+   rule stays valid in both themes.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* -- primitive: neutral ramp ------------------------------------------ */
+  --n-950: #07090e;
+  --n-900: #0b0e14;
+  --n-870: #0e1219;
+  --n-850: #11161f;
+  --n-800: #141922;
+  --n-750: #1a2130;
+  --n-700: #222b3b;
+  --n-650: #2a3446;
+  --n-600: #334055;
+  --n-500: #45536c;
+  --n-400: #5f6e89;
+  --n-300: #8b98ad;
+  --n-250: #a4b0c2;
+  --n-200: #c2ccdb;
+  --n-100: #dde4ef;
+  --n-50:  #f3f6fb;
+
+  /* -- primitive: accents ---------------------------------------------- */
+  --blue-400: #7cbcff;
+  --blue-500: #4da3ff;
+  --blue-600: #2b85e6;
+  --green-400: #5fe0a8;
+  --green-500: #3ecf8e;
+  --amber-400: #f6c667;
+  --amber-500: #f2b544;
+  --red-400: #ff8f8f;
+  --red-500: #ff6b6b;
+  --violet-400: #a99bff;
+  --violet-500: #8b7dff;
+  --teal-500: #3ec9c9;
+
+  /* -- primitive: spacing (4px rhythm) ---------------------------------- */
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 20px; --s6: 24px; --s7: 32px; --s8: 40px;
+  --s9: 48px; --s10: 64px;
+
+  /* -- primitive: radii ------------------------------------------------- */
+  --r-xs: 4px; --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-xl: 20px;
+  --r-full: 999px;
+
+  /* -- primitive: type -------------------------------------------------- */
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* -- primitive: motion ------------------------------------------------ */
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --dur-3: 320ms;
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+
+  /* -- semantic: surfaces & text (dark is the default) ------------------ */
+  --bg: var(--n-950);
+  --bg-grad: radial-gradient(1200px 600px at 78% -10%, #14233c 0%, transparent 60%),
+             radial-gradient(900px 500px at 8% 0%, #16182e 0%, transparent 55%);
+  --surface: var(--n-870);
+  --surface-2: var(--n-800);
+  --surface-3: var(--n-750);
+  --surface-4: var(--n-700);
+  --border: var(--n-700);
+  --border-strong: var(--n-600);
+  --text: var(--n-100);
+  --text-dim: var(--n-300);
+  --text-faint: var(--n-400);
+  --accent: var(--blue-500);
+  --accent-soft: rgba(77, 163, 255, .14);
+  --accent-fg: #06121f;
+  --ok: var(--green-500);
+  --ok-soft: rgba(62, 207, 142, .14);
+  --warn: var(--amber-500);
+  --warn-soft: rgba(242, 181, 68, .14);
+  --bad: var(--red-500);
+  --bad-soft: rgba(255, 107, 107, .14);
+  --info: var(--violet-500);
+  --info-soft: rgba(139, 125, 255, .16);
+  --teal: var(--teal-500);
+  --focus: var(--blue-400);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .5);
+  --shadow-2: 0 8px 24px -8px rgba(0, 0, 0, .65);
+  --shadow-3: 0 24px 60px -18px rgba(0, 0, 0, .78);
+  --scrim: rgba(4, 6, 11, .74);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f7fc;
+  --bg-grad: radial-gradient(1100px 560px at 82% -12%, #dbe8ff 0%, transparent 62%),
+             radial-gradient(900px 500px at 4% 0%, #e6e4ff 0%, transparent 58%);
+  --surface: #ffffff;
+  --surface-2: #f7f9fd;
+  --surface-3: #eef2f9;
+  --surface-4: #e3e9f4;
+  --border: #dde4ef;
+  --border-strong: #c4cfe0;
+  --text: #101725;
+  --text-dim: #55637a;
+  --text-faint: #7b879b;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, .10);
+  --accent-fg: #ffffff;
+  --ok: #0f9d58;
+  --ok-soft: rgba(15, 157, 88, .12);
+  --warn: #b45309;
+  --warn-soft: rgba(180, 83, 9, .12);
+  --bad: #dc2626;
+  --bad-soft: rgba(220, 38, 38, .10);
+  --info: #6d28d9;
+  --info-soft: rgba(109, 40, 217, .10);
+  --focus: #1d4ed8;
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, .06);
+  --shadow-2: 0 10px 26px -12px rgba(16, 24, 40, .22);
+  --shadow-3: 0 28px 64px -20px rgba(16, 24, 40, .28);
+  --scrim: rgba(15, 23, 42, .42);
+}
+
+/* -- base ---------------------------------------------------------------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  background-image: var(--bg-grad);
+  background-attachment: fixed;
+  color: var(--text);
+  font: 14px/1.55 var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -.01em; }
+p { margin: 0; }
+a { color: var(--accent); }
+code, pre, .mono { font-family: var(--mono); }
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+::selection { background: var(--accent-soft); color: var(--text); }
+.sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+.ic {
+  width: 18px; height: 18px; flex: 0 0 auto;
+  fill: none; stroke: currentColor; stroke-width: 1.75;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ic-sm { width: 15px; height: 15px; }
+.ic-lg { width: 22px; height: 22px; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* -- app shell ----------------------------------------------------------- */
+.app {
+  display: grid;
+  grid-template-columns: 252px minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+}
+.sidebar {
+  display: flex; flex-direction: column; min-height: 0;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border-right: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+}
+.brand {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s5) var(--s5) var(--s4);
+}
+.brand-mark {
+  display: grid; place-items: center; width: 34px; height: 34px;
+  border-radius: var(--r-md); color: var(--accent-fg);
+  background: linear-gradient(140deg, var(--blue-400), var(--accent) 55%, var(--violet-500));
+  box-shadow: var(--shadow-2);
+}
+.brand-name { font-weight: 700; font-size: 15px; letter-spacing: -.02em; }
+.brand-name span { color: var(--accent); }
+.brand-sub { font-size: 11px; color: var(--text-faint); letter-spacing: .04em; text-transform: uppercase; }
+.sidebar-scroll { flex: 1; min-height: 0; overflow: auto; padding: var(--s2) var(--s3); }
+.nav-group-label {
+  padding: var(--s4) var(--s3) var(--s2);
+  font-size: 10.5px; font-weight: 700; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--text-faint);
+}
+.nav-item {
+  display: flex; align-items: center; gap: var(--s3);
+  width: 100%; margin-bottom: 2px; padding: 9px var(--s3);
+  background: transparent; border: 0; border-radius: var(--r-md);
+  color: var(--text-dim); font: inherit; font-size: 13.5px; font-weight: 500;
+  text-align: left; cursor: pointer; position: relative;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+.nav-item:hover { background: var(--surface-3); color: var(--text); }
+.nav-item[aria-selected="true"] {
+  background: var(--accent-soft); color: var(--text); font-weight: 600;
+}
+.nav-item[aria-selected="true"]::before {
+  content: ""; position: absolute; left: -11px; top: 50%; transform: translateY(-50%);
+  width: 3px; height: 20px; border-radius: var(--r-full); background: var(--accent);
+}
+.nav-item .nav-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-count {
+  min-width: 20px; padding: 1px 6px; border-radius: var(--r-full);
+  background: var(--surface-4); color: var(--text-dim);
+  font-size: 11px; font-weight: 600; text-align: center;
+}
+.nav-count:empty { display: none; }
+.nav-count.hot { background: var(--warn-soft); color: var(--warn); }
+.nav-count.crit { background: var(--bad-soft); color: var(--bad); }
+.sidebar-foot { padding: var(--s3) var(--s4) var(--s4); border-top: 1px solid var(--border); }
+.kbd-hint { font-size: 11.5px; color: var(--text-faint); display: flex; align-items: center; gap: var(--s2); }
+kbd {
+  font-family: var(--mono); font-size: 10.5px; padding: 2px 6px;
+  border: 1px solid var(--border-strong); border-bottom-width: 2px;
+  border-radius: var(--r-xs); background: var(--surface-3); color: var(--text-dim);
+}
+
+/* -- topbar -------------------------------------------------------------- */
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.topbar {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3) var(--s6);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  backdrop-filter: blur(12px);
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+.page-title { min-width: 0; flex: 0 1 auto; }
+.page-title h1 {
+  font-size: 16px; line-height: 1.25;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.page-title p { font-size: 12px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-right {
+  margin-left: auto; display: flex; align-items: center; gap: var(--s2);
+  min-width: 0; flex: 0 0 auto;
+}
+.topbar-stats { display: flex; align-items: center; gap: var(--s2); flex-wrap: nowrap; }
+.topbar-stats .chip, #provider-chip { max-width: 220px; overflow: hidden; }
+.topbar-stats .chip b, #provider-chip b {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-block; vertical-align: bottom; max-width: 150px;
+}
+.icon-btn {
+  display: grid; place-items: center; width: 34px; height: 34px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-2); color: var(--text-dim); cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease);
+}
+.icon-btn:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-3); }
+.menu-btn { display: none; }
+
+/* -- chips & badges ------------------------------------------------------ */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+  border: 1px solid var(--border); border-radius: var(--r-full);
+  background: var(--surface-2); color: var(--text-dim);
+  font-size: 11.5px; white-space: nowrap; line-height: 1.7;
+}
+.chip b { color: var(--text); font-weight: 600; }
+.chip.good { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); color: var(--ok); }
+.chip.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); color: var(--warn); }
+.chip.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); color: var(--bad); }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); flex: 0 0 auto; }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.dot.bad { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.dot.pulse { animation: pulse 2.4s var(--ease) infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.badge {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px;
+  border-radius: var(--r-full); border: 1px solid var(--border);
+  background: var(--surface-3); color: var(--text-dim);
+  font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  white-space: nowrap;
+}
+.badge.resolved, .badge.done, .badge.ok { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.badge.needs_human, .badge.pending, .badge.awaiting_approval, .badge.skipped { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.badge.failed, .badge.error, .badge.dead, .badge.quarantined { color: var(--bad); background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+.badge.detected, .badge.acting, .badge.executing, .badge.queued, .badge.claimed,
+.badge.running, .badge.verifying, .badge.triage, .badge.triaging,
+.badge.diagnosing, .badge.planning, .badge.policy_check { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.badge.suppressed, .badge.cancelled, .badge.expired, .badge.rejected, .badge.approved { color: var(--text-dim); }
+
+/* -- buttons ------------------------------------------------------------- */
+button {
+  font: inherit; color: var(--text); cursor: pointer;
+  background: var(--surface-3); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 7px 13px;
+  display: inline-flex; align-items: center; gap: 7px; justify-content: center;
+  white-space: nowrap; flex: 0 0 auto;
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+button:hover:not(:disabled) { border-color: var(--border-strong); background: var(--surface-4); }
+button:active:not(:disabled) { transform: translateY(1px); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary {
+  background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600;
+  box-shadow: 0 4px 14px -6px var(--accent);
+}
+button.primary:hover:not(:disabled) { background: var(--blue-400); border-color: var(--blue-400); }
+button.danger { color: var(--bad); }
+button.danger:hover:not(:disabled) { background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+button.ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+button.ghost:hover:not(:disabled) { background: var(--surface-3); color: var(--text); }
+button.sm { padding: 4px 9px; font-size: 12px; border-radius: var(--r-sm); }
+
+/* -- forms --------------------------------------------------------------- */
+textarea, input, select {
+  width: 100%; font: inherit; color: var(--text);
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 8px 11px;
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
+}
+textarea:focus, input:focus, select:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+textarea { min-height: 96px; resize: vertical; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
+select {
+  appearance: none; padding-right: 30px; cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-faint) 50%),
+                    linear-gradient(135deg, var(--text-faint) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 16px, calc(100% - 10px) 16px;
+  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+}
+input[type=number] { width: 120px; }
+input[type=checkbox] { width: auto; accent-color: var(--accent); }
+label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-dim); flex: 1; min-width: 150px; }
+label > span.lbl { font-weight: 600; letter-spacing: .02em; }
+.hint { font-size: 11.5px; color: var(--text-faint); }
+
+/* -- layout helpers ------------------------------------------------------ */
+main { flex: 1; min-height: 0; overflow: auto; padding: var(--s6) var(--s6) var(--s10); }
+.pane { display: none; animation: fade var(--dur-2) var(--ease-out); }
+.pane.active { display: block; }
+@keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.stack { display: flex; flex-direction: column; gap: var(--s4); }
+.grid { display: grid; gap: var(--s4); }
+.row { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; }
+.row.tight { gap: var(--s2); }
+.spacer { flex: 1; }
+.status { color: var(--text-dim); font-size: 12.5px; }
+.status.err { color: var(--bad); }
+.meta { color: var(--text-faint); font-size: 12px; }
+.section-title {
+  display: flex; align-items: center; gap: var(--s2);
+  font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-faint);
+}
+.section-title .ic { color: var(--text-faint); }
+
+/* -- cards --------------------------------------------------------------- */
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-lg); padding: var(--s5);
+  display: flex; flex-direction: column; gap: var(--s4);
+  box-shadow: var(--shadow-1);
+}
+.card-head { display: flex; align-items: center; gap: var(--s3); }
+.card-head h3 { font-size: 14px; }
+.card-head .spacer { flex: 1; }
+.card-sub { font-size: 12.5px; color: var(--text-dim); margin: 0; }
+.box {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--s3) var(--s4);
+  min-height: 160px; max-height: 56vh; overflow: auto;
+}
+.box pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.6; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.6; }
+
+/* -- stat tiles ---------------------------------------------------------- */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); gap: var(--s4); }
+.tile {
+  position: relative; overflow: hidden;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-lg); padding: var(--s4) var(--s5);
+  display: flex; flex-direction: column; gap: 6px;
+  box-shadow: var(--shadow-1);
+}
+.tile-label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--text-faint);
+}
+.tile-value { font-size: 26px; font-weight: 700; letter-spacing: -.02em; line-height: 1.15; }
+.tile-value.sm { font-size: 16px; }
+.tile-foot { font-size: 11.5px; color: var(--text-dim); }
+.tile.accent .tile-value { color: var(--accent); }
+.tile.ok .tile-value { color: var(--ok); }
+.tile.warn .tile-value { color: var(--warn); }
+.tile.bad .tile-value { color: var(--bad); }
+.tile-accent-bar { position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--accent); }
+.tile.ok .tile-accent-bar { background: var(--ok); }
+.tile.warn .tile-accent-bar { background: var(--warn); }
+.tile.bad .tile-accent-bar { background: var(--bad); }
+
+/* -- bars & charts ------------------------------------------------------- */
+.bars { display: flex; flex-direction: column; gap: 9px; }
+.bar-row { display: grid; grid-template-columns: 128px 1fr 54px; align-items: center; gap: var(--s3); font-size: 12px; }
+.bar-name { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { height: 7px; border-radius: var(--r-full); background: var(--surface-3); overflow: hidden; }
+.bar-fill { height: 100%; border-radius: var(--r-full); background: var(--accent); transition: width var(--dur-3) var(--ease-out); }
+.bar-val { text-align: right; font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.donut-wrap { display: flex; align-items: center; gap: var(--s5); flex-wrap: wrap; }
+.donut { width: 132px; height: 132px; flex: 0 0 auto; }
+.donut circle { fill: none; stroke-width: 14; transform: rotate(-90deg); transform-origin: 50% 50%; }
+.donut-track { stroke: var(--surface-3); }
+.legend { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
+.legend-row { display: flex; align-items: center; gap: var(--s2); color: var(--text-dim); }
+.legend-row b { color: var(--text); font-family: var(--mono); font-weight: 600; }
+.swatch { width: 9px; height: 9px; border-radius: 3px; flex: 0 0 auto; }
+
+/* -- lists --------------------------------------------------------------- */
+.list { display: flex; flex-direction: column; gap: var(--s3); }
+.item {
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-2); padding: var(--s3) var(--s4);
+  display: flex; flex-direction: column; gap: 7px;
+  transition: border-color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+.item.clickable { cursor: pointer; }
+.item.clickable:hover { border-color: var(--accent); background: var(--surface-3); }
+.item-top { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.item-title { font-weight: 600; flex: 1; min-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-id { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); }
+.item-meta { font-size: 11.5px; color: var(--text-faint); display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
+.item-meta > span { display: inline-flex; align-items: center; gap: 4px; }
+
+/* -- incident timeline --------------------------------------------------- */
+.track { display: flex; align-items: flex-start; gap: 0; overflow-x: auto; padding: var(--s2) 0 var(--s3); }
+.track-node { display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 0 0 auto; min-width: 74px; }
+.track-dot {
+  width: 13px; height: 13px; border-radius: 50%;
+  border: 2px solid var(--border-strong); background: var(--surface);
+}
+.track-node.done .track-dot { border-color: var(--accent); background: var(--accent); }
+.track-node.current .track-dot {
+  border-color: var(--accent); background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+.track-node.ok .track-dot { border-color: var(--ok); background: var(--ok); }
+.track-node.bad .track-dot { border-color: var(--bad); background: var(--bad); }
+.track-node.warn .track-dot { border-color: var(--warn); background: var(--warn); }
+.track-label { font-size: 9.5px; letter-spacing: .05em; color: var(--text-faint); text-align: center; text-transform: uppercase; white-space: nowrap; }
+.track-node.current .track-label, .track-node.done .track-label { color: var(--text-dim); }
+.track-line { flex: 1 1 14px; height: 2px; background: var(--border); margin-top: 6px; min-width: 12px; }
+.track-line.done { background: var(--accent); }
+
+/* -- key/value grid ------------------------------------------------------ */
+.kv { display: grid; grid-template-columns: minmax(110px, auto) 1fr; gap: 7px var(--s4); font-size: 12.5px; }
+.kv dt { color: var(--text-faint); }
+.kv dd { margin: 0; word-break: break-word; }
+.meter { height: 6px; border-radius: var(--r-full); background: var(--surface-3); overflow: hidden; }
+.meter > i { display: block; height: 100%; background: var(--accent); border-radius: var(--r-full); }
+.meter.good > i { background: var(--ok); }
+.meter.warn > i { background: var(--warn); }
+.meter.bad > i { background: var(--bad); }
+
+/* -- tables -------------------------------------------------------------- */
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--text-faint); font-weight: 600; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; position: sticky; top: 0; background: var(--surface-2); z-index: 1; }
+tbody tr:hover { background: var(--surface-3); }
+td.mono { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+td.num { font-family: var(--mono); text-align: right; }
+
+/* -- chat ---------------------------------------------------------------- */
+.composer { position: relative; }
+.composer textarea { min-height: 104px; padding-bottom: 42px; }
+.composer-foot {
+  position: absolute; left: var(--s3); right: var(--s3); bottom: var(--s3);
+  display: flex; align-items: center; gap: var(--s2);
+}
+.chat-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s4); }
+.answer {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--s4);
+  font-size: 13.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+}
+.logbox {
+  background: var(--n-950); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: var(--s3) var(--s4); max-height: 420px; overflow: auto;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6; color: var(--n-250);
+}
+[data-theme="light"] .logbox { background: #0e1522; color: #c3cee0; }
+.logbox .ln { display: block; white-space: pre-wrap; word-break: break-word; }
+.logbox .ln.tool { color: var(--blue-400); }
+.logbox .ln.err { color: var(--red-400); }
+.logbox .ln.ok { color: var(--green-400); }
+.steps { display: flex; flex-direction: column; gap: 6px; }
+.step {
+  display: flex; align-items: flex-start; gap: var(--s3);
+  padding: 7px var(--s3); border-radius: var(--r-sm);
+  background: var(--surface-2); border: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.step .ic { color: var(--accent); margin-top: 1px; }
+.step-body { flex: 1; min-width: 0; }
+.step-name { font-family: var(--mono); font-weight: 600; font-size: 12px; }
+.step-text { color: var(--text-dim); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+
+/* -- auth ---------------------------------------------------------------- */
+.banner {
+  display: flex; gap: var(--s3); align-items: center; padding: 10px var(--s6);
+  background: var(--warn-soft); border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  color: var(--warn); font-size: 13px;
+}
+.banner b { color: var(--text); }
+.banner .ic { flex: 0 0 auto; }
+.banner .spacer { flex: 1; }
+.banner button { background: transparent; border-color: color-mix(in srgb, var(--warn) 50%, transparent); color: var(--warn); }
+
+/* -- modal --------------------------------------------------------------- */
+.modal {
+  position: fixed; inset: 0; background: var(--scrim);
+  display: flex; align-items: center; justify-content: center; padding: var(--s6);
+  z-index: 60; backdrop-filter: blur(3px);
+  animation: fade var(--dur-2) var(--ease-out);
+}
+.modal-card {
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--r-xl); padding: var(--s6); width: min(640px, 100%);
+  max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: var(--s4);
+  box-shadow: var(--shadow-3);
+}
+.modal-card h2 { font-size: 17px; }
+.modal-card h3 {
+  font-size: 11px; color: var(--text-faint); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .07em; margin-top: var(--s2);
+}
+.modal-card p { font-size: 13px; color: var(--text-dim); }
+.modal-card code { font-size: 12.5px; background: var(--surface-3); padding: 1px 5px; border-radius: var(--r-xs); }
+.cmd { display: flex; gap: var(--s2); align-items: stretch; }
+.cmd pre {
+  flex: 1; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 9px 11px; overflow: auto; font-size: 12px;
+}
+.keyrow { display: flex; gap: var(--s2); align-items: flex-end; }
+.keyrow label { flex: 1; }
+
+/* -- command palette ----------------------------------------------------- */
+.palette-card { width: min(560px, 100%); padding: var(--s3); gap: var(--s2); }
+.palette-input {
+  display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+}
+.palette-input input { border: 0; background: transparent; font-size: 15px; padding: 6px 0; }
+.palette-input input:focus { box-shadow: none; }
+.palette-list { max-height: 46vh; overflow: auto; display: flex; flex-direction: column; gap: 2px; }
+.palette-item {
+  display: flex; align-items: center; gap: var(--s3); width: 100%;
+  padding: 9px var(--s3); border: 0; border-radius: var(--r-md);
+  background: transparent; color: var(--text-dim); text-align: left; font-size: 13px;
+}
+.palette-item:hover, .palette-item.sel { background: var(--accent-soft); color: var(--text); }
+.palette-item .spacer { flex: 1; }
+.palette-empty { padding: var(--s5); text-align: center; color: var(--text-faint); font-size: 13px; }
+
+/* -- toasts -------------------------------------------------------------- */
+.toasts {
+  position: fixed; right: var(--s5); bottom: var(--s5); z-index: 70;
+  display: flex; flex-direction: column; gap: var(--s2); align-items: flex-end;
+  pointer-events: none;
+}
+.toast {
+  display: flex; align-items: center; gap: var(--s2);
+  background: var(--surface-3); border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--accent); border-radius: var(--r-md);
+  padding: 10px 14px; max-width: 420px; font-size: 13px;
+  box-shadow: var(--shadow-2); pointer-events: auto;
+  animation: toast-in var(--dur-3) var(--ease-out);
+}
+.toast.bad { border-left-color: var(--bad); }
+.toast.good { border-left-color: var(--ok); }
+.toast .ic { color: var(--accent); }
+.toast.bad .ic { color: var(--bad); }
+.toast.good .ic { color: var(--ok); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* -- skeletons & empty --------------------------------------------------- */
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 37%, var(--surface-2) 63%);
+  background-size: 400% 100%; animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--r-sm); height: 13px;
+}
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+.empty {
+  display: flex; flex-direction: column; align-items: center; gap: var(--s3);
+  padding: var(--s8) var(--s5); text-align: center;
+  border: 1px dashed var(--border-strong); border-radius: var(--r-lg);
+  color: var(--text-faint); font-size: 13px;
+}
+.empty .ic { width: 30px; height: 30px; color: var(--text-faint); opacity: .7; }
+.empty b { color: var(--text-dim); font-weight: 600; }
+.hidden { display: none !important; }
+
+/* -- responsive ---------------------------------------------------------- */
+@media (max-width: 1320px) {
+  #provider-chip { display: none; }
+}
+@media (max-width: 1120px) {
+  .topbar-stats { display: none; }
+}
+@media (max-width: 1180px) {
+  .app { grid-template-columns: 68px minmax(0, 1fr); }
+  .sidebar { align-items: stretch; }
+  .brand { justify-content: center; padding: var(--s5) 0 var(--s4); }
+  .brand-text, .nav-label, .nav-group-label, .kbd-hint, .nav-count { display: none; }
+  .nav-item { justify-content: center; padding: 11px 0; }
+  .nav-item[aria-selected="true"]::before { left: -8px; }
+  .sidebar-scroll { padding: var(--s2) 10px; }
+  .sidebar-foot { display: none; }
+}
+@media (max-width: 860px) {
+  .chat-grid { grid-template-columns: minmax(0, 1fr); }
+  main { padding: var(--s4) var(--s4) var(--s8); }
+  .topbar { padding: var(--s3) var(--s4); }
+  .page-title p { display: none; }
+}
+@media (max-width: 680px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0; width: 250px; z-index: 55;
+    transform: translateX(-100%); transition: transform var(--dur-3) var(--ease-out);
+    box-shadow: var(--shadow-3); background: var(--surface);
   }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; }
-  body {
-    background: var(--bg); color: var(--text); font: 14px/1.5 system-ui,
-      -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column;
+  .sidebar.open { transform: none; }
+  .brand-text, .nav-label, .nav-group-label, .nav-count { display: revert; }
+  .nav-item { justify-content: flex-start; padding: 10px var(--s3); }
+  .menu-btn { display: grid; }
+  .scrim { position: fixed; inset: 0; background: var(--scrim); z-index: 54; }
+  .tiles { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  #token-chip { display: none; }
+  .kv { grid-template-columns: 1fr; gap: 2px var(--s3); }
+  .kv dd { margin-bottom: 6px; }
+}
+@media (max-width: 520px) {
+  #token-btn .btn-label { display: none; }
+  #token-btn { padding: 7px 9px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important; scroll-behavior: auto !important;
   }
-  header {
-    display: flex; align-items: center; gap: 14px; padding: 10px 18px;
-    border-bottom: 1px solid var(--line); background: var(--panel);
-  }
-  .logo { font-weight: 700; letter-spacing: .5px; font-size: 16px; }
-  .logo span { color: var(--accent); }
-  .chip {
-    display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px;
-    border: 1px solid var(--line); border-radius: 999px; font-size: 12px;
-    color: var(--dim); white-space: nowrap;
-  }
-  .chip b { color: var(--text); font-weight: 600; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
-  .dot.ok { background: var(--ok); }
-  .dot.bad { background: var(--bad); }
-  .dot.warn { background: var(--warn); }
-  .spacer { flex: 1; }
-  nav {
-    display: flex; gap: 4px; padding: 8px 18px 0; background: var(--panel);
-    border-bottom: 1px solid var(--line);
-  }
-  nav button {
-    background: transparent; color: var(--dim); border: 0;
-    border-bottom: 2px solid transparent; padding: 8px 14px; cursor: pointer;
-    font: inherit;
-  }
-  nav button.active { color: var(--text); border-bottom-color: var(--accent); }
-  main { flex: 1; overflow: auto; padding: 16px 18px 28px; }
-  .pane { display: none; }
-  .pane.active { display: block; }
-  .card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    padding: 14px; display: flex; flex-direction: column; gap: 12px;
-  }
-  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .box {
-    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 10px; min-height: 180px; max-height: 55vh; overflow: auto;
-  }
-  .box h3 { margin: 0 0 8px; font-size: 12px; color: var(--dim); font-weight: 500; }
-  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; }
-  textarea, input, select {
-    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-    border-radius: 8px; padding: 8px 10px; font: inherit; width: 100%;
-  }
-  textarea { min-height: 92px; resize: vertical; font-family: var(--mono); font-size: 12.5px; }
-  input[type=number] { width: 110px; }
-  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); flex: 1; min-width: 150px; }
-  button {
-    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-    border-radius: 8px; padding: 7px 13px; cursor: pointer; font: inherit;
-  }
-  button:hover { border-color: var(--accent); }
-  button:disabled { opacity: .55; cursor: not-allowed; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
-  button.danger { color: var(--bad); }
-  .status { color: var(--dim); font-size: 12.5px; }
-  .status.err { color: var(--bad); }
-  .list { display: flex; flex-direction: column; gap: 10px; }
-  .incident { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel2); cursor: pointer; }
-  .incident:hover { border-color: var(--accent); }
-  .incident .top { display: flex; gap: 10px; align-items: center; }
-  .incident .id { font-family: var(--mono); font-size: 12px; color: var(--dim); }
-  .incident .sum { flex: 1; }
-  .badge { padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); text-transform: uppercase; letter-spacing: .4px; }
-  .badge.resolved, .badge.done { color: var(--ok); border-color: #1f5a41; }
-  .badge.needs_human { color: var(--warn); border-color: #5c4720; }
-  .badge.failed, .badge.error { color: var(--bad); border-color: #5a2a2a; }
-  .badge.detected, .badge.acting, .badge.queued, .badge.claimed,
-  .badge.running, .badge.verifying { color: var(--accent); border-color: #234a72; }
-  .badge.skipped, .badge.cancelled { color: var(--dim); }
-  .meta { color: var(--dim); font-size: 12px; margin-top: 3px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--bg); }
-  td.mono { font-family: var(--mono); font-size: 12px; }
-  .hidden { display: none !important; }
-  .toast { position: fixed; right: 18px; bottom: 18px; background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 8px; max-width: 420px; z-index: 40; }
-  /* Auth banner: always visible while the page is open but the token is not. */
-  .banner {
-    display: flex; gap: 10px; align-items: center; padding: 9px 18px;
-    background: #2a2410; border-bottom: 1px solid #5c4720; color: #f2dfae;
-    font-size: 13px;
-  }
-  .banner b { color: #ffe9b8; }
-  .banner .spacer { flex: 1; }
-  /* Modal */
-  .modal {
-    position: fixed; inset: 0; background: rgba(4, 7, 12, .72);
-    display: flex; align-items: center; justify-content: center; padding: 18px;
-    z-index: 50;
-  }
-  .modal-card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-    padding: 20px 22px; width: min(620px, 100%); max-height: 92vh; overflow: auto;
-    display: flex; flex-direction: column; gap: 12px;
-  }
-  .modal-card h2 { margin: 0; font-size: 17px; }
-  .modal-card h3 { margin: 6px 0 0; font-size: 12px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
-  .modal-card p { margin: 0; font-size: 13px; color: #c3cee0; }
-  .modal-card code { font-family: var(--mono); font-size: 12.5px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
-  .cmd { display: flex; gap: 8px; align-items: stretch; }
-  .cmd pre { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; overflow: auto; }
-  .keyrow { display: flex; gap: 8px; align-items: flex-end; }
-  .keyrow label { flex: 1; }
-  @media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="logo">Auton<span>.</span></div>
-  <span class="chip"><span id="health-dot" class="dot"></span><b id="health-text">checking…</b></span>
-  <span class="chip">provider <b id="provider-name">—</b></span>
-  <span class="chip">model <b id="model-name">—</b></span>
-  <span class="spacer"></span>
-  <span class="chip" id="token-chip">token <b id="token-state">not set</b></span>
-  <button id="token-btn">API access</button>
-</header>
 
-<div class="banner hidden" id="auth-banner">
-  <span><b>Read-only mode.</b> The page is public, but running tasks, the task
-    queue, incidents, audit and provider settings need the API token.</span>
-  <span class="spacer"></span>
-  <button id="banner-token">Add token</button>
+<!-- Icon sprite: one consistent 1.75px stroke family, inline (no icon font). -->
+<svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><path d="M22 7 13.5 15.5l-5-5L2 17"/><path d="M16 7h6v6"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 8.3-8.3 2 2-1.5 1.5 1.5 1.5-2 2-1.5-1.5-1.5 1.5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><path d="m21 8-9-5-9 5v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5M3 17l9 5 9-5"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></symbol>
+</svg>
+
+<div class="app">
+  <!-- Sidebar ------------------------------------------------------------ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-mark"><svg class="ic" aria-hidden="true"><use href="#i-layers"/></svg></span>
+      <span class="brand-text">
+        <span class="brand-name">Auton<span>.</span></span>
+        <span class="brand-sub">ops agent</span>
+      </span>
+    </div>
+    <div class="sidebar-scroll">
+      <div class="nav-group-label">Operate</div>
+      <nav role="tablist" aria-orientation="vertical" aria-label="Sections" id="tabs">
+        <button class="nav-item" role="tab" data-tab="overview" aria-selected="true" aria-controls="pane-overview" id="tab-overview">
+          <svg class="ic" aria-hidden="true"><use href="#i-grid"/></svg><span class="nav-label">Overview</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="chat" aria-selected="false" aria-controls="pane-chat" id="tab-chat">
+          <svg class="ic" aria-hidden="true"><use href="#i-chat"/></svg><span class="nav-label">Chat</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="incidents" aria-selected="false" aria-controls="pane-incidents" id="tab-incidents">
+          <svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span class="nav-label">Incidents</span><span class="nav-count" id="nav-count-incidents"></span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="approvals" aria-selected="false" aria-controls="pane-approvals" id="tab-approvals">
+          <svg class="ic" aria-hidden="true"><use href="#i-shield"/></svg><span class="nav-label">Approvals</span><span class="nav-count" id="nav-count-approvals"></span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="tasks" aria-selected="false" aria-controls="pane-tasks" id="tab-tasks">
+          <svg class="ic" aria-hidden="true"><use href="#i-list"/></svg><span class="nav-label">Tasks</span><span class="nav-count" id="nav-count-tasks"></span>
+        </button>
+        <div class="nav-group-label">Observe</div>
+        <button class="nav-item" role="tab" data-tab="learning" aria-selected="false" aria-controls="pane-learning" id="tab-learning">
+          <svg class="ic" aria-hidden="true"><use href="#i-trend"/></svg><span class="nav-label">Learning</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="audit" aria-selected="false" aria-controls="pane-audit" id="tab-audit">
+          <svg class="ic" aria-hidden="true"><use href="#i-file"/></svg><span class="nav-label">Audit</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="provider" aria-selected="false" aria-controls="pane-provider" id="tab-provider">
+          <svg class="ic" aria-hidden="true"><use href="#i-cpu"/></svg><span class="nav-label">Provider</span>
+        </button>
+      </nav>
+    </div>
+    <div class="sidebar-foot">
+      <div class="kbd-hint">
+        <svg class="ic ic-sm" aria-hidden="true"><use href="#i-search"/></svg>
+        <span>Command palette</span><kbd id="kbd-palette">Ctrl K</kbd>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main --------------------------------------------------------------- -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menu-btn" aria-label="Open navigation" aria-expanded="false">
+        <svg class="ic" aria-hidden="true"><use href="#i-menu"/></svg>
+      </button>
+      <div class="page-title">
+        <h1 id="page-title">Overview</h1>
+        <p id="page-sub">Live platform state</p>
+      </div>
+      <div class="topbar-right">
+        <div class="topbar-stats" id="topbar-stats"></div>
+        <span class="chip" id="health-chip"><span id="health-dot" class="dot"></span><b id="health-text">checking…</b></span>
+        <span class="chip" id="provider-chip"><b id="provider-name">—</b> · <b id="model-name">—</b></span>
+        <button class="icon-btn" id="theme-toggle" aria-label="Switch to light theme" title="Switch theme">
+          <svg class="ic" aria-hidden="true"><use href="#i-sun" id="theme-icon"/></svg>
+        </button>
+        <span class="chip" id="token-chip"><span id="token-state">not set</span></span>
+        <button id="token-btn" aria-label="API access token"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-key"/></svg><span class="btn-label">API access</span></button>
+      </div>
+    </header>
+
+    <div class="banner hidden" id="auth-banner" role="status">
+      <svg class="ic" aria-hidden="true"><use href="#i-key"/></svg>
+      <span><b>Read-only mode.</b> This page is public and holds no data, but running
+        tasks, reading incidents or audit records and changing provider settings
+        all need the API token.</span>
+      <span class="spacer"></span>
+      <button id="banner-token">Add token</button>
+    </div>
+
+    <main id="main">
+      <!-- Overview ------------------------------------------------------- -->
+      <section class="pane active" id="pane-overview" role="tabpanel" aria-labelledby="tab-overview">
+        <div class="stack">
+          <div class="tiles" id="ov-tiles"></div>
+          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr))">
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-db"/></svg>
+                <h3>Queue depth</h3><span class="spacer"></span>
+                <span class="status" id="ov-queue-status">—</span>
+              </div>
+              <div class="bars" id="ov-queue"></div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg>
+                <h3>Incidents by state</h3><span class="spacer"></span>
+                <span class="status" id="ov-incident-status">—</span>
+              </div>
+              <div class="donut-wrap" id="ov-incidents"></div>
+            </div>
+          </div>
+          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr))">
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-eye"/></svg>
+                <h3>Watcher streams</h3><span class="spacer"></span>
+                <span class="status" id="ov-watch-status">—</span>
+              </div>
+              <div class="box" style="min-height:0"><table>
+                <thead><tr><th>resource</th><th>state</th><th>events</th><th>errors</th><th class="num">version</th></tr></thead>
+                <tbody id="ov-watchers"></tbody>
+              </table></div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-activity"/></svg>
+                <h3>Workers & transport</h3><span class="spacer"></span>
+                <span class="status" id="ov-worker-status">—</span>
+              </div>
+              <div class="list" id="ov-workers"></div>
+              <div id="ov-transport"></div>
+            </div>
+          </div>
+          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr))">
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg>
+                <h3>Recent incidents</h3><span class="spacer"></span>
+                <button class="sm ghost" id="ov-goto-incidents">Open incidents<svg class="ic ic-sm" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+              </div>
+              <div class="list" id="ov-recent"></div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-shield"/></svg>
+                <h3>Policy & approvals</h3><span class="spacer"></span>
+                <button class="sm ghost" id="ov-goto-approvals">Open approvals<svg class="ic ic-sm" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+              </div>
+              <div class="list" id="ov-policy"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Chat ----------------------------------------------------------- -->
+      <section class="pane" id="pane-chat" role="tabpanel" aria-labelledby="tab-chat">
+        <div class="stack">
+          <div class="card">
+            <div class="composer">
+              <textarea id="task" aria-label="Task for the agent" placeholder="Ask Auton to inspect, diagnose or change something — e.g. “Why is api-1 crashlooping in auton-apps? Summarise the evidence.”"></textarea>
+              <div class="composer-foot">
+                <button class="primary" id="run"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-play"/></svg>Run task</button>
+                <button class="danger hidden" id="cancel"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-stop"/></svg>Cancel</button>
+                <span class="status" id="chat-status" role="status" aria-live="polite"></span>
+                <span class="spacer"></span>
+                <span class="hint"><kbd>Ctrl</kbd> <kbd>↵</kbd> to run</span>
+              </div>
+            </div>
+          </div>
+          <div class="chat-grid">
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-list"/></svg>
+                <h3>Steps</h3><span class="spacer"></span>
+                <button class="sm ghost" id="chat-copy-log">Copy log</button>
+              </div>
+              <div class="steps" id="chat-steps"></div>
+              <div class="logbox" id="log">No run yet.</div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <svg class="ic" aria-hidden="true"><use href="#i-chat"/></svg>
+                <h3>Answer</h3><span class="spacer"></span>
+                <button class="sm ghost" id="chat-copy-answer">Copy</button>
+              </div>
+              <div class="answer" id="answer"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Incidents ------------------------------------------------------ -->
+      <section class="pane" id="pane-incidents" role="tabpanel" aria-labelledby="tab-incidents">
+        <div class="stack">
+          <div class="card">
+            <div class="row">
+              <div class="section-title"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-filter"/></svg>Filter</div>
+              <select id="incident-filter" style="width:auto" aria-label="Incident status">
+                <option value="">all statuses</option>
+                <option value="needs_human">needs human</option>
+                <option value="resolved">resolved</option>
+                <option value="failed">failed</option>
+                <option value="detected">detected</option>
+                <option value="acting">acting</option>
+              </select>
+              <button id="incident-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+              <span class="status" id="incident-status" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+          <div class="list" id="incident-list"></div>
+        </div>
+      </section>
+
+      <!-- Tasks ---------------------------------------------------------- -->
+      <section class="pane" id="pane-tasks" role="tabpanel" aria-labelledby="tab-tasks">
+        <div class="stack">
+          <div class="card">
+            <div class="row">
+              <select id="task-queue" style="width:auto" aria-label="Queue">
+                <option value="">all queues</option>
+                <option value="repair">repair (scanner + manual)</option>
+                <option value="agent">agent (LLM)</option>
+              </select>
+              <select id="task-status" style="width:auto" aria-label="Status">
+                <option value="">all statuses</option>
+                <option value="queued">queued</option>
+                <option value="running">running</option>
+                <option value="resolved">resolved</option>
+                <option value="needs_human">needs human</option>
+                <option value="failed">failed</option>
+                <option value="skipped">skipped</option>
+                <option value="done">done (agent)</option>
+                <option value="error">error (agent)</option>
+                <option value="cancelled">cancelled</option>
+              </select>
+              <button id="task-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+              <span class="status" id="task-status-line" role="status" aria-live="polite"></span>
+            </div>
+            <div class="row tight" id="task-stats"></div>
+          </div>
+          <div class="list" id="task-detail"></div>
+          <div class="list" id="task-list"></div>
+          <div class="card">
+            <div class="card-head">
+              <svg class="ic" aria-hidden="true"><use href="#i-box"/></svg>
+              <h3>Manual repair</h3>
+            </div>
+            <p class="card-sub">
+              Queues a repair task for the workers. They still check the
+              <code>auton-apps</code> allowlist, the resource lock, the cooldown and
+              the hourly budget, and every kubectl call is audit-gated. Image, config,
+              scheduling and PVC problems stay report-only.
+            </p>
+            <div class="row">
+              <label><span class="lbl">kind</span>
+                <select id="m-kind">
+                  <option value="Pod">Pod</option>
+                  <option value="Deployment">Deployment</option>
+                  <option value="StatefulSet">StatefulSet</option>
+                  <option value="PersistentVolumeClaim">PersistentVolumeClaim</option>
+                </select>
+              </label>
+              <label><span class="lbl">name</span>
+                <input id="m-name" placeholder="api-1" autocomplete="off">
+              </label>
+              <label><span class="lbl">namespace</span>
+                <input id="m-ns" value="auton-apps" autocomplete="off">
+              </label>
+              <label><span class="lbl">cause</span>
+                <select id="m-cause"></select>
+              </label>
+            </div>
+            <div class="row">
+              <label style="flex-direction:row;align-items:center;gap:6px;min-width:0;flex:0">
+                <input id="m-force" type="checkbox" checked style="width:auto">
+                ignore cooldown (budget still applies)
+              </label>
+              <button class="primary" id="m-submit"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-play"/></svg>Queue repair</button>
+              <span class="status" id="m-status" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Approvals ------------------------------------------------------ -->
+      <section class="pane" id="pane-approvals" role="tabpanel" aria-labelledby="tab-approvals">
+        <div class="stack">
+          <div class="card">
+            <div class="row">
+              <select id="approval-filter" style="width:auto" aria-label="Approval status">
+                <option value="pending">pending</option>
+                <option value="">all</option>
+                <option value="approved">approved</option>
+                <option value="rejected">rejected</option>
+                <option value="executed">executed</option>
+                <option value="expired">expired</option>
+              </select>
+              <button id="approval-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+              <span class="status" id="approval-status" role="status" aria-live="polite"></span>
+            </div>
+            <p class="card-sub">
+              A repair plan that the policy engine rated above the automatic tier
+              waits here. Nothing in the cluster changes until somebody approves it;
+              rejecting sends the incident back to a human.
+            </p>
+            <div class="list" id="approval-list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <svg class="ic" aria-hidden="true"><use href="#i-shield"/></svg>
+              <h3>Policy</h3><span class="spacer"></span>
+              <span class="status" id="policy-status" role="status" aria-live="polite"></span>
+            </div>
+            <div class="row">
+              <label><span class="lbl">mode</span>
+                <select id="policy-mode">
+                  <option value="">…</option>
+                  <option value="disabled">disabled</option>
+                  <option value="observe-only">observe-only</option>
+                  <option value="safe-auto">safe-auto</option>
+                  <option value="approval-required">approval-required</option>
+                </select>
+              </label>
+              <button id="policy-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+            </div>
+            <div class="box" style="min-height:0"><pre id="policy-view">…</pre></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Learning ------------------------------------------------------- -->
+      <section class="pane" id="pane-learning" role="tabpanel" aria-labelledby="tab-learning">
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <svg class="ic" aria-hidden="true"><use href="#i-trend"/></svg>
+              <h3>Learned profiles</h3><span class="spacer"></span>
+              <button id="learning-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+              <span class="status" id="learning-status" role="status" aria-live="polite"></span>
+            </div>
+            <p class="card-sub">
+              Every verified repair writes an outcome, and the outcomes change how the
+              <em>next</em> repair of the same resource is done. Learning may only make
+              the platform more cautious or tune a bounded number: a bigger OOM bump, a
+              higher tier (a human has to approve), a longer cooldown, a smaller
+              per-resource budget, or a quarantine. It never widens permissions, never
+              lowers a tier and never changes the action — and every adaptation is
+              written to the audit log before it is applied.
+            </p>
+            <div class="list" id="learning-profiles"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>
+              <h3>Repair outcomes</h3>
+            </div>
+            <div class="box" style="min-height:0"><pre id="learning-outcomes">—</pre></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Audit ---------------------------------------------------------- -->
+      <section class="pane" id="pane-audit" role="tabpanel" aria-labelledby="tab-audit">
+        <div class="card">
+          <div class="card-head">
+            <svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>
+            <h3>Audit log</h3><span class="spacer"></span>
+            <button id="audit-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+            <span class="status" id="audit-status" role="status" aria-live="polite"></span>
+          </div>
+          <div class="box" style="min-height:0;max-height:70vh">
+            <table>
+              <thead><tr><th>time</th><th>action</th><th>target</th><th>phase</th><th>incident</th><th>audit id</th></tr></thead>
+              <tbody id="audit-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Provider ------------------------------------------------------- -->
+      <section class="pane" id="pane-provider" role="tabpanel" aria-labelledby="tab-provider">
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <svg class="ic" aria-hidden="true"><use href="#i-cpu"/></svg>
+              <h3>Model provider</h3><span class="spacer"></span>
+              <span class="status" id="provider-status" role="status" aria-live="polite"></span>
+            </div>
+            <div class="row">
+              <label><span class="lbl">Provider</span>
+                <select id="p-provider"></select>
+              </label>
+              <label><span class="lbl">Model</span>
+                <input id="p-model" placeholder="qwen2.5-coder:7b-instruct">
+              </label>
+            </div>
+            <div class="row">
+              <label><span class="lbl">Base URL</span>
+                <input id="p-base" placeholder="http://ollama-service:11434">
+              </label>
+              <label><span class="lbl">Max tokens</span>
+                <input id="p-tokens" type="number" min="64" max="8192" step="1">
+              </label>
+              <label><span class="lbl">Data policy</span>
+                <select id="p-policy">
+                  <option value="redact">redact — mask secrets before leaving the cluster</option>
+                  <option value="allow">allow — send messages unchanged</option>
+                  <option value="local-only">local-only — refuse remote providers</option>
+                </select>
+              </label>
+            </div>
+            <div class="row keyrow">
+              <label><span class="lbl">API key (write-only)</span>
+                <input id="p-key" type="password" autocomplete="new-password"
+                       placeholder="leave blank to keep the current key">
+              </label>
+              <button id="p-key-toggle" type="button"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-eye"/></svg>Show</button>
+            </div>
+            <div class="row">
+              <button class="primary" id="provider-save"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-check"/></svg>Save settings</button>
+              <button class="danger" id="provider-clear-key">Clear API key</button>
+              <button id="provider-test">Send test completion</button>
+              <button id="provider-reload"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+            </div>
+            <p class="meta">
+              Switching to a remote provider disables the local model completely — there
+              is no fallback. <code>local-only</code> refuses remote providers, and a
+              remote provider without a key is rejected. The key is never returned by
+              the API; changes are written to the <code>auton-model-config</code>
+              ConfigMap and the <code>auton-model</code> Secret and audited without the
+              key value.
+            </p>
+            <div class="box" style="min-height:0"><pre id="provider-json">—</pre></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
 </div>
 
-<nav>
-  <button data-tab="chat" class="active">Chat</button>
-  <button data-tab="incidents">Incidents</button>
-  <button data-tab="approvals">Approvals</button>
-  <button data-tab="tasks">Tasks</button>
-  <button data-tab="audit">Audit</button>
-  <button data-tab="provider">Provider</button>
-</nav>
-
-<main>
-  <!-- Chat ------------------------------------------------------------- -->
-  <section class="pane active" id="pane-chat">
-    <div class="card">
-      <div class="row">
-        <textarea id="task" placeholder="Ask Auton to inspect, diagnose or change something. Example: &quot;Why is api-1 crashlooping in auton-apps? Summarise the evidence.&quot;"></textarea>
-      </div>
-      <div class="row">
-        <button class="primary" id="run">Run task</button>
-        <button class="danger hidden" id="cancel">Cancel</button>
-        <span class="status" id="chat-status"></span>
-      </div>
-      <div class="split">
-        <div class="box"><h3>Steps</h3><pre id="log">No run yet.</pre></div>
-        <div class="box"><h3>Answer</h3><pre id="answer"></pre></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Incidents -------------------------------------------------------- -->
-  <section class="pane" id="pane-incidents">
-    <div class="card">
-      <div class="row">
-        <select id="incident-filter" style="width:auto">
-          <option value="">all statuses</option>
-          <option value="needs_human">needs human</option>
-          <option value="resolved">resolved</option>
-          <option value="failed">failed</option>
-          <option value="detected">detected</option>
-          <option value="acting">acting</option>
-        </select>
-        <button id="incident-reload">Refresh</button>
-        <span class="status" id="incident-status"></span>
-      </div>
-      <div class="list" id="incident-list"></div>
-    </div>
-  </section>
-
-  <!-- Tasks ------------------------------------------------------------ -->
-  <section class="pane" id="pane-tasks">
-    <div class="card">
-      <div class="row">
-        <select id="task-queue" style="width:auto">
-          <option value="">all queues</option>
-          <option value="repair">repair (scanner + manual)</option>
-          <option value="agent">agent (LLM)</option>
-        </select>
-        <select id="task-status" style="width:auto">
-          <option value="">all statuses</option>
-          <option value="queued">queued</option>
-          <option value="running">running</option>
-          <option value="resolved">resolved</option>
-          <option value="needs_human">needs human</option>
-          <option value="failed">failed</option>
-          <option value="skipped">skipped</option>
-          <option value="done">done (agent)</option>
-          <option value="error">error (agent)</option>
-          <option value="cancelled">cancelled</option>
-        </select>
-        <button id="task-reload">Refresh</button>
-        <span class="status" id="task-status-line"></span>
-      </div>
-      <div class="row" id="task-stats"></div>
-      <div class="list" id="task-detail"></div>
-      <div class="list" id="task-list"></div>
-    </div>
-
-    <div class="card" style="margin-top:12px">
-      <h3 style="margin:0;font-size:12px;color:var(--dim)">Manual repair</h3>
-      <p class="status" style="margin:0">
-        Queues a repair task for the workers. They still check the
-        <code>auton-apps</code> allowlist, the resource lock, the cooldown and the
-        hourly budget, and every kubectl call is audit-gated. Image, config,
-        scheduling and PVC problems stay report-only.
-      </p>
-      <div class="row">
-        <label>kind
-          <select id="m-kind">
-            <option value="Pod">Pod</option>
-            <option value="Deployment">Deployment</option>
-            <option value="StatefulSet">StatefulSet</option>
-            <option value="PersistentVolumeClaim">PersistentVolumeClaim</option>
-          </select>
-        </label>
-        <label>name
-          <input id="m-name" placeholder="api-1" autocomplete="off">
-        </label>
-        <label>namespace
-          <input id="m-ns" value="auton-apps" autocomplete="off">
-        </label>
-        <label>cause
-          <select id="m-cause"></select>
-        </label>
-      </div>
-      <div class="row">
-        <label style="flex-direction:row;align-items:center;gap:6px;min-width:0;flex:0">
-          <input id="m-force" type="checkbox" checked style="width:auto">
-          ignore cooldown (budget still applies)
-        </label>
-        <button class="primary" id="m-submit">Queue repair</button>
-        <span class="status" id="m-status"></span>
-      </div>
-    </div>
-  </section>
-
-  <!-- Approvals -------------------------------------------------------- -->
-  <section class="pane" id="pane-approvals">
-    <div class="card">
-      <div class="row">
-        <select id="approval-filter" style="width:auto">
-          <option value="pending">pending</option>
-          <option value="">all</option>
-          <option value="approved">approved</option>
-          <option value="rejected">rejected</option>
-          <option value="executed">executed</option>
-          <option value="expired">expired</option>
-        </select>
-        <button id="approval-reload">Refresh</button>
-        <span class="status" id="approval-status"></span>
-      </div>
-      <p class="status" style="margin:0">
-        A repair plan that the policy engine rated above the automatic tier
-        waits here. Nothing in the cluster changes until somebody approves it;
-        rejecting sends the incident back to a human.
-      </p>
-      <div class="list" id="approval-list"></div>
-    </div>
-
-    <div class="card" style="margin-top:12px">
-      <h3 style="margin:0;font-size:12px;color:var(--dim)">Policy</h3>
-      <div class="row">
-        <label>mode
-          <select id="policy-mode">
-            <option value="">…</option>
-            <option value="disabled">disabled</option>
-            <option value="observe-only">observe-only</option>
-            <option value="safe-auto">safe-auto</option>
-            <option value="approval-required">approval-required</option>
-          </select>
-        </label>
-        <button id="policy-reload">Refresh</button>
-        <span class="status" id="policy-status"></span>
-      </div>
-      <div class="box" style="flex:1"><pre id="policy-view">…</pre></div>
-    </div>
-  </section>
-
-  <!-- Audit ------------------------------------------------------------ -->
-  <section class="pane" id="pane-audit">
-    <div class="card">
-      <div class="row">
-        <button id="audit-reload">Refresh</button>
-        <span class="status" id="audit-status"></span>
-      </div>
-      <div class="box" style="flex:1">
-        <table>
-          <thead><tr><th>time</th><th>action</th><th>target</th><th>phase</th><th>incident</th><th>audit id</th></tr></thead>
-          <tbody id="audit-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
-
-  <!-- Provider --------------------------------------------------------- -->
-  <section class="pane" id="pane-provider">
-    <div class="card">
-      <div class="row">
-        <label>Provider
-          <select id="p-provider"></select>
-        </label>
-        <label>Model
-          <input id="p-model" placeholder="qwen2.5-coder:7b-instruct">
-        </label>
-      </div>
-      <div class="row">
-        <label>Base URL
-          <input id="p-base" placeholder="http://ollama-service:11434">
-        </label>
-        <label>Max tokens
-          <input id="p-tokens" type="number" min="64" max="8192" step="1">
-        </label>
-      </div>
-      <div class="row">
-        <label>Data policy
-          <select id="p-policy">
-            <option value="redact">redact — mask secrets before leaving the cluster</option>
-            <option value="allow">allow — send messages unchanged</option>
-            <option value="local-only">local-only — refuse remote providers</option>
-          </select>
-        </label>
-      </div>
-      <div class="row keyrow">
-        <label>API key (write-only)
-          <input id="p-key" type="password" autocomplete="new-password"
-                 placeholder="leave blank to keep the current key">
-        </label>
-        <button id="p-key-toggle" type="button">Show</button>
-      </div>
-      <div class="row">
-        <button class="primary" id="provider-save">Save settings</button>
-        <button id="provider-clear-key" class="danger">Clear API key</button>
-        <button id="provider-test">Send test completion</button>
-        <button id="provider-reload">Refresh</button>
-        <span class="status" id="provider-status"></span>
-      </div>
-      <p class="meta">
-        Switching to a remote provider disables the local model completely — there
-        is no fallback. <code>local-only</code> refuses remote providers, and a
-        remote provider without a key is rejected. The key is never returned by
-        the API; changes are written to the <code>auton-model-config</code>
-        ConfigMap and the <code>auton-model</code> Secret and audited without the
-        key value.
-      </p>
-      <div class="box" style="min-height:120px"><pre id="provider-json">—</pre></div>
-    </div>
-  </section>
-</main>
-
-<!-- API access modal ---------------------------------------------------- -->
-<div class="modal hidden" id="auth-modal">
+<!-- API access modal ------------------------------------------------------ -->
+<div class="modal hidden" id="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
   <div class="modal-card">
-    <h2>API access token</h2>
+    <h2 id="auth-modal-title">API access token</h2>
     <p>
       The page you are looking at contains no data and is served without a
       token. Everything that <em>does</em> something — running a task, reading
@@ -385,7 +1153,7 @@
     <h3>Where do I get it?</h3>
     <div class="cmd">
       <pre id="token-cmd">kubectl -n auton get secret auton-api-token -o jsonpath='{.data.token}' | base64 -d</pre>
-      <button id="token-copy" type="button">Copy</button>
+      <button id="token-copy" type="button"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-copy"/></svg>Copy</button>
     </div>
     <p class="meta">or run <code>./scripts/install.sh --show-token</code>.</p>
     <h3>Where is it stored?</h3>
@@ -395,142 +1163,1715 @@
       “Forget token” to remove it.
     </p>
     <div class="keyrow">
-      <label>Token
+      <label><span class="lbl">Token</span>
         <input id="token-input" type="password" autocomplete="off"
                placeholder="paste the value from the Secret">
       </label>
-      <button id="token-show" type="button">Show</button>
+      <button id="token-show" type="button"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-eye"/></svg>Show</button>
     </div>
     <div class="row">
-      <button class="primary" id="token-test">Test and save</button>
+      <button class="primary" id="token-test"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-check"/></svg>Test and save</button>
       <button id="token-save">Save</button>
       <button class="danger" id="token-forget">Forget token</button>
       <span class="spacer"></span>
       <button id="token-cancel">Close</button>
     </div>
-    <span class="status" id="token-msg"></span>
+    <span class="status" id="token-msg" role="status" aria-live="polite"></span>
   </div>
 </div>
 
-<div class="toast hidden" id="toast"></div>
+<!-- Command palette ------------------------------------------------------- -->
+<div class="modal hidden" id="palette-modal" role="dialog" aria-modal="true" aria-label="Command palette">
+  <div class="modal-card palette-card">
+    <div class="palette-input">
+      <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="palette-input" placeholder="Jump to a section or run an action…" autocomplete="off" aria-label="Command palette input">
+      <kbd>Esc</kbd>
+    </div>
+    <div class="palette-list" id="palette-list"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
 <script>
 (() => {
-  "use strict";
-  const $ = (id) => document.getElementById(id);
-  const state = {
-    token: localStorage.getItem("auton.token") || "",
-    auth: "bearer",        // "bearer" | "off", from /health
-    verified: false,       // /auth/check accepted the current token
-    job: null,
-    timer: null,
-    provider: null,        // last GET /provider payload
-  };
-  let toastTimer = null;
-  let currentTab = "chat";
+"use strict";
 
-  function toast(msg, bad) {
-    const el = $("toast");
-    el.textContent = msg;
-    el.style.borderLeftColor = bad ? "var(--bad)" : "var(--accent)";
-    el.classList.remove("hidden");
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.add("hidden"), 4500);
+/* ==========================================================================
+   Auton console — application script
+   --------------------------------------------------------------------------
+   One file, no bundler, no CDN, no external asset. Everything below talks
+   to the same origin only:
+
+     /health                    open   — platform status
+     /auth/check                token  — validate the bearer token
+     /provider, /provider/test  token  — read / write the model settings
+     /provider/key              token  — DELETE the stored key
+     /incidents[/{id}]          token  — incident records
+     /approvals[/{id}]          token  — approval requests
+     /approvals/{id}/approve    token  — POST approve | reject
+     /tasks, /tasks/stats       token  — queue, workers, watcher health
+     /tasks/{id}                token  — one task with its log
+     /audit                     token  — the write-ahead audit log
+     /policy                    token  — the effective policy
+     /learning                  token  — outcomes, profiles, limits
+     /run?async=1               token  — queue an agent job
+     /jobs/{id}                 token  — poll a job
+   ========================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+const state = {
+  token: localStorage.getItem("auton.token") || "",
+  auth: "bearer",          // "bearer" | "off", from /health
+  verified: false,         // /auth/check accepted the current token
+  job: null,               // the running agent job id
+  timer: null,             // its poll timer
+  provider: null,          // the last GET /provider payload
+  health: null,            // the last /health payload
+  tab: "overview",
+  theme: localStorage.getItem("auton.theme") || "dark",
+  palette: { open: false, items: [], index: 0 },
+};
+
+/* -- small helpers -------------------------------------------------------- */
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function icon(name, className) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", className || "ic");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(SVG_NS, "use");
+  use.setAttribute("href", "#" + name);
+  svg.appendChild(use);
+  return svg;
+}
+
+function setStatus(node, text, bad) {
+  if (!node) return;
+  node.textContent = text || "";
+  node.classList.toggle("err", !!bad);
+}
+
+function fmtTime(ts) {
+  if (ts === null || ts === undefined || ts === "") return "";
+  let date;
+  if (typeof ts === "number") date = new Date(ts * 1000);
+  else if (typeof ts === "string" && /^-?\d+(\.\d+)?$/.test(ts)) date = new Date(Number(ts) * 1000);
+  else date = new Date(ts);
+  if (isNaN(date.getTime())) return String(ts);
+  return date.toLocaleString();
+}
+
+function relTime(ts) {
+  if (ts === null || ts === undefined || ts === "") return "";
+  let seconds;
+  if (typeof ts === "number") seconds = Date.now() / 1000 - ts;
+  else if (typeof ts === "string" && /^-?\d+(\.\d+)?$/.test(ts)) seconds = Date.now() / 1000 - Number(ts);
+  else {
+    const parsed = new Date(ts).getTime();
+    if (isNaN(parsed)) return fmtTime(ts);
+    seconds = Date.now() / 1000 - parsed / 1000;
   }
+  const past = seconds >= 0;
+  const value = Math.abs(seconds);
+  let text;
+  if (value < 60) text = Math.round(value) + "s";
+  else if (value < 3600) text = Math.round(value / 60) + "m";
+  else if (value < 86400) text = Math.round(value / 3600) + "h";
+  else text = Math.round(value / 86400) + "d";
+  return past ? text + " ago" : "in " + text;
+}
 
-  // -- auth ------------------------------------------------------------- //
-  function needsToken() {
-    return state.auth !== "off" && !state.token;
+function num(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
+}
+
+function plural(count, one, many) {
+  return count + " " + (count === 1 ? one : (many || one + "s"));
+}
+
+/* -- toasts --------------------------------------------------------------- */
+
+function toast(message, kind) {
+  const stack = $("toasts");
+  if (!stack) return;
+  const node = el("div", "toast" + (kind ? " " + kind : ""));
+  node.appendChild(icon(kind === "bad" ? "i-alert" : (kind === "good" ? "i-check" : "i-activity"), "ic-sm"));
+  node.appendChild(el("span", null, message));
+  stack.appendChild(node);
+  const life = kind === "bad" ? 7000 : 4500;
+  setTimeout(() => {
+    node.style.opacity = "0";
+    node.style.transition = "opacity 200ms ease";
+    setTimeout(() => node.remove(), 220);
+  }, life);
+}
+
+/* -- theme ---------------------------------------------------------------- */
+
+function applyTheme(theme) {
+  state.theme = theme === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", state.theme);
+  localStorage.setItem("auton.theme", state.theme);
+  const btn = $("theme-toggle");
+  const use = $("theme-icon");
+  if (use) use.setAttribute("href", state.theme === "light" ? "#i-moon" : "#i-sun");
+  if (btn) {
+    btn.setAttribute("aria-label", state.theme === "light"
+      ? "Switch to dark theme" : "Switch to light theme");
+    btn.setAttribute("title", state.theme === "light" ? "Dark theme" : "Light theme");
   }
+}
 
-  function renderAuth() {
-    $("token-state").textContent = state.auth === "off" ? "auth off"
+/* -- auth ----------------------------------------------------------------- */
+
+function needsToken() {
+  return state.auth !== "off" && !state.token;
+}
+
+function renderAuth() {
+  const chip = $("token-chip");
+  const label = $("token-state");
+  if (label) {
+    label.textContent = state.auth === "off" ? "auth off"
       : state.token ? (state.verified ? "valid" : "set, unverified") : "not set";
-    $("token-chip").title = state.auth === "off"
+  }
+  if (chip) {
+    chip.classList.toggle("good", state.auth === "off" || state.verified);
+    chip.classList.toggle("warn", state.auth !== "off" && !!state.token && !state.verified);
+    chip.title = state.auth === "off"
       ? "Authentication is disabled on this server (local development)"
       : "Bearer token for the API — click API access to change it";
-    $("auth-banner").classList.toggle("hidden",
+  }
+  const banner = $("auth-banner");
+  if (banner) {
+    banner.classList.toggle("hidden",
       state.auth === "off" || (!!state.token && state.verified));
   }
+}
 
-  function setTokenMsg(text, bad) {
-    const el = $("token-msg");
-    el.textContent = text || "";
-    el.classList.toggle("err", !!bad);
+function setTokenMsg(text, bad) {
+  setStatus($("token-msg"), text, bad);
+}
+
+function openAuthModal(reason) {
+  if (state.auth === "off") {
+    toast("This server runs with authentication disabled.");
+    return;
   }
+  const input = $("token-input");
+  if (input) input.value = state.token || "";
+  setTokenMsg(reason || (state.token
+    ? "Stored token was not accepted. Paste a fresh one."
+    : ""), !!reason);
+  const modal = $("auth-modal");
+  if (modal) modal.classList.remove("hidden");
+  if (input) setTimeout(() => input.focus(), 30);
+}
 
-  function openAuthModal(reason) {
-    if (state.auth === "off") {
-      toast("This server runs with authentication disabled.");
-      return;
-    }
-    $("token-input").value = state.token || "";
-    setTokenMsg(reason || (state.token
-      ? "Stored token was not accepted. Paste a fresh one."
-      : ""), !!reason);
-    $("auth-modal").classList.remove("hidden");
-    $("token-input").focus();
+function closeAuthModal() {
+  const modal = $("auth-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+function saveToken(value, verified) {
+  state.token = (value || "").trim();
+  state.verified = !!verified;
+  if (state.token) localStorage.setItem("auton.token", state.token);
+  else localStorage.removeItem("auton.token");
+  renderAuth();
+  if (state.token) refreshHealth();
+}
+
+async function checkToken(token) {
+  const res = await fetch("/auth/check", {
+    headers: { "Authorization": "Bearer " + token },
+  });
+  return res.ok;
+}
+
+async function verifyStoredToken() {
+  if (!state.token || state.auth === "off") { renderAuth(); return; }
+  try {
+    state.verified = await checkToken(state.token);
+  } catch (_) {
+    state.verified = false;
   }
-
-  function closeAuthModal() {
-    $("auth-modal").classList.add("hidden");
+  renderAuth();
+  if (!state.verified && state.token) {
+    setTokenMsg("The saved token is no longer accepted.", true);
   }
+}
 
-  function saveToken(value, verified) {
-    state.token = (value || "").trim();
-    state.verified = !!verified;
-    if (state.token) localStorage.setItem("auton.token", state.token);
-    else localStorage.removeItem("auton.token");
+/* -- http ----------------------------------------------------------------- */
+// A 401 on any call re-opens the modal: silently retrying with an empty
+// token is what produced the old "401 — set the token" toast with no way
+// forward.
+async function api(path, opts = {}) {
+  const { silent, ...rest } = opts;
+  const res = await fetch(path, {
+    ...rest,
+    headers: {
+      ...(state.auth === "off" ? {} : { "Authorization": "Bearer " + state.token }),
+      ...(rest.body ? { "Content-Type": "application/json" } : {}),
+      ...(rest.headers || {}),
+    },
+  });
+  if (res.status === 401) {
+    state.verified = false;
     renderAuth();
-    if (state.token) refreshHealth();
+    if (!silent) openAuthModal("That request was rejected: the API token is " +
+      "missing or expired.");
   }
+  return res;
+}
 
-  async function checkToken(token) {
-    const res = await fetch("/auth/check", {
-      headers: { "Authorization": "Bearer " + token },
+async function apiJson(path, opts) {
+  const res = await api(path, opts);
+  let body = null;
+  try { body = await res.json(); } catch (_) { /* not JSON */ }
+  if (!res.ok) {
+    const msg = (body && (body.error || body.hint)) || ("HTTP " + res.status);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+function tokenGuard(statusEl) {
+  if (!needsToken()) return false;
+  setStatus(statusEl, "Token required — click “API access”.", true);
+  openAuthModal("");
+  return true;
+}
+
+/* -- health --------------------------------------------------------------- */
+// The single writer of the health chip. The old code updated it from two
+// places and could leave a stale "API unreachable" next to "API ok".
+async function refreshHealth() {
+  try {
+    const res = await fetch("/health");
+    const h = await res.json();
+    $("health-dot").className = "dot ok";
+    $("health-text").textContent = h.status === "ok" ? "API ok"
+      : (h.status || "degraded");
+    $("provider-name").textContent = h.provider || "—";
+    $("model-name").textContent = h.model || "—";
+    const wasOff = state.auth === "off";
+    state.auth = h.auth || "bearer";
+    if (wasOff !== (state.auth === "off")) renderAuth();
+    state.health = h;
+    renderTopStats();
+    return true;
+  } catch (_) {
+    $("health-dot").className = "dot bad";
+    $("health-text").textContent = "API unreachable";
+    return false;
+  }
+}
+
+function renderTopStats() {
+  const host = $("topbar-stats");
+  if (!host) return;
+  host.innerHTML = "";
+  const h = state.health || {};
+  const parts = [];
+  if (h.queue) parts.push(["queue", h.queue]);
+  if (h.write_scope) parts.push(["k8s", h.write_scope]);
+  if (h.learning) parts.push(["learn", h.learning]);
+  parts.forEach((pair) => {
+    const chip = el("span", "chip");
+    chip.appendChild(document.createTextNode(pair[0] + " "));
+    chip.appendChild(el("b", null, pair[1]));
+    host.appendChild(chip);
+  });
+}
+
+/* -- navigation ----------------------------------------------------------- */
+
+const PAGES = {
+  overview: { title: "Overview", sub: "Live platform state" },
+  chat: { title: "Chat", sub: "Ask the agent to inspect, diagnose or change" },
+  incidents: { title: "Incidents", sub: "Detected problems and their repairs" },
+  approvals: { title: "Approvals", sub: "Human decisions on repair plans" },
+  tasks: { title: "Tasks", sub: "Queue, workers and manual repairs" },
+  learning: { title: "Learning", sub: "Bounded adaptation from verified outcomes" },
+  audit: { title: "Audit", sub: "Every mutation, written before it happens" },
+  provider: { title: "Provider", sub: "Model, endpoint and data policy" },
+};
+
+function activateTab(name, options = {}) {
+  if (!PAGES[name]) name = "overview";
+  state.tab = name;
+  $$(".nav-item[data-tab]").forEach((btn) => {
+    const active = btn.dataset.tab === name;
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+    btn.setAttribute("tabindex", active ? "0" : "-1");
+  });
+  $$(".pane").forEach((pane) => {
+    pane.classList.toggle("active", pane.id === "pane-" + name);
+  });
+  const page = PAGES[name];
+  $("page-title").textContent = page.title;
+  $("page-sub").textContent = page.sub;
+  closeDrawer();
+  if (!options.silent) reloadTab();
+  const url = "#" + name;
+  if (location.hash !== url) history.replaceState(null, "", url);
+}
+
+function reloadTab() {
+  if (state.tab === "overview") loadOverview();
+  if (state.tab === "incidents") loadIncidents();
+  if (state.tab === "approvals") { loadApprovals(); loadPolicy(); }
+  if (state.tab === "tasks") loadTasks();
+  if (state.tab === "audit") loadAudit();
+  if (state.tab === "learning") loadLearning();
+  if (state.tab === "provider") loadProvider();
+}
+
+/* -- mobile drawer -------------------------------------------------------- */
+
+let scrim = null;
+
+function openDrawer() {
+  const sidebar = $("sidebar");
+  if (!sidebar) return;
+  sidebar.classList.add("open");
+  $("menu-btn").setAttribute("aria-expanded", "true");
+  if (!scrim) {
+    scrim = el("div", "scrim");
+    scrim.addEventListener("click", closeDrawer);
+    document.body.appendChild(scrim);
+  }
+  scrim.classList.remove("hidden");
+}
+
+function closeDrawer() {
+  const sidebar = $("sidebar");
+  if (sidebar) sidebar.classList.remove("open");
+  const btn = $("menu-btn");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  if (scrim) scrim.classList.add("hidden");
+}
+
+/* ==========================================================================
+   Overview
+   ========================================================================== */
+
+const STATE_ORDER = [
+  ["detected", "Detected"],
+  ["triage", "Triaging"],
+  ["diagnosing", "Diagnosing"],
+  ["planning", "Planning"],
+  ["policy_check", "Policy"],
+  ["awaiting_approval", "Approval"],
+  ["suppressed", "Suppressed"],
+  ["queued", "Queued"],
+  ["executing", "Executing"],
+  ["verifying", "Verifying"],
+  ["resolved", "Resolved"],
+  ["failed", "Failed"],
+  ["needs_human", "Human"],
+];
+
+const OPEN_STATES = new Set([
+  "detected", "triage", "diagnosing", "planning", "policy_check",
+  "awaiting_approval", "queued", "executing", "verifying",
+]);
+
+function normState(value) {
+  const v = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (v === "acting") return "executing";
+  if (v === "triaging") return "triage";
+  return v;
+}
+
+function stateColor(state) {
+  const s = normState(state);
+  if (s === "resolved") return "var(--ok)";
+  if (s === "failed" || s === "quarantined") return "var(--bad)";
+  if (s === "needs_human" || s === "awaiting_approval") return "var(--warn)";
+  if (s === "suppressed") return "var(--text-faint)";
+  return "var(--accent)";
+}
+
+function stateClass(state) {
+  const s = normState(state);
+  if (s === "resolved") return "resolved";
+  if (s === "failed") return "failed";
+  if (s === "needs_human") return "needs_human";
+  if (s === "awaiting_approval") return "awaiting_approval";
+  if (s === "suppressed") return "suppressed";
+  if (s === "triage") return "triage";
+  return s;
+}
+
+function svgNode(name, attrs) {
+  const node = document.createElementNS(SVG_NS, name);
+  Object.keys(attrs || {}).forEach((key) => node.setAttribute(key, attrs[key]));
+  return node;
+}
+
+function makeDonut(segments, total, label) {
+  const radius = 52;
+  const circumference = 2 * Math.PI * radius;
+  const svg = svgNode("svg", {
+    "class": "donut",
+    "viewBox": "0 0 132 132",
+    "role": "img",
+    "aria-label": label || "distribution",
+  });
+  svg.appendChild(svgNode("circle", {
+    "class": "donut-track", cx: 66, cy: 66, r: radius,
+  }));
+  let offset = 0;
+  segments.forEach((seg) => {
+    const value = num(seg.value);
+    if (value <= 0) return;
+    const length = (value / total) * circumference;
+    const ring = svgNode("circle", {
+      cx: 66, cy: 66, r: radius,
+      stroke: seg.color,
+      "stroke-dasharray": length + " " + (circumference - length),
+      "stroke-dashoffset": -offset,
     });
-    return res.ok;
+    ring.appendChild(svgNode("title", {})).textContent =
+      seg.label + ": " + value;
+    svg.appendChild(ring);
+    offset += length;
+  });
+  const value = svgNode("text", {
+    x: 66, y: 63, "text-anchor": "middle",
+    fill: "var(--text)", "font-size": "24", "font-weight": "700",
+  });
+  value.textContent = String(total);
+  svg.appendChild(value);
+  const caption = svgNode("text", {
+    x: 66, y: 80, "text-anchor": "middle",
+    fill: "var(--text-faint)", "font-size": "10", "letter-spacing": "0.08em",
+  });
+  caption.textContent = "TOTAL";
+  svg.appendChild(caption);
+  return svg;
+}
+
+function makeBars(rows) {
+  const host = el("div", "bars");
+  const max = Math.max(1, ...rows.map((r) => num(r.value)));
+  rows.forEach((row) => {
+    const line = el("div", "bar-row");
+    line.appendChild(el("div", "bar-name", row.label));
+    const track = el("div", "bar-track");
+    const fill = el("i", "bar-fill");
+    fill.style.width = Math.round((num(row.value) / max) * 100) + "%";
+    if (row.color) fill.style.background = row.color;
+    track.appendChild(fill);
+    line.appendChild(track);
+    line.appendChild(el("div", "bar-val", String(num(row.value))));
+    host.appendChild(line);
+  });
+  return host;
+}
+
+function tile(label, value, foot, tone, iconName) {
+  const node = el("div", "tile" + (tone ? " " + tone : ""));
+  const bar = el("span", "tile-accent-bar");
+  node.appendChild(bar);
+  const head = el("div", "tile-label");
+  if (iconName) head.appendChild(icon(iconName, "ic-sm"));
+  head.appendChild(el("span", null, label));
+  node.appendChild(head);
+  const valueNode = el("div", "tile-value" + (typeof value === "string" && value.length > 12 ? " sm" : ""), String(value));
+  node.appendChild(valueNode);
+  if (foot) node.appendChild(el("div", "tile-foot", foot));
+  return node;
+}
+
+function emptyState(message, iconName, title) {
+  const node = el("div", "empty");
+  node.appendChild(icon(iconName || "i-layers", "ic"));
+  if (title) node.appendChild(el("b", null, title));
+  node.appendChild(el("span", null, message));
+  return node;
+}
+
+async function loadOverview() {
+  if (tokenGuard($("ov-incident-status"))) {
+    $("ov-tiles").innerHTML = "";
+    $("ov-tiles").appendChild(emptyState(
+      "Add the API token to see the live platform state.",
+      "i-key", "Token required"));
+    return;
+  }
+  const tiles = $("ov-tiles");
+  tiles.innerHTML = "";
+  for (let i = 0; i < 6; i += 1) {
+    const skeleton = el("div", "tile");
+    skeleton.appendChild(el("div", "skeleton"));
+    const line = el("div", "skeleton");
+    line.style.width = "55%";
+    line.style.height = "22px";
+    skeleton.appendChild(line);
+    tiles.appendChild(skeleton);
+  }
+  setStatus($("ov-queue-status"), "loading…");
+  setStatus($("ov-incident-status"), "loading…");
+  setStatus($("ov-watch-status"), "loading…");
+  setStatus($("ov-worker-status"), "loading…");
+
+  const results = await Promise.allSettled([
+    apiJson("/tasks/stats", { silent: true }),
+    apiJson("/incidents?limit=100", { silent: true }),
+    apiJson("/approvals?limit=50", { silent: true }),
+    apiJson("/policy", { silent: true }),
+    apiJson("/learning?limit=20", { silent: true }),
+  ]);
+  const stats = results[0].status === "fulfilled" ? results[0].value : null;
+  const incidents = results[1].status === "fulfilled" ? results[1].value : null;
+  const approvals = results[2].status === "fulfilled" ? results[2].value : null;
+  const policyData = results[3].status === "fulfilled" ? results[3].value : null;
+  const learning = results[4].status === "fulfilled" ? results[4].value : null;
+  const failure = results.find((r) => r.status === "rejected");
+  if (failure) {
+    const message = failure.reason && failure.reason.message
+      ? failure.reason.message : "overview unavailable";
+    setStatus($("ov-queue-status"), message, true);
+    setStatus($("ov-incident-status"), message, true);
+    setStatus($("ov-watch-status"), message, true);
+    setStatus($("ov-worker-status"), message, true);
   }
 
-  async function verifyStoredToken() {
-    if (!state.token || state.auth === "off") { renderAuth(); return; }
-    try {
-      state.verified = await checkToken(state.token);
-    } catch (_) {
-      state.verified = false;
-    }
-    renderAuth();
-    if (!state.verified && state.token) {
-      setTokenMsg("The saved token is no longer accepted.", true);
+  const health = state.health || {};
+  const list = (incidents && incidents.incidents) || [];
+  const openIncidents = list.filter((rec) => OPEN_STATES.has(normState(rec.status)));
+  const pending = ((approvals && approvals.approvals) || [])
+    .filter((rec) => rec.status === "pending");
+  const workers = (stats && stats.workers) || [];
+  const aliveWorkers = workers.filter((w) => w.alive).length;
+  const watchers = ((stats && stats.watchers) || [])
+    .filter((w) => w.resource !== "summary" && w.name !== "scanner");
+  const availableWatchers = watchers.filter((w) => w.available).length;
+  const depth = (stats && stats.queue_depth) || {};
+  const queueTotal = num(depth.repair_critical) + num(depth.repair_normal) + num(depth.agent);
+
+  tiles.innerHTML = "";
+  tiles.appendChild(tile("Platform", health.status === "ok" ? "healthy" : (health.status || "—"),
+    [health.provider, health.model].filter(Boolean).join(" · "),
+    health.status === "ok" ? "ok" : "warn", "i-activity"));
+  tiles.appendChild(tile("Queue", queueTotal,
+    [(stats && stats.backend) || "—", health.queue_auth
+      ? "auth " + health.queue_auth : ""].filter(Boolean).join(" · "),
+    "", "i-db"));
+  tiles.appendChild(tile("Open incidents", openIncidents.length,
+    plural(list.length, "incident") + " total",
+    openIncidents.length ? "warn" : "ok", "i-alert"));
+  tiles.appendChild(tile("Pending approvals", pending.length,
+    pending.length ? "a human must decide" : "nothing waiting",
+    pending.length ? "warn" : "ok", "i-shield"));
+  tiles.appendChild(tile("Workers", aliveWorkers + "/" + workers.length,
+    workers.map((w) => w.role).join(", ") || "no heartbeat",
+    aliveWorkers ? "ok" : "bad", "i-cpu"));
+  tiles.appendChild(tile("Watch streams", availableWatchers + "/" + watchers.length,
+    watchers.length ? "live Kubernetes watches" : "polling fallback",
+    availableWatchers === watchers.length ? "ok" : (availableWatchers ? "warn" : "bad"),
+    "i-eye"));
+
+  // -- queue depth --------------------------------------------------------
+  const queueHost = $("ov-queue");
+  queueHost.innerHTML = "";
+  const queueRows = [
+    { label: "repair critical", value: num(depth.repair_critical), color: "var(--bad)" },
+    { label: "repair normal", value: num(depth.repair_normal), color: "var(--accent)" },
+    { label: "agent", value: num(depth.agent), color: "var(--info)" },
+    { label: "claimed", value: num(depth.claimed), color: "var(--teal)" },
+    { label: "delayed", value: num(depth.delayed), color: "var(--warn)" },
+    { label: "dead", value: num(depth.dead), color: "var(--bad)" },
+  ];
+  queueHost.appendChild(makeBars(queueRows));
+  const budgetUsed = num(stats && stats.budget_used);
+  const oldest = stats && stats.oldest_queued;
+  const queueFoot = el("div", "item-meta");
+  queueFoot.appendChild(el("span", null, "budget " + budgetUsed + "/h"));
+  queueFoot.appendChild(el("span", null, "oldest queued " + (oldest ? relTime(oldest) : "—")));
+  queueHost.appendChild(queueFoot);
+  setStatus($("ov-queue-status"), (stats && stats.backend) || "—");
+
+  // -- incidents donut ----------------------------------------------------
+  const incidentHost = $("ov-incidents");
+  incidentHost.innerHTML = "";
+  const byState = new Map();
+  list.forEach((rec) => {
+    const key = normState(rec.status) || "detected";
+    byState.set(key, (byState.get(key) || 0) + 1);
+  });
+  if (!list.length) {
+    incidentHost.appendChild(emptyState("No incidents recorded yet.", "i-check", "All clear"));
+  } else {
+    const segments = [];
+    STATE_ORDER.forEach((pair) => {
+      const count = byState.get(pair[0]) || 0;
+      if (count) segments.push({ label: pair[1], value: count, color: stateColor(pair[0]) });
+    });
+    byState.forEach((count, key) => {
+      if (!STATE_ORDER.some((pair) => pair[0] === key)) {
+        segments.push({ label: key, value: count, color: "var(--text-faint)" });
+      }
+    });
+    incidentHost.appendChild(makeDonut(segments, list.length, "incidents by state"));
+    const legend = el("div", "legend");
+    segments.forEach((seg) => {
+      const row = el("div", "legend-row");
+      const swatch = el("span", "swatch");
+      swatch.style.background = seg.color;
+      row.appendChild(swatch);
+      row.appendChild(el("span", null, seg.label));
+      row.appendChild(el("b", null, String(seg.value)));
+      legend.appendChild(row);
+    });
+    incidentHost.appendChild(legend);
+  }
+  setStatus($("ov-incident-status"), plural(list.length, "incident"));
+
+  // -- watchers -----------------------------------------------------------
+  const watchBody = $("ov-watchers");
+  watchBody.innerHTML = "";
+  if (!watchers.length) {
+    const row = el("tr");
+    const cell = el("td", null, "No watcher streams published — the scanner is polling.");
+    cell.colSpan = 5;
+    cell.style.color = "var(--text-faint)";
+    row.appendChild(cell);
+    watchBody.appendChild(row);
+  } else {
+    watchers.forEach((w) => {
+      const row = el("tr");
+      const name = el("td", "mono", w.resource || w.name);
+      const stateCell = el("td");
+      const dot = el("span", "dot " + (w.available ? "ok" : "bad"));
+      stateCell.appendChild(dot);
+      stateCell.appendChild(document.createTextNode(" " + (w.available ? "live" : "down")));
+      row.appendChild(name);
+      row.appendChild(stateCell);
+      row.appendChild(el("td", "num", num(w.events)));
+      row.appendChild(el("td", "num", num(w.errors) + num(w.forbidden)));
+      row.appendChild(el("td", "num", String(w.resource_version || "—")));
+      watchBody.appendChild(row);
+    });
+  }
+  setStatus($("ov-watch-status"), availableWatchers + "/" + watchers.length + " live");
+
+  // -- workers & transport -------------------------------------------------
+  const workerHost = $("ov-workers");
+  workerHost.innerHTML = "";
+  if (!workers.length) {
+    workerHost.appendChild(emptyState("No worker heartbeat published.", "i-cpu", "No workers"));
+  } else {
+    workers.forEach((worker) => {
+      const row = el("div", "item");
+      const top = el("div", "item-top");
+      const dot = el("span", "dot " + (worker.alive ? "ok" : "bad"));
+      top.appendChild(dot);
+      top.appendChild(el("span", "item-title", worker.role || "worker"));
+      top.appendChild(el("span", "item-id", worker.name || ""));
+      const badge = el("span", "badge " + (worker.alive ? "resolved" : "failed"),
+        worker.alive ? "alive" : "stale");
+      top.appendChild(badge);
+      row.appendChild(top);
+      const meta = el("div", "item-meta");
+      meta.appendChild(el("span", null,
+        "heartbeat " + (worker.age !== null && worker.age !== undefined
+          ? relTime(Date.now() / 1000 - num(worker.age)) : "—")));
+      row.appendChild(meta);
+      workerHost.appendChild(row);
+    });
+  }
+  setStatus($("ov-worker-status"), aliveWorkers + "/" + workers.length + " alive");
+
+  const transportHost = $("ov-transport");
+  transportHost.innerHTML = "";
+  const scanner = ((stats && stats.watchers) || [])
+    .find((w) => w.resource === "summary" || w.name === "scanner");
+  if (scanner && scanner.transport) {
+    const box = el("div", "kv");
+    const pairs = [
+      ["direct", num(scanner.transport.direct)],
+      ["kubectl fallback", num(scanner.transport.kubectl)],
+      ["direct errors", num(scanner.transport.direct_error)],
+      ["unavailable", num(scanner.transport.unavailable)],
+    ];
+    pairs.forEach((pair) => {
+      box.appendChild(el("dt", null, pair[0]));
+      box.appendChild(el("dd", "mono", String(pair[1])));
+    });
+    transportHost.appendChild(el("div", "section-title", "transport"));
+    transportHost.appendChild(box);
+  }
+
+  // -- recent incidents ---------------------------------------------------
+  const recentHost = $("ov-recent");
+  recentHost.innerHTML = "";
+  const recent = list.slice()
+    .sort((a, b) => num(b.last_seen || b.first_seen || b.created_at)
+      - num(a.last_seen || a.first_seen || a.created_at))
+    .slice(0, 5);
+  if (!recent.length) {
+    recentHost.appendChild(emptyState("Nothing has gone wrong yet.", "i-check", "All clear"));
+  } else {
+    recent.forEach((rec) => recentHost.appendChild(incidentRow(rec, true)));
+  }
+
+  // -- policy & approvals --------------------------------------------------
+  const policyHost = $("ov-policy");
+  policyHost.innerHTML = "";
+  if (policyData && policyData.ok) {
+    const mode = policyData.policy.mode || "unknown";
+    const row = el("div", "item");
+    const top = el("div", "item-top");
+    top.appendChild(el("span", "item-title", "mode " + mode));
+    top.appendChild(el("span", "badge " + (mode === "disabled" ? "failed"
+      : (mode === "approval-required" ? "pending" : "resolved")), policyData.source));
+    row.appendChild(top);
+    const meta = el("div", "item-meta");
+    const tiers = (policyData.policy.auto_approve_tiers || []).join(", ");
+    meta.appendChild(el("span", null, "auto tiers " + (tiers || "none")));
+    row.appendChild(meta);
+    policyHost.appendChild(row);
+  } else if (policyData) {
+    const row = el("div", "item");
+    row.appendChild(el("div", "item-title", "policy invalid"));
+    row.appendChild(el("div", "item-meta", policyData.error || "unreadable"));
+    policyHost.appendChild(row);
+  }
+  const approvalRow = el("div", "item");
+  const approvalTop = el("div", "item-top");
+  approvalTop.appendChild(el("span", "item-title",
+    pending.length ? plural(pending.length, "approval") + " waiting" : "no approvals waiting"));
+  approvalTop.appendChild(el("span", "badge " + (pending.length ? "pending" : "resolved"),
+    pending.length ? "action needed" : "clear"));
+  approvalRow.appendChild(approvalTop);
+  policyHost.appendChild(approvalRow);
+
+  if (learning && learning.profiles) {
+    const quarantined = learning.profiles.filter((p) => p.quarantined).length;
+    if (quarantined) {
+      const row = el("div", "item");
+      const top = el("div", "item-top");
+      top.appendChild(el("span", "item-title", plural(quarantined, "quarantined") + " resource"));
+      top.appendChild(el("span", "badge failed", "quarantined"));
+      row.appendChild(top);
+      policyHost.appendChild(row);
     }
   }
 
-  $("token-btn").onclick = () => openAuthModal("");
-  $("banner-token").onclick = () => openAuthModal("");
-  $("token-cancel").onclick = closeAuthModal;
-  $("auth-modal").onclick = (ev) => {
+  // -- nav counters --------------------------------------------------------
+  setCount("nav-count-incidents", openIncidents.length, openIncidents.length ? "hot" : "");
+  setCount("nav-count-approvals", pending.length, pending.length ? "crit" : "");
+  setCount("nav-count-tasks", queueTotal, "");
+}
+
+function setCount(id, value, tone) {
+  const node = $(id);
+  if (!node) return;
+  node.textContent = value ? String(value) : "";
+  node.className = "nav-count" + (value && tone ? " " + tone : "");
+}
+
+/* ==========================================================================
+   Chat
+   ========================================================================== */
+
+function renderSteps(steps) {
+  const host = $("chat-steps");
+  host.innerHTML = "";
+  if (!steps || !steps.length) {
+    host.appendChild(el("div", "meta", "No tool steps yet."));
+    return;
+  }
+  steps.forEach((step, index) => {
+    const row = el("div", "step");
+    row.appendChild(icon("i-play", "ic-sm"));
+    const body = el("div", "step-body");
+    const head = el("div", "item-top");
+    head.appendChild(el("span", "step-name", step.tool || "tool"));
+    head.appendChild(el("span", "item-id", "step " + (index + 1)));
+    if (step.ms !== undefined) head.appendChild(el("span", "item-id", step.ms + " ms"));
+    body.appendChild(head);
+    const args = step.arguments && Object.keys(step.arguments).length
+      ? JSON.stringify(step.arguments) : "";
+    if (args) body.appendChild(el("div", "step-text", args));
+    if (step.output) body.appendChild(el("div", "step-text", String(step.output).slice(0, 600)));
+    row.appendChild(body);
+    host.appendChild(row);
+  });
+}
+
+async function pollJob(id) {
+  try {
+    const job = await apiJson("/jobs/" + encodeURIComponent(id), { silent: true });
+    const lines = job.logs || job.log || [];
+    const log = $("log");
+    log.innerHTML = "";
+    if (!lines.length) {
+      log.appendChild(el("span", "ln", "…"));
+    } else {
+      lines.forEach((line) => {
+        const text = String(line);
+        let tone = "";
+        if (/error|failed|traceback/i.test(text)) tone = "err";
+        else if (/^\s*->|ok\b|done/i.test(text)) tone = "ok";
+        else if (/^\s*(tool|call)/i.test(text)) tone = "tool";
+        log.appendChild(el("span", "ln" + (tone ? " " + tone : ""), text));
+      });
+      log.scrollTop = log.scrollHeight;
+    }
+    setStatus($("chat-status"), job.status + " · " + Math.round(num(job.elapsed)) + "s");
+    if (job.done) {
+      state.job = null;
+      clearInterval(state.timer);
+      $("run").disabled = false;
+      $("cancel").classList.add("hidden");
+      const result = job.result || {};
+      renderSteps(result.steps || []);
+      if (job.status === "done") {
+        setStatus($("chat-status"), "done · " + (result.stop_reason || "final"));
+        $("answer").textContent = result.final || JSON.stringify(result, null, 2);
+      } else {
+        setStatus($("chat-status"), job.status + (job.error ? ": " + job.error : ""), true);
+        if (job.result) $("answer").textContent = JSON.stringify(job.result, null, 2);
+      }
+    }
+  } catch (e) {
+    clearInterval(state.timer);
+    state.job = null;
+    $("run").disabled = false;
+    $("cancel").classList.add("hidden");
+    setStatus($("chat-status"), e.message, true);
+  }
+}
+
+async function runTask() {
+  const task = $("task").value.trim();
+  if (!task) { setStatus($("chat-status"), "Write a task first.", true); return; }
+  if (needsToken()) { openAuthModal(""); return; }
+  $("run").disabled = true;
+  $("cancel").classList.remove("hidden");
+  $("log").textContent = "starting…";
+  $("answer").textContent = "";
+  $("chat-steps").innerHTML = "";
+  setStatus($("chat-status"), "queued");
+  try {
+    const job = await apiJson("/run?async=1", {
+      method: "POST", body: JSON.stringify({ task }),
+    });
+    state.job = job.job_id;
+    clearInterval(state.timer);
+    state.timer = setInterval(() => pollJob(state.job), 1500);
+    pollJob(state.job);
+  } catch (e) {
+    $("run").disabled = false;
+    $("cancel").classList.add("hidden");
+    setStatus($("chat-status"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Incidents
+   ========================================================================== */
+
+function incidentRow(rec, compact) {
+  const row = el("div", "item clickable");
+  row.setAttribute("role", "button");
+  row.setAttribute("tabindex", "0");
+  const top = el("div", "item-top");
+  top.appendChild(el("span", "item-title",
+    rec.summary || rec.reason || rec.observation || rec.resource || rec.id));
+  const state = normState(rec.status || rec.state);
+  top.appendChild(el("span", "badge " + stateClass(state),
+    (rec.state || state || "?").toString().replace(/_/g, " ")));
+  if (rec.severity) top.appendChild(el("span", "badge", rec.severity));
+  top.appendChild(el("span", "item-id", rec.id || ""));
+  row.appendChild(top);
+  const meta = el("div", "item-meta");
+  const parts = [rec.resource, rec.namespace, rec.cause];
+  parts.filter(Boolean).forEach((part) => meta.appendChild(el("span", null, part)));
+  const seen = rec.last_seen || rec.first_seen || rec.created_at;
+  if (seen) meta.appendChild(el("span", null, relTime(seen)));
+  if (rec.occurrence_count > 1) {
+    meta.appendChild(el("span", null, "×" + rec.occurrence_count));
+  }
+  row.appendChild(meta);
+  if (!compact) {
+    const actions = rec.actions || [];
+    if (actions.length) {
+      const last = actions[actions.length - 1];
+      const line = el("div", "item-meta");
+      line.appendChild(el("span", null, "action " + (last.action || last)));
+      row.appendChild(line);
+    }
+  }
+  const open = () => showIncident(rec.id);
+  row.addEventListener("click", open);
+  row.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); open(); }
+  });
+  return row;
+}
+
+function buildTrack(record) {
+  const visited = new Set();
+  (record.timeline || []).forEach((entry) => {
+    const to = normState(entry.to);
+    if (to) visited.add(to);
+  });
+  const current = normState(record.status || record.state);
+  const track = el("div", "track");
+  STATE_ORDER.forEach((pair, index) => {
+    const key = pair[0];
+    const node = el("div", "track-node");
+    if (visited.has(key)) node.classList.add("done");
+    if (key === current) {
+      node.classList.add("current");
+      if (key === "resolved") node.classList.add("ok");
+      if (key === "failed") node.classList.add("bad");
+      if (key === "needs_human") node.classList.add("warn");
+    }
+    node.appendChild(el("span", "track-dot"));
+    node.appendChild(el("span", "track-label", pair[1]));
+    track.appendChild(node);
+    if (index < STATE_ORDER.length - 1) {
+      const line = el("span", "track-line");
+      if (visited.has(key)) line.classList.add("done");
+      track.appendChild(line);
+    }
+  });
+  return track;
+}
+
+function kvGrid(pairs) {
+  const grid = el("dl", "kv");
+  pairs.forEach((pair) => {
+    if (!pair[1]) return;
+    grid.appendChild(el("dt", null, pair[0]));
+    grid.appendChild(el("dd", pair[2] || null, String(pair[1])));
+  });
+  return grid;
+}
+
+async function showIncident(id) {
+  if (!id) return;
+  try {
+    const rec = await apiJson("/incidents/" + encodeURIComponent(id));
+    const card = el("div", "card");
+    const head = el("div", "card-head");
+    head.appendChild(icon("i-alert"));
+    head.appendChild(el("h3", null, rec.summary || rec.resource || rec.id));
+    head.appendChild(el("span", "spacer"));
+    const state = normState(rec.status || rec.state);
+    head.appendChild(el("span", "badge " + stateClass(state),
+      (rec.state || state || "?").toString().replace(/_/g, " ")));
+    if (rec.severity) head.appendChild(el("span", "badge", rec.severity));
+    const close = el("button", "sm ghost", "Close");
+    close.addEventListener("click", () => card.remove());
+    head.appendChild(close);
+    card.appendChild(head);
+
+    card.appendChild(buildTrack(rec));
+
+    const diagnosis = rec.diagnosis || {};
+    card.appendChild(kvGrid([
+      ["cause", rec.cause],
+      ["resource", rec.resource],
+      ["namespace", rec.namespace],
+      ["fingerprint", rec.fingerprint, "mono"],
+      ["occurrences", rec.occurrence_count, "mono"],
+      ["cluster", rec.cluster_id, "mono"],
+      ["first seen", fmtTime(rec.first_seen)],
+      ["last seen", fmtTime(rec.last_seen)],
+      ["confidence", diagnosis.confidence !== undefined
+        ? Math.round(num(diagnosis.confidence) * 100) + "%" : ""],
+      ["action", diagnosis.recommended_action],
+      ["human needed", rec.needs_human ? "yes" : ""],
+    ]));
+
+    if (rec.repair_plan) {
+      const plan = rec.repair_plan;
+      card.appendChild(el("div", "section-title", "repair plan"));
+      card.appendChild(kvGrid([
+        ["action", plan.action],
+        ["playbook", plan.playbook],
+        ["tier", plan.tier, "mono"],
+        ["expected", plan.expected_effect],
+        ["verification", plan.verification],
+        ["rollback", plan.rollback && plan.rollback.note],
+      ]));
+    }
+
+    if (rec.timeline && rec.timeline.length) {
+      const list = el("div", "list");
+      rec.timeline.forEach((entry) => {
+        const row = el("div", "item");
+        const top = el("div", "item-top");
+        top.appendChild(el("span", "item-title",
+          (entry.from ? entry.from + " → " : "") + entry.to));
+        top.appendChild(el("span", "item-id", entry.by || "system"));
+        top.appendChild(el("span", "item-id", fmtTime(entry.ts)));
+        row.appendChild(top);
+        if (entry.note) row.appendChild(el("div", "item-meta", entry.note));
+        list.appendChild(row);
+      });
+      card.appendChild(el("div", "section-title", "timeline"));
+      card.appendChild(list);
+    }
+
+    const details = el("details");
+    const summary = el("summary", null, "Raw incident record");
+    details.appendChild(summary);
+    const raw = el("div", "box");
+    raw.appendChild(el("pre", null, JSON.stringify(rec, null, 2)));
+    details.appendChild(raw);
+    card.appendChild(details);
+
+    const host = $("incident-list");
+    const previous = host.querySelector(".card");
+    if (previous) previous.remove();
+    host.prepend(card);
+    card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+}
+
+async function loadIncidents() {
+  if (tokenGuard($("incident-status"))) return;
+  setStatus($("incident-status"), "loading…");
+  try {
+    const status = $("incident-filter").value;
+    const data = await apiJson("/incidents?limit=50" + (status ? "&status=" + encodeURIComponent(status) : ""));
+    const host = $("incident-list");
+    host.innerHTML = "";
+    setStatus($("incident-status"), plural(data.count, "incident"));
+    const list = data.incidents || [];
+    list.forEach((rec) => host.appendChild(incidentRow(rec, false)));
+    if (!list.length) {
+      host.appendChild(emptyState(
+        "The controller records one when it detects a problem.",
+        "i-check", "No incidents"));
+    }
+  } catch (e) {
+    setStatus($("incident-status"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Approvals & policy
+   ========================================================================== */
+
+function approvalCard(rec) {
+  const plan = rec.plan || {};
+  const card = el("div", "item");
+  const top = el("div", "item-top");
+  top.appendChild(el("span", "item-title",
+    plan.action || plan.root_cause || rec.id || "repair plan"));
+  top.appendChild(el("span", "badge",
+    "tier " + (plan.tier !== undefined && plan.tier !== null ? plan.tier : "?")));
+  top.appendChild(el("span", "badge " + (rec.status || ""), rec.status || "?"));
+  top.appendChild(el("span", "item-id", rec.id || ""));
+  card.appendChild(top);
+
+  const meta = el("div", "item-meta");
+  [plan.resource, plan.namespace, fmtTime(rec.created_at),
+    rec.policy && rec.policy.reason].filter(Boolean)
+    .forEach((part) => meta.appendChild(el("span", null, part)));
+  card.appendChild(meta);
+
+  const detail = el("dl", "kv");
+  [
+    ["expected effect", plan.expected_effect],
+    ["verification", plan.verification],
+    ["rollback", plan.rollback && plan.rollback.note],
+    ["reversible", plan.reversible === undefined ? "" : (plan.reversible ? "yes" : "no")],
+  ].forEach((pair) => {
+    if (!pair[1]) return;
+    detail.appendChild(el("dt", null, pair[0]));
+    detail.appendChild(el("dd", null, String(pair[1])));
+  });
+  if (detail.childNodes.length) card.appendChild(detail);
+
+  if (rec.status === "pending") {
+    const row = el("div", "row");
+    const approve = el("button", "primary", "Approve");
+    approve.addEventListener("click", () => decideApproval(rec.id, true));
+    const reject = el("button", "danger", "Reject");
+    reject.addEventListener("click", () => decideApproval(rec.id, false));
+    row.appendChild(approve);
+    row.appendChild(reject);
+    card.appendChild(row);
+  }
+  return card;
+}
+
+async function decideApproval(id, approve) {
+  const path = "/approvals/" + encodeURIComponent(id) + (approve ? "/approve" : "/reject");
+  try {
+    const data = await apiJson(path, {
+      method: "POST",
+      body: JSON.stringify({
+        by: "ui",
+        comment: approve ? "approved in the UI" : "rejected in the UI",
+      }),
+    });
+    setStatus($("approval-status"), data.ok ? (approve ? "approved" : "rejected") : "failed");
+    toast(approve ? "Approval accepted — the repair is queued." : "Approval rejected.",
+      data.ok ? "good" : "bad");
+    loadApprovals();
+  } catch (e) {
+    setStatus($("approval-status"), e.message, true);
+    toast(e.message, "bad");
+  }
+}
+
+async function loadApprovals() {
+  if (tokenGuard($("approval-status"))) return;
+  setStatus($("approval-status"), "loading…");
+  try {
+    const status = $("approval-filter").value;
+    const data = await apiJson("/approvals?limit=50" + (status ? "&status=" + encodeURIComponent(status) : ""));
+    const host = $("approval-list");
+    host.innerHTML = "";
+    setStatus($("approval-status"), plural(data.count, "approval"));
+    const list = data.approvals || [];
+    list.forEach((rec) => host.appendChild(approvalCard(rec)));
+    if (!list.length) {
+      host.appendChild(emptyState(
+        "A repair plan appears here when the policy rates it above the automatic tier.",
+        "i-shield", "Nothing to approve"));
+    }
+  } catch (e) {
+    setStatus($("approval-status"), e.message, true);
+  }
+}
+
+async function loadPolicy() {
+  if (tokenGuard($("policy-status"))) return;
+  try {
+    const data = await apiJson("/policy");
+    const select = $("policy-mode");
+    if (data.ok) {
+      select.value = data.policy.mode || "";
+      setStatus($("policy-status"), "mode: " + data.policy.mode + " · source: " + data.source);
+      $("policy-view").textContent = JSON.stringify(data.policy, null, 2);
+    } else {
+      setStatus($("policy-status"), "the policy is invalid: " + data.error, true);
+      $("policy-view").textContent = data.error;
+    }
+  } catch (e) {
+    setStatus($("policy-status"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Tasks
+   ========================================================================== */
+
+function chips(host, parts) {
+  host.innerHTML = "";
+  parts.forEach((part) => {
+    const chip = el("span", "chip");
+    if (typeof part === "string") chip.textContent = part;
+    else {
+      chip.appendChild(document.createTextNode(part[0] + " "));
+      chip.appendChild(el("b", null, String(part[1])));
+    }
+    host.appendChild(chip);
+  });
+}
+
+function renderTaskStats(stats) {
+  const depth = stats.queue_depth || {};
+  const active = stats.active || {};
+  chips($("task-stats"), [
+    ["repair critical", num(depth.repair_critical)],
+    ["repair normal", num(depth.repair_normal)],
+    ["agent", num(depth.agent)],
+    ["active repair", num(active.repair)],
+    ["active agent", num(active.agent)],
+    ["delayed", num(depth.delayed)],
+    ["dead", num(depth.dead)],
+    ["budget/h", num(stats.budget_used)],
+    ["backend", stats.backend || "?"],
+  ]);
+}
+
+function fillCauses(causes) {
+  const select = $("m-cause");
+  if (!causes || select.options.length > 0) return;
+  Object.keys(causes).sort().forEach((cause) => {
+    const opt = el("option", null, cause + " (" + causes[cause] + ")");
+    opt.value = cause;
+    select.appendChild(opt);
+  });
+}
+
+function taskRow(task) {
+  const row = el("div", "item clickable");
+  row.setAttribute("role", "button");
+  row.setAttribute("tabindex", "0");
+  const top = el("div", "item-top");
+  top.appendChild(el("span", "item-title",
+    (task.resource || "(no resource)") + (task.cause ? " · " + task.cause : "")));
+  top.appendChild(el("span", "badge", task.queue || "?"));
+  top.appendChild(el("span", "badge " + (task.status || ""), task.status || "?"));
+  top.appendChild(el("span", "item-id", task.id || ""));
+  row.appendChild(top);
+  const meta = el("div", "item-meta");
+  [task.namespace, task.priority, "attempt " + num(task.attempts),
+    task.worker ? "on " + task.worker : "", fmtTime(task.created_ts),
+    task.incident_id].filter(Boolean)
+    .forEach((part) => meta.appendChild(el("span", null, part)));
+  row.appendChild(meta);
+  const open = () => showTask(task.id);
+  row.addEventListener("click", open);
+  row.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); open(); }
+  });
+  return row;
+}
+
+async function showTask(id) {
+  if (!id) return;
+  try {
+    const rec = await apiJson("/tasks/" + encodeURIComponent(id));
+    const card = el("div", "card");
+    const head = el("div", "card-head");
+    head.appendChild(icon("i-box"));
+    head.appendChild(el("h3", null, id));
+    head.appendChild(el("span", "spacer"));
+    head.appendChild(el("span", "badge " + (rec.status || ""), rec.status || "?"));
+    const cancel = el("button", "sm danger", "Cancel task");
+    cancel.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      try {
+        await apiJson("/tasks/" + encodeURIComponent(id) + "/cancel", { method: "POST" });
+        toast("Cancel requested");
+        card.remove();
+        loadTasks();
+      } catch (e) { toast(e.message, "bad"); }
+    });
+    const close = el("button", "sm ghost", "Close");
+    close.addEventListener("click", () => card.remove());
+    head.appendChild(cancel);
+    head.appendChild(close);
+    card.appendChild(head);
+
+    card.appendChild(kvGrid([
+      ["resource", rec.resource],
+      ["namespace", rec.namespace],
+      ["kind", rec.kind],
+      ["name", rec.name],
+      ["cause", rec.cause],
+      ["priority", rec.priority],
+      ["attempts", rec.attempts, "mono"],
+      ["worker", rec.worker],
+      ["incident", rec.incident_id, "mono"],
+      ["created", fmtTime(rec.created_ts)],
+    ]));
+
+    const copy = Object.assign({}, rec);
+    delete copy.logs;
+    const raw = el("div", "box");
+    raw.appendChild(el("pre", null, JSON.stringify(copy, null, 2)));
+    card.appendChild(raw);
+
+    const logBox = el("div", "box");
+    const lines = rec.logs || [];
+    if (!lines.length) logBox.appendChild(el("pre", null, "(no log lines)"));
+    else lines.forEach((line) => logBox.appendChild(el("pre", null, String(line))));
+    card.appendChild(logBox);
+
+    const host = $("task-detail");
+    host.innerHTML = "";
+    host.appendChild(card);
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+}
+
+async function loadTasks() {
+  if (tokenGuard($("task-status-line"))) return;
+  setStatus($("task-status-line"), "loading…");
+  try {
+    const params = ["limit=50"];
+    if ($("task-queue").value) params.push("queue=" + encodeURIComponent($("task-queue").value));
+    if ($("task-status").value) params.push("status=" + encodeURIComponent($("task-status").value));
+    const data = await apiJson("/tasks?" + params.join("&"));
+    const host = $("task-list");
+    host.innerHTML = "";
+    renderTaskStats(data.stats || {});
+    fillCauses(data.causes);
+    setStatus($("task-status-line"), plural(data.count, "task"));
+    const list = data.tasks || [];
+    list.forEach((task) => host.appendChild(taskRow(task)));
+    if (!list.length) {
+      host.appendChild(emptyState(
+        "Scanners queue repairs; Chat queues agent jobs.",
+        "i-list", "No tasks in this view"));
+    }
+    const depth = (data.stats && data.stats.queue_depth) || {};
+    const queueTotal = num(depth.repair_critical) + num(depth.repair_normal) + num(depth.agent);
+    setCount("nav-count-tasks", queueTotal, "");
+  } catch (e) {
+    setStatus($("task-status-line"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Learning
+   ========================================================================== */
+
+function learningCard(profile) {
+  const card = el("div", "item");
+  const top = el("div", "item-top");
+  top.appendChild(el("span", "item-title", profile.resource || profile.id));
+  top.appendChild(el("span", "badge", "tier " + num(profile.tier)));
+  top.appendChild(el("span", "badge " + (profile.quarantined ? "needs_human" : "resolved"),
+    profile.quarantined ? "quarantined" : "active"));
+  card.appendChild(top);
+
+  const meta = el("div", "item-meta");
+  [profile.namespace, profile.cause,
+    "memory ×" + num(profile.memory_step, 1),
+    "cooldown " + num(profile.cooldown_seconds) + "s",
+    "budget " + num(profile.budget_per_hour) + "/h",
+    num(profile.successes) + " ok / " + num(profile.failures) + " failed",
+  ].filter(Boolean).forEach((part) => meta.appendChild(el("span", null, part)));
+  card.appendChild(meta);
+
+  const adaptations = profile.adaptations || [];
+  if (adaptations.length) {
+    const list = el("div", "list");
+    adaptations.slice(-5).forEach((entry) => {
+      const row = el("div", "item");
+      const rowTop = el("div", "item-top");
+      rowTop.appendChild(el("span", "item-title", entry.name || "adaptation"));
+      if (entry.from !== undefined && entry.to !== undefined) {
+        rowTop.appendChild(el("span", "item-id",
+          entry.from + " → " + entry.to));
+      }
+      row.appendChild(rowTop);
+      if (entry.reason) row.appendChild(el("div", "item-meta", entry.reason));
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+  return card;
+}
+
+async function loadLearning() {
+  if (tokenGuard($("learning-status"))) return;
+  setStatus($("learning-status"), "loading…");
+  try {
+    const data = await apiJson("/learning?limit=50");
+    const host = $("learning-profiles");
+    host.innerHTML = "";
+    const profiles = data.profiles || [];
+    profiles.forEach((profile) => host.appendChild(learningCard(profile)));
+    if (!profiles.length) {
+      host.appendChild(emptyState(
+        "A profile appears after the first verified repair.",
+        "i-trend", "Nothing learned yet"));
+    }
+    const outcomes = data.outcomes || [];
+    const lines = outcomes.map((outcome) => {
+      const when = outcome.ts_iso || fmtTime(outcome.ts);
+      const mark = outcome.ok ? "ok" : (outcome.needs_human ? "needs human" : "failed");
+      return [when, outcome.namespace + "/" + outcome.resource, outcome.cause,
+        outcome.action || "-", "[" + mark + "]"].join("  ");
+    });
+    $("learning-outcomes").textContent = lines.join("\n") || "No outcomes yet.";
+    const stats = data.stats || {};
+    setStatus($("learning-status"),
+      plural(stats.outcomes || 0, "outcome") + " · " +
+      plural(stats.profiles || 0, "profile") +
+      (data.enabled ? "" : " · disabled"));
+  } catch (e) {
+    setStatus($("learning-status"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Audit
+   ========================================================================== */
+
+async function loadAudit() {
+  if (tokenGuard($("audit-status"))) return;
+  setStatus($("audit-status"), "loading…");
+  try {
+    const data = await apiJson("/audit?limit=100");
+    const body = $("audit-body");
+    body.innerHTML = "";
+    setStatus($("audit-status"), plural(data.count, "record"));
+    const records = data.records || [];
+    records.forEach((record) => {
+      const tr = el("tr");
+      const cells = [
+        fmtTime(record.ts),
+        record.action || record.tool || "",
+        (record.resource || "") + (record.name ? "/" + record.name : ""),
+        record.phase || "",
+        record.incident_id || "",
+        record.audit_id || "",
+      ];
+      cells.forEach((value, index) => {
+        const td = el("td", index === 1 || index === 4 || index === 5 ? "mono" : null, value);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    if (!records.length) {
+      const tr = el("tr");
+      const td = el("td", null, "No audit records yet.");
+      td.colSpan = 6;
+      td.style.color = "var(--text-faint)";
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+  } catch (e) {
+    setStatus($("audit-status"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Provider
+   ========================================================================== */
+
+function providerDefaults(name) {
+  const p = state.provider;
+  if (!p || !p.defaults || !p.defaults[name]) return null;
+  return p.defaults[name];
+}
+
+function fillProviderForm(p) {
+  if (!p) return;
+  const select = $("p-provider");
+  if (select.options.length === 0) {
+    (p.providers || []).forEach((name) => {
+      const opt = el("option", null, name);
+      opt.value = name;
+      select.appendChild(opt);
+    });
+  }
+  select.value = p.provider || "ollama";
+  $("p-model").value = p.model || "";
+  $("p-base").value = p.base_url || "";
+  $("p-tokens").value = p.max_tokens || 1024;
+  $("p-policy").value = p.data_policy || "redact";
+}
+
+async function loadProvider() {
+  if (tokenGuard($("provider-status"))) return;
+  setStatus($("provider-status"), "loading…");
+  try {
+    const p = await apiJson("/provider");
+    state.provider = p;
+    fillProviderForm(p);
+    $("provider-json").textContent = JSON.stringify(p, null, 2);
+    $("provider-name").textContent = p.provider || "—";
+    $("model-name").textContent = p.model || "—";
+    const parts = [p.ok ? "loaded" : (p.error || "misconfigured")];
+    if (p.api_key_set && p.api_key_hint) parts.push("key " + p.api_key_hint);
+    else if (!p.local_model_enabled) parts.push("no API key");
+    setStatus($("provider-status"), parts.join(" · "), !p.ok);
+  } catch (e) {
+    setStatus($("provider-status"), e.message, true);
+  }
+}
+
+/* ==========================================================================
+   Command palette
+   ========================================================================== */
+
+function paletteCommands() {
+  const commands = [];
+  Object.keys(PAGES).forEach((name) => {
+    commands.push({
+      label: "Go to " + PAGES[name].title,
+      hint: PAGES[name].sub,
+      icon: name === "overview" ? "i-grid" : (name === "chat" ? "i-chat"
+        : (name === "incidents" ? "i-alert" : (name === "approvals" ? "i-shield"
+          : (name === "tasks" ? "i-list" : (name === "learning" ? "i-trend"
+            : (name === "audit" ? "i-file" : "i-cpu")))))),
+      run: () => activateTab(name),
+    });
+  });
+  commands.push({
+    label: "Refresh this view",
+    hint: "reload the current section",
+    icon: "i-refresh",
+    run: () => { reloadTab(); toast("Refreshing…"); },
+  });
+  commands.push({
+    label: "Refresh platform health",
+    hint: "GET /health",
+    icon: "i-activity",
+    run: () => { refreshHealth().then((ok) => toast(ok ? "API ok" : "API unreachable", ok ? "good" : "bad")); },
+  });
+  commands.push({
+    label: state.theme === "light" ? "Switch to dark theme" : "Switch to light theme",
+    hint: "appearance",
+    icon: state.theme === "light" ? "i-moon" : "i-sun",
+    run: () => applyTheme(state.theme === "light" ? "dark" : "light"),
+  });
+  commands.push({
+    label: "API access token",
+    hint: "add, replace or forget the bearer token",
+    icon: "i-key",
+    run: () => openAuthModal(""),
+  });
+  commands.push({
+    label: "Run the task in Chat",
+    hint: "Ctrl+Enter",
+    icon: "i-play",
+    run: () => { activateTab("chat"); setTimeout(() => $("task").focus(), 60); },
+  });
+  return commands;
+}
+
+function openPalette() {
+  const modal = $("palette-modal");
+  if (!modal) return;
+  state.palette.open = true;
+  state.palette.index = 0;
+  modal.classList.remove("hidden");
+  const input = $("palette-input");
+  if (input) { input.value = ""; setTimeout(() => input.focus(), 30); }
+  renderPalette();
+}
+
+function closePalette() {
+  const modal = $("palette-modal");
+  if (modal) modal.classList.add("hidden");
+  state.palette.open = false;
+}
+
+function renderPalette() {
+  const host = $("palette-list");
+  if (!host) return;
+  const query = ($("palette-input").value || "").trim().toLowerCase();
+  const items = paletteCommands().filter((command) => {
+    if (!query) return true;
+    return (command.label + " " + command.hint).toLowerCase().includes(query);
+  });
+  state.palette.items = items;
+  state.palette.index = Math.min(state.palette.index, Math.max(0, items.length - 1));
+  host.innerHTML = "";
+  if (!items.length) {
+    host.appendChild(el("div", "palette-empty", "No matching command."));
+    return;
+  }
+  items.forEach((command, index) => {
+    const button = el("button", "palette-item" + (index === state.palette.index ? " sel" : ""));
+    button.appendChild(icon(command.icon, "ic-sm"));
+    button.appendChild(el("span", null, command.label));
+    button.appendChild(el("span", "spacer"));
+    button.appendChild(el("kbd", null, command.hint));
+    button.addEventListener("click", () => {
+      closePalette();
+      command.run();
+    });
+    host.appendChild(button);
+  });
+}
+
+function movePalette(delta) {
+  const total = state.palette.items.length;
+  if (!total) return;
+  state.palette.index = (state.palette.index + delta + total) % total;
+  renderPalette();
+  const selected = $("palette-list").querySelector(".palette-item.sel");
+  if (selected) selected.scrollIntoView({ block: "nearest" });
+}
+
+function runPaletteSelection() {
+  const command = state.palette.items[state.palette.index];
+  if (!command) return;
+  closePalette();
+  command.run();
+}
+
+/* ==========================================================================
+   Wiring
+   ========================================================================== */
+
+function wire() {
+  // -- theme ------------------------------------------------------------
+  $("theme-toggle").addEventListener("click", () => {
+    applyTheme(state.theme === "light" ? "dark" : "light");
+  });
+
+  // -- navigation ------------------------------------------------------
+  $$(".nav-item[data-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => activateTab(btn.dataset.tab));
+    btn.addEventListener("keydown", (ev) => {
+      const tabs = $$(".nav-item[data-tab]");
+      const index = tabs.indexOf(btn);
+      let next = -1;
+      if (ev.key === "ArrowDown" || ev.key === "ArrowRight") next = (index + 1) % tabs.length;
+      if (ev.key === "ArrowUp" || ev.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+      if (ev.key === "Home") next = 0;
+      if (ev.key === "End") next = tabs.length - 1;
+      if (next < 0) return;
+      ev.preventDefault();
+      tabs[next].focus();
+      activateTab(tabs[next].dataset.tab);
+    });
+  });
+  $("menu-btn").addEventListener("click", () => {
+    if ($("sidebar").classList.contains("open")) closeDrawer();
+    else openDrawer();
+  });
+  $("ov-goto-incidents").addEventListener("click", () => activateTab("incidents"));
+  $("ov-goto-approvals").addEventListener("click", () => activateTab("approvals"));
+
+  // -- auth ------------------------------------------------------------
+  $("token-btn").addEventListener("click", () => openAuthModal(""));
+  $("banner-token").addEventListener("click", () => openAuthModal(""));
+  $("token-cancel").addEventListener("click", closeAuthModal);
+  $("auth-modal").addEventListener("click", (ev) => {
     if (ev.target === $("auth-modal")) closeAuthModal();
-  };
-  $("token-show").onclick = () => {
+  });
+  $("token-show").addEventListener("click", () => {
     const input = $("token-input");
     const hidden = input.type === "password";
     input.type = hidden ? "text" : "password";
-    $("token-show").textContent = hidden ? "Hide" : "Show";
-  };
-  $("token-copy").onclick = async () => {
+    $("token-show").lastChild.textContent = hidden ? "Hide" : "Show";
+  });
+  $("token-copy").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("token-cmd").textContent);
       setTokenMsg("Command copied.");
     } catch (_) {
       setTokenMsg("Copy failed — select the command manually.", true);
     }
-  };
-  $("token-save").onclick = () => {
+  });
+  $("token-save").addEventListener("click", () => {
     saveToken($("token-input").value, false);
     setTokenMsg(state.token ? "Saved. Click “Test and save” to verify it."
       : "Token removed.");
-  };
-  $("token-test").onclick = async () => {
+  });
+  $("token-test").addEventListener("click", async () => {
     const value = $("token-input").value.trim();
     if (!value) { setTokenMsg("Paste a token first.", true); return; }
     setTokenMsg("Testing…");
@@ -543,487 +2884,60 @@
     saveToken(value, true);
     setTokenMsg("Token accepted.");
     closeAuthModal();
-    toast("API token saved.");
+    toast("API token saved.", "good");
     reloadTab();
-  };
-  $("token-forget").onclick = () => {
+  });
+  $("token-forget").addEventListener("click", () => {
     saveToken("", false);
     setTokenMsg("Token removed from this browser.");
     $("token-input").value = "";
-  };
-
-  // -- http ------------------------------------------------------------- //
-  // 401 on any call re-opens the modal: silently retrying with an empty token
-  // is what produced the old "401 — set the token" toast with no way forward.
-  async function api(path, opts = {}) {
-    const { silent, ...rest } = opts;
-    const res = await fetch(path, {
-      ...rest,
-      headers: {
-        ...(state.auth === "off" ? {} : { "Authorization": "Bearer " + state.token }),
-        ...(rest.body ? { "Content-Type": "application/json" } : {}),
-        ...(rest.headers || {}),
-      },
-    });
-    if (res.status === 401) {
-      state.verified = false;
-      renderAuth();
-      if (!silent) openAuthModal("That request was rejected: the API token is " +
-        "missing or expired.");
-    }
-    return res;
-  }
-
-  async function apiJson(path, opts) {
-    const res = await api(path, opts);
-    let body = null;
-    try { body = await res.json(); } catch (_) {}
-    if (!res.ok) {
-      const msg = (body && (body.error || body.hint)) || ("HTTP " + res.status);
-      const err = new Error(msg);
-      err.status = res.status;
-      throw err;
-    }
-    return body;
-  }
-
-  // -- header / health -------------------------------------------------- //
-  // One poll, one writer per element: the old code updated the health chip
-  // twice and could leave a stale "API unreachable" next to "API ok".
-  async function refreshHealth() {
-    try {
-      const h = await (await fetch("/health")).json();
-      $("health-dot").className = "dot ok";
-      $("health-text").textContent = h.status === "ok" ? "API ok"
-        : (h.status || "degraded");
-      $("provider-name").textContent = h.provider || "—";
-      $("model-name").textContent = h.model || "—";
-      const wasOff = state.auth === "off";
-      state.auth = h.auth || "bearer";
-      if (wasOff !== (state.auth === "off")) renderAuth();
-      return true;
-    } catch (_) {
-      $("health-dot").className = "dot bad";
-      $("health-text").textContent = "API unreachable";
-      return false;
-    }
-  }
-
-  // -- tabs ------------------------------------------------------------- //
-  function reloadTab() {
-    if (currentTab === "incidents") loadIncidents();
-    if (currentTab === "approvals") { loadApprovals(); loadPolicy(); }
-    if (currentTab === "tasks") loadTasks();
-    if (currentTab === "audit") loadAudit();
-    if (currentTab === "provider") loadProvider();
-  }
-
-  document.querySelectorAll("nav button").forEach((btn) => {
-    btn.onclick = () => {
-      currentTab = btn.dataset.tab;
-      document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
-      document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + currentTab));
-      reloadTab();
-    };
   });
 
-  // -- chat ------------------------------------------------------------- //
-  function setStatus(el, text, bad) {
-    el.textContent = text || "";
-    el.classList.toggle("err", !!bad);
-  }
-
-  async function pollJob(id) {
-    try {
-      const job = await apiJson("/jobs/" + encodeURIComponent(id), { silent: true });
-      const lines = job.logs || job.log || [];
-      $("log").textContent = lines.join("\n") || "…";
-      $("log").scrollTop = $("log").scrollHeight;
-      setStatus($("chat-status"), `${job.status} · ${Math.round(job.elapsed || 0)}s`);
-      if (job.done) {
-        state.job = null;
-        clearInterval(state.timer);
-        $("run").disabled = false;
-        $("cancel").classList.add("hidden");
-        if (job.status === "done") {
-          setStatus($("chat-status"), "done");
-          const r = job.result || {};
-          $("answer").textContent = r.final || JSON.stringify(r, null, 2);
-        } else {
-          setStatus($("chat-status"), job.status + (job.error ? ": " + job.error : ""), true);
-          if (job.result) $("answer").textContent = JSON.stringify(job.result, null, 2);
-        }
-      }
-    } catch (e) {
-      clearInterval(state.timer);
-      state.job = null;
-      $("run").disabled = false;
-      $("cancel").classList.add("hidden");
-      setStatus($("chat-status"), e.message, true);
-    }
-  }
-
-  $("run").onclick = async () => {
-    const task = $("task").value.trim();
-    if (!task) { setStatus($("chat-status"), "Write a task first.", true); return; }
-    if (!state.token && state.auth !== "off") { openAuthModal(""); return; }
-    $("run").disabled = true;
-    $("cancel").classList.remove("hidden");
-    $("log").textContent = "starting…";
-    $("answer").textContent = "";
-    setStatus($("chat-status"), "queued");
-    try {
-      const job = await apiJson("/run?async=1", {
-        method: "POST", body: JSON.stringify({ task }),
-      });
-      state.job = job.job_id;
-      clearInterval(state.timer);
-      state.timer = setInterval(() => pollJob(state.job), 1500);
-      pollJob(state.job);
-    } catch (e) {
-      $("run").disabled = false;
-      $("cancel").classList.add("hidden");
-      setStatus($("chat-status"), e.message, true);
-    }
-  };
-
-  $("cancel").onclick = async () => {
+  // -- chat ------------------------------------------------------------
+  $("run").addEventListener("click", runTask);
+  $("cancel").addEventListener("click", async () => {
     if (!state.job) return;
     try {
       await apiJson("/jobs/" + encodeURIComponent(state.job) + "/cancel", { method: "POST" });
       setStatus($("chat-status"), "cancel requested");
     } catch (e) { setStatus($("chat-status"), e.message, true); }
-  };
-
-  // -- incidents -------------------------------------------------------- //
-  function fmtTime(ts) {
-    if (!ts) return "";
-    const d = new Date(ts * 1000);
-    return isNaN(d) ? String(ts) : d.toLocaleString();
-  }
-
-  function tokenGuard(statusEl, what) {
-    if (state.token || state.auth === "off") return false;
-    setStatus(statusEl, "Token required — click “Add token”.", true);
-    openAuthModal("");
-    return true;
-  }
-
-  async function loadIncidents() {
-    if (tokenGuard($("incident-status"))) return;
-    setStatus($("incident-status"), "loading…");
-    try {
-      const status = $("incident-filter").value;
-      const data = await apiJson("/incidents?limit=50" + (status ? "&status=" + status : ""));
-      const list = $("incident-list");
-      list.innerHTML = "";
-      setStatus($("incident-status"), `${data.count} incident(s)`);
-      data.incidents.forEach((rec) => list.appendChild(incidentCard(rec)));
-      if (!data.incidents.length) {
-        const empty = document.createElement("div");
-        empty.className = "meta";
-        empty.textContent = "No incidents. The controller records one when it detects a problem.";
-        list.appendChild(empty);
-      }
-    } catch (e) { setStatus($("incident-status"), e.message, true); }
-  }
-
-  // -- approvals --------------------------------------------------------- //
-  async function loadApprovals() {
-    if (tokenGuard($("approval-status"))) return;
-    setStatus($("approval-status"), "loading…");
-    try {
-      const status = $("approval-filter").value;
-      const data = await apiJson("/approvals?limit=50" + (status ? "&status=" + status : ""));
-      const list = $("approval-list");
-      list.innerHTML = "";
-      setStatus($("approval-status"), `${data.count} approval(s)`);
-      data.approvals.forEach((rec) => list.appendChild(approvalCard(rec)));
-      if (!data.approvals.length) {
-        const empty = document.createElement("div");
-        empty.className = "meta";
-        empty.textContent = "No approval requests. A repair plan appears here when the policy rates it above the automatic tier.";
-        list.appendChild(empty);
-      }
-    } catch (e) { setStatus($("approval-status"), e.message, true); }
-  }
-
-  function approvalCard(rec) {
-    const el = document.createElement("div");
-    el.className = "incident";
-    const plan = rec.plan || {};
-    const top = document.createElement("div");
-    top.className = "top";
-    const sum = document.createElement("div");
-    sum.className = "sum";
-    sum.textContent = plan.action || plan.root_cause || rec.id;
-    const tier = document.createElement("span");
-    tier.className = "badge";
-    tier.textContent = "tier " + (plan.tier != null ? plan.tier : "?");
-    const badge = document.createElement("span");
-    badge.className = "badge " + (rec.status || "");
-    badge.textContent = rec.status || "?";
-    const id = document.createElement("span");
-    id.className = "id";
-    id.textContent = rec.id;
-    top.append(sum, tier, badge, id);
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = [plan.resource, plan.namespace, fmtTime(rec.created_at),
-      (rec.policy && rec.policy.reason) || ""].filter(Boolean).join(" · ");
-    el.append(top, meta);
-
-    if (plan.expected_effect || plan.verification) {
-      const detail = document.createElement("pre");
-      detail.textContent = [plan.expected_effect,
-        plan.verification ? "verify: " + plan.verification : "",
-        plan.rollback && plan.rollback.note ? "undo: " + plan.rollback.note : ""
-      ].filter(Boolean).join("\n");
-      el.append(detail);
+  });
+  $("task").addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") {
+      ev.preventDefault();
+      runTask();
     }
-
-    if (rec.status === "pending") {
-      const row = document.createElement("div");
-      row.className = "row";
-      const approve = document.createElement("button");
-      approve.className = "primary";
-      approve.textContent = "Approve";
-      approve.onclick = () => decideApproval(rec.id, true);
-      const reject = document.createElement("button");
-      reject.className = "danger";
-      reject.textContent = "Reject";
-      reject.onclick = () => decideApproval(rec.id, false);
-      row.append(approve, reject);
-      el.append(row);
-    }
-    return el;
-  }
-
-  async function decideApproval(id, approve) {
-    const path = "/approvals/" + encodeURIComponent(id) + (approve ? "/approve" : "/reject");
+  });
+  $("chat-copy-log").addEventListener("click", async () => {
     try {
-      const data = await apiJson(path, {
-        method: "POST",
-        body: JSON.stringify({ by: "ui", comment: approve ? "approved in the UI" : "rejected in the UI" })
-      });
-      setStatus($("approval-status"), data.ok ? (approve ? "approved" : "rejected") : "failed");
-      loadApprovals();
-    } catch (e) { setStatus($("approval-status"), e.message, true); }
-  }
-
-  async function loadPolicy() {
-    if (tokenGuard($("policy-status"))) return;
+      await navigator.clipboard.writeText($("log").innerText);
+      toast("Log copied.");
+    } catch (_) { toast("Copy failed.", "bad"); }
+  });
+  $("chat-copy-answer").addEventListener("click", async () => {
     try {
-      const data = await apiJson("/policy");
-      const select = $("policy-mode");
-      if (data.ok) {
-        select.value = data.policy.mode || "";
-        setStatus($("policy-status"), "mode: " + data.policy.mode + " · source: " + data.source);
-        $("policy-view").textContent = JSON.stringify(data.policy, null, 2);
-      } else {
-        setStatus($("policy-status"), "the policy is invalid: " + data.error, true);
-        $("policy-view").textContent = data.error;
-      }
-    } catch (e) { setStatus($("policy-status"), e.message, true); }
-  }
+      await navigator.clipboard.writeText($("answer").innerText);
+      toast("Answer copied.");
+    } catch (_) { toast("Copy failed.", "bad"); }
+  });
 
-  function incidentCard(rec) {
-    const el = document.createElement("div");
-    el.className = "incident";
-    const top = document.createElement("div");
-    top.className = "top";
-    const sum = document.createElement("div");
-    sum.className = "sum";
-    sum.textContent = rec.summary || rec.reason || rec.resource || rec.id;
-    const badge = document.createElement("span");
-    badge.className = "badge " + (rec.status || "");
-    badge.textContent = rec.status || "?";
-    const sev = document.createElement("span");
-    sev.className = "badge";
-    sev.textContent = rec.severity || "info";
-    const id = document.createElement("span");
-    id.className = "id";
-    id.textContent = rec.id;
-    top.append(sum, sev, badge, id);
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = [rec.resource, rec.namespace, fmtTime(rec.created_at),
-      rec.action && ("action: " + rec.action)].filter(Boolean).join(" · ");
-    el.append(top, meta);
-    el.onclick = () => showIncident(rec.id);
-    return el;
-  }
+  // -- incidents -------------------------------------------------------
+  $("incident-reload").addEventListener("click", loadIncidents);
+  $("incident-filter").addEventListener("change", loadIncidents);
 
-  async function showIncident(id) {
-    try {
-      const rec = await apiJson("/incidents/" + encodeURIComponent(id));
-      const detail = document.createElement("pre");
-      detail.textContent = JSON.stringify(rec, null, 2);
-      const box = document.createElement("div");
-      box.className = "incident";
-      const close = document.createElement("button");
-      close.textContent = "Close";
-      close.onclick = (ev) => { ev.stopPropagation(); box.remove(); };
-      box.append(close, detail);
-      $("incident-list").prepend(box);
-    } catch (e) { toast(e.message, true); }
-  }
+  // -- approvals -------------------------------------------------------
+  $("approval-reload").addEventListener("click", loadApprovals);
+  $("approval-filter").addEventListener("change", loadApprovals);
+  $("policy-reload").addEventListener("click", loadPolicy);
 
-  $("incident-reload").onclick = loadIncidents;
-  $("incident-filter").onchange = loadIncidents;
+  // -- learning --------------------------------------------------------
+  $("learning-reload").addEventListener("click", loadLearning);
 
-  // -- approvals --------------------------------------------------------- //
-  $("approval-reload").onclick = loadApprovals;
-  $("approval-filter").onchange = loadApprovals;
-  $("policy-reload").onclick = loadPolicy;
-
-  // -- tasks ------------------------------------------------------------ //
-  // One list + one detail pane: the list polls every few seconds, the open
-  // detail does not, so reading a task is not interrupted by a refresh.
-  function chips(el, parts) {
-    el.innerHTML = "";
-    parts.forEach((text) => {
-      const chip = document.createElement("span");
-      chip.className = "chip";
-      chip.textContent = text;
-      el.appendChild(chip);
-    });
-  }
-
-  function renderTaskStats(stats) {
-    const depth = stats.queue_depth || {};
-    const active = stats.active || {};
-    chips($("task-stats"), [
-      "repair critical " + (depth.repair_critical || 0),
-      "repair normal " + (depth.repair_normal || 0),
-      "agent " + (depth.agent || 0),
-      "active repair " + (active.repair || 0),
-      "active agent " + (active.agent || 0),
-      "delayed " + (depth.delayed || 0),
-      "dead " + (depth.dead || 0),
-      "budget " + (stats.budget_used || 0) + "/h",
-      "backend " + (stats.backend || "?"),
-    ]);
-  }
-
-  function fillCauses(causes) {
-    const select = $("m-cause");
-    if (select.options.length > 0 || !causes) return;
-    Object.keys(causes).sort().forEach((cause) => {
-      const opt = document.createElement("option");
-      opt.value = cause;
-      opt.textContent = cause + " (" + causes[cause] + ")";
-      select.appendChild(opt);
-    });
-  }
-
-  function taskCard(task) {
-    const el = document.createElement("div");
-    el.className = "incident";
-    const top = document.createElement("div");
-    top.className = "top";
-    const sum = document.createElement("div");
-    sum.className = "sum";
-    sum.textContent = (task.resource || "(no resource)") +
-      (task.cause ? " · " + task.cause : "");
-    const queue = document.createElement("span");
-    queue.className = "badge";
-    queue.textContent = task.queue || "?";
-    const badge = document.createElement("span");
-    badge.className = "badge " + (task.status || "");
-    badge.textContent = task.status || "?";
-    const id = document.createElement("span");
-    id.className = "id";
-    id.textContent = task.id;
-    top.append(sum, queue, badge, id);
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = [
-      task.namespace,
-      task.priority,
-      "attempt " + (task.attempts || 0),
-      task.worker ? "on " + task.worker : "",
-      fmtTime(task.created_ts),
-      task.incident_id,
-    ].filter(Boolean).join(" · ");
-    el.append(top, meta);
-    el.onclick = () => showTask(task.id);
-    return el;
-  }
-
-  async function showTask(id) {
-    try {
-      const rec = await apiJson("/tasks/" + encodeURIComponent(id));
-      const box = document.createElement("div");
-      box.className = "incident";
-      const row = document.createElement("div");
-      row.className = "row";
-      const title = document.createElement("b");
-      title.textContent = id;
-      const spacer = document.createElement("span");
-      spacer.className = "spacer";
-      const cancel = document.createElement("button");
-      cancel.className = "danger";
-      cancel.textContent = "Cancel task";
-      cancel.onclick = async (ev) => {
-        ev.stopPropagation();
-        try {
-          await apiJson("/tasks/" + encodeURIComponent(id) + "/cancel",
-                        { method: "POST" });
-          toast("Cancel requested");
-          box.remove();
-          loadTasks();
-        } catch (e) { toast(e.message, true); }
-      };
-      const close = document.createElement("button");
-      close.textContent = "Close";
-      close.onclick = (ev) => { ev.stopPropagation(); box.remove(); };
-      row.append(title, spacer, cancel, close);
-
-      const copy = Object.assign({}, rec);
-      delete copy.logs;
-      const detail = document.createElement("pre");
-      detail.textContent = JSON.stringify(copy, null, 2);
-      const log = document.createElement("div");
-      log.className = "box";
-      const pre = document.createElement("pre");
-      pre.textContent = (rec.logs || []).join("\n") || "(no log lines)";
-      log.appendChild(pre);
-      box.append(row, detail, log);
-      $("task-detail").innerHTML = "";
-      $("task-detail").appendChild(box);
-    } catch (e) { toast(e.message, true); }
-  }
-
-  async function loadTasks() {
-    if (tokenGuard($("task-status-line"))) return;
-    setStatus($("task-status-line"), "loading…");
-    try {
-      const params = ["limit=50"];
-      if ($("task-queue").value) params.push("queue=" + encodeURIComponent($("task-queue").value));
-      if ($("task-status").value) params.push("status=" + encodeURIComponent($("task-status").value));
-      const data = await apiJson("/tasks?" + params.join("&"));
-      const list = $("task-list");
-      list.innerHTML = "";
-      renderTaskStats(data.stats || {});
-      fillCauses(data.causes);
-      setStatus($("task-status-line"), data.count + " task(s)");
-      data.tasks.forEach((task) => list.appendChild(taskCard(task)));
-      if (!data.tasks.length) {
-        const empty = document.createElement("div");
-        empty.className = "meta";
-        empty.textContent = "No tasks in this view. Scanners queue repairs; " +
-          "Chat queues agent jobs.";
-        list.appendChild(empty);
-      }
-    } catch (e) { setStatus($("task-status-line"), e.message, true); }
-  }
-
-  $("task-reload").onclick = loadTasks;
-  $("task-queue").onchange = loadTasks;
-  $("task-status").onchange = loadTasks;
-
-  $("m-submit").onclick = async () => {
+  // -- tasks -----------------------------------------------------------
+  $("task-reload").addEventListener("click", loadTasks);
+  $("task-queue").addEventListener("change", loadTasks);
+  $("task-status").addEventListener("change", loadTasks);
+  $("m-submit").addEventListener("click", async () => {
     const payload = {
       queue: "repair",
       kind: $("m-kind").value,
@@ -1042,99 +2956,30 @@
         method: "POST", body: JSON.stringify(payload),
       });
       setStatus($("m-status"), "queued " + res.task_id);
-      toast("Repair task queued");
+      toast("Repair task queued", "good");
       $("m-name").value = "";
       loadTasks();
     } catch (e) { setStatus($("m-status"), e.message, true); }
-  };
+  });
 
-  // -- audit ------------------------------------------------------------ //
-  async function loadAudit() {
-    if (tokenGuard($("audit-status"))) return;
-    setStatus($("audit-status"), "loading…");
-    try {
-      const data = await apiJson("/audit?limit=100");
-      const body = $("audit-body");
-      body.innerHTML = "";
-      setStatus($("audit-status"), `${data.count} record(s)`);
-      data.records.forEach((r) => {
-        const tr = document.createElement("tr");
-        const cells = [
-          fmtTime(r.ts),
-          (r.action || r.tool || ""),
-          (r.resource || "") + (r.name ? "/" + r.name : ""),
-          (r.phase || ""),
-          (r.incident_id || ""),
-          (r.audit_id || ""),
-        ];
-        cells.forEach((value, i) => {
-          const td = document.createElement("td");
-          if (i === 1 || i === 4 || i === 5) td.className = "mono";
-          td.textContent = value;
-          tr.appendChild(td);
-        });
-        body.appendChild(tr);
-      });
-    } catch (e) { setStatus($("audit-status"), e.message, true); }
-  }
-  $("audit-reload").onclick = loadAudit;
+  // -- audit -----------------------------------------------------------
+  $("audit-reload").addEventListener("click", loadAudit);
 
-  // -- provider --------------------------------------------------------- //
-  function providerDefaults(name) {
-    const p = state.provider;
-    if (!p || !p.defaults || !p.defaults[name]) return null;
-    return p.defaults[name];
-  }
-
-  function fillProviderForm(p) {
-    const select = $("p-provider");
-    if (select.options.length === 0) {
-      (p.providers || []).forEach((name) => {
-        const opt = document.createElement("option");
-        opt.value = name;
-        opt.textContent = name;
-        select.appendChild(opt);
-      });
-    }
-    select.value = p.provider || "ollama";
-    $("p-model").value = p.model || "";
-    $("p-base").value = p.base_url || "";
-    $("p-tokens").value = p.max_tokens || 1024;
-    $("p-policy").value = p.data_policy || "redact";
-  }
-
-  async function loadProvider() {
-    if (tokenGuard($("provider-status"))) return;
-    setStatus($("provider-status"), "loading…");
-    try {
-      const p = await apiJson("/provider");
-      state.provider = p;
-      fillProviderForm(p);
-      $("provider-json").textContent = JSON.stringify(p, null, 2);
-      $("provider-name").textContent = p.provider || "—";
-      $("model-name").textContent = p.model || "—";
-      const parts = [p.ok ? "loaded" : (p.error || "misconfigured")];
-      if (p.api_key_set && p.api_key_hint) parts.push("key " + p.api_key_hint);
-      else if (!p.local_model_enabled) parts.push("no API key");
-      setStatus($("provider-status"), parts.join(" · "), !p.ok);
-    } catch (e) { setStatus($("provider-status"), e.message, true); }
-  }
-
-  $("provider-reload").onclick = loadProvider;
-  $("p-provider").onchange = () => {
+  // -- provider --------------------------------------------------------
+  $("provider-reload").addEventListener("click", loadProvider);
+  $("p-provider").addEventListener("change", () => {
     const defaults = providerDefaults($("p-provider").value);
     if (!defaults) return;
     $("p-base").value = defaults.base_url || "";
     $("p-model").value = defaults.model || "";
-  };
-  $("p-key-toggle").onclick = () => {
+  });
+  $("p-key-toggle").addEventListener("click", () => {
     const input = $("p-key");
     const hidden = input.type === "password";
     input.type = hidden ? "text" : "password";
-    $("p-key-toggle").textContent = hidden ? "Hide" : "Show";
-  };
-
-  $("provider-save").onclick = async () => {
+    $("p-key-toggle").lastChild.textContent = hidden ? "Hide" : "Show";
+  });
+  $("provider-save").addEventListener("click", async () => {
     const payload = {
       provider: $("p-provider").value,
       base_url: $("p-base").value.trim(),
@@ -1159,43 +3004,95 @@
       const msg = ["saved", applied, res.api_key_change !== "unchanged"
         ? "key " + res.api_key_change : ""].filter(Boolean).join(" · ");
       setStatus($("provider-status"), msg, !res.ok);
-      toast("Provider settings saved");
+      toast("Provider settings saved", "good");
     } catch (e) { setStatus($("provider-status"), e.message, true); }
-  };
-
-  $("provider-clear-key").onclick = async () => {
+  });
+  $("provider-clear-key").addEventListener("click", async () => {
     if (!confirm("Remove the stored provider API key? A remote provider will " +
-                 "then fail every request (no local fallback).")) return;
+      "then fail every request (no local fallback).")) return;
     setStatus($("provider-status"), "clearing…");
     try {
       const res = await apiJson("/provider/key", { method: "DELETE" });
       state.provider = res;
       $("provider-json").textContent = JSON.stringify(res, null, 2);
       setStatus($("provider-status"), "API key cleared", !res.ok);
+      toast("API key cleared.");
     } catch (e) { setStatus($("provider-status"), e.message, true); }
-  };
-
-  $("provider-test").onclick = async () => {
+  });
+  $("provider-test").addEventListener("click", async () => {
     setStatus($("provider-status"), "sending a tiny completion…");
     try {
       const res = await apiJson("/provider/test", { method: "POST" });
-      setStatus($("provider-status"), res.ok ? "test ok" : "test failed");
+      setStatus($("provider-status"), res.ok ? "test ok" : "test failed", !res.ok);
       $("provider-json").textContent = JSON.stringify(res, null, 2);
     } catch (e) { setStatus($("provider-status"), e.message, true); }
-  };
+  });
 
-  // -- boot ------------------------------------------------------------- //
+  // -- command palette --------------------------------------------------
+  $("palette-input").addEventListener("input", () => {
+    state.palette.index = 0;
+    renderPalette();
+  });
+  $("palette-input").addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown") { ev.preventDefault(); movePalette(1); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); movePalette(-1); }
+    else if (ev.key === "Enter") { ev.preventDefault(); runPaletteSelection(); }
+  });
+  $("palette-modal").addEventListener("click", (ev) => {
+    if (ev.target === $("palette-modal")) closePalette();
+  });
+
+  // -- global keys -----------------------------------------------------
+  document.addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "k") {
+      ev.preventDefault();
+      if (state.palette.open) closePalette();
+      else openPalette();
+      return;
+    }
+    if (ev.key === "Escape") {
+      if (state.palette.open) { closePalette(); return; }
+      if (!$("auth-modal").classList.contains("hidden")) { closeAuthModal(); return; }
+      if ($("sidebar").classList.contains("open")) { closeDrawer(); return; }
+    }
+  });
+}
+
+/* ==========================================================================
+   Boot
+   ========================================================================== */
+
+function boot() {
+  applyTheme(state.theme);
+  wire();
   renderAuth();
+  const hash = (location.hash || "").replace("#", "");
+  activateTab(PAGES[hash] ? hash : "overview", { silent: true });
   refreshHealth().then(() => {
     renderAuth();
     verifyStoredToken();
+    reloadTab();
   });
   setInterval(refreshHealth, 30000);
-  // Keep the task list current while it is on screen (the detail pane is
-  // written only on click, so a poll never closes what you are reading).
-  setInterval(() => { if (currentTab === "tasks") loadTasks(); }, 5000);
-  setInterval(() => { if (currentTab === "approvals") loadApprovals(); }, 10000);
+  // Keep the visible views current; the open detail panes are written only on
+  // click, so a poll never closes what you are reading.
+  setInterval(() => {
+    if (state.tab === "overview") loadOverview();
+    if (state.tab === "tasks") loadTasks();
+  }, 10000);
+  setInterval(() => {
+    if (state.tab === "approvals") loadApprovals();
+    if (state.tab === "incidents") loadIncidents();
+  }, 15000);
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}
 })();
+
 </script>
 </body>
 </html>

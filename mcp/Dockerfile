@@ -34,9 +34,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # NOTE: keep this list in sync with the modules in mcp/ (AGENTS.md).
 COPY agent_core.py agent_server.py agent_client.py agent_service.py \
      agent_worker.py approvals.py audit.py diagnosis.py evidence.py \
-     incidents.py k8s_tools.py llm.py n8n_tools.py \
-     ops_controller.py ops_queue.py ops_scanner.py ops_worker.py \
-     planner.py playbooks.py policy.py provider_admin.py task_store.py ./
+     incidents.py k8s_api.py k8s_ops.py k8s_tools.py learning.py llm.py \
+     metrics.py n8n_tools.py ops_controller.py ops_queue.py ops_scanner.py \
+     ops_worker.py planner.py playbooks.py policy.py provider_admin.py \
+     task_store.py watcher.py ./
 COPY ui ./ui
 
 ENV AGENT_WORKSPACE=/workspace \
@@ -51,6 +52,7 @@ ENV AGENT_WORKSPACE=/workspace \
     AGENT_NAMESPACE=auton \
     AGENT_K8S_ENABLED=1 \
     AGENT_K8S_WRITE=0 \
+    AGENT_K8S_DIRECT=1 \
     N8N_API_URL=http://n8n:5678/api/v1 \
     N8N_WEBHOOK_BASE=http://n8n:5678/webhook \
     N8N_API_KEY_FILE=/etc/n8n-api/api-key \

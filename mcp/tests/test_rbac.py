@@ -58,10 +58,11 @@ def test_roles_never_grant_secrets_or_pvc_delete():
         assert not _allows(rules, "serviceaccounts", "create")
         assert not _allows(rules, "roles", "create")
         assert not _allows(rules, "rolebindings", "create")
-        # Evidence collection uses exec, but only the agent's own Role grants
-        # it; the ops controller reaches a pod through logs/diagnose instead.
+        # Evidence collection uses exec, but only the *opt-in* write scope
+        # grants it (Phase 4); the ops controller reaches a pod through
+        # logs/diagnose instead. See test_agent_scope.py.
         if doc["metadata"]["name"] == "auton-agent":
-            assert _allows(rules, "pods/exec", "create")
+            assert not _allows(rules, "pods/exec", "create")
 
 
 def test_only_the_api_identity_may_touch_secrets_and_only_the_model_one():

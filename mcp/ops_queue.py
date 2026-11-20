@@ -36,6 +36,59 @@ class QueueError(RuntimeError):
 
 
 # --------------------------------------------------------------------------- #
+# Redis authentication (Phase 5)
+# --------------------------------------------------------------------------- #
+
+# Redis answers a wrong password with "WRONGPASS ...", a missing one with
+# "NOAUTH Authentication required." and a password against a passwordless
+# server with "ERR Client sent AUTH, but no password is set". redis-py maps
+# some of these to AuthenticationError and leaves others as a plain
+# ResponseError, so the classification looks at the message too.
+_AUTH_MARKERS = (
+    "authentication", "noauth", "wrongpass", "invalid username-password",
+    "invalid password", "no password is set", "client sent auth", "auth failed",
+)
+
+
+def _is_auth_error(exc: Exception, text: str = "") -> bool:
+    """True when a Redis failure is an authentication failure, not a outage."""
+    if "auth" in type(exc).__name__.lower():
+        return True
+    low = (text or str(exc)).lower()
+    return any(marker in low for marker in _AUTH_MARKERS)
+
+
+def redis_password() -> str:
+    """Return the queue password, or "" when none is configured.
+
+    The **file** wins over the environment variable: a mounted Secret is the
+    safer source (the value never appears in `kubectl get pod -o yaml`) and
+    it is what the manifests use.
+
+    An unreadable or an empty file is an **error**, never an empty password:
+    a client that silently connects without auth looks healthy against a
+    passwordless server and is refused by a protected one. Both cases must
+    fail closed.
+    """
+    key_file = os.environ.get("AGENT_REDIS_PASSWORD_FILE", "").strip()
+    if key_file:
+        try:
+            with open(key_file, encoding="utf-8") as fh:
+                password = fh.read().strip()
+        except OSError as exc:
+            raise QueueError(
+                f"cannot read AGENT_REDIS_PASSWORD_FILE ({key_file}): {exc}"
+            ) from exc
+        if not password:
+            raise QueueError(
+                f"AGENT_REDIS_PASSWORD_FILE ({key_file}) is empty; "
+                "the queue client refuses to start without its password"
+            )
+        return password
+    return os.environ.get("AGENT_REDIS_PASSWORD", "").strip()
+
+
+# --------------------------------------------------------------------------- #
 # In-memory backend
 # --------------------------------------------------------------------------- #
 
@@ -220,6 +273,9 @@ class RedisBackend:
 
     def __init__(self, url: str = "", password: str = "", timeout: float = 5.0,
                  client=None) -> None:
+        # How this client authenticates: "password" or "none". Reported by
+        # /health so an operator can see *that* auth is on without the value.
+        self.auth = "password" if password else "none"
         if client is not None:
             self._client = client
             return
@@ -242,7 +298,23 @@ class RedisBackend:
         try:
             return bool(self._client.ping())
         except Exception as exc:
-            raise QueueError(f"Redis is unreachable: {exc}") from exc
+            raise QueueError(self._failure(exc)) from exc
+
+    def _failure(self, exc: Exception) -> str:
+        """Classify a Redis failure.
+
+        An authentication error is not "unreachable": it means the client and
+        the server disagree about the password. Both cases fail closed — the
+        caller refuses to start — but the operator needs to know which one it
+        is, so the message says so.
+        """
+        text = str(exc)
+        if _is_auth_error(exc, text):
+            return (f"Redis authentication failed: "
+                    f"{text or type(exc).__name__}. "
+                    "Check the queue password (Secret auton-redis, key "
+                    "`password`) and AGENT_REDIS_PASSWORD_FILE.")
+        return f"Redis is unreachable: {exc}"
 
     # -- strings ---------------------------------------------------------- #
     def set(self, key: str, value: str) -> None:
@@ -360,20 +432,18 @@ def create_backend(kind: str = "", client=None):
     `redis` (the cluster). There is no silent fallback from redis to memory:
     two API pods with separate in-memory queues would look healthy and lose
     work.
+
+    The same applies to authentication (Phase 5): a missing password, a wrong
+    password and a password against a passwordless server all raise
+    `QueueError`, so the caller refuses to start. The queue never
+    "connects without auth to be nice".
     """
     kind = (kind or os.environ.get("AGENT_QUEUE", "memory")).strip().lower()
     if kind == "memory":
         return MemoryBackend()
     if kind != "redis":
         raise QueueError(f"unknown AGENT_QUEUE={kind!r} (use memory or redis)")
-    password = os.environ.get("AGENT_REDIS_PASSWORD", "").strip()
-    key_file = os.environ.get("AGENT_REDIS_PASSWORD_FILE", "").strip()
-    if key_file:
-        try:
-            with open(key_file, encoding="utf-8") as fh:
-                password = fh.read().strip()
-        except OSError as exc:
-            raise QueueError(f"cannot read AGENT_REDIS_PASSWORD_FILE: {exc}") from exc
+    password = redis_password()
     backend = RedisBackend(url=os.environ.get("AGENT_REDIS_URL", ""),
                            password=password, client=client)
     backend.ping()

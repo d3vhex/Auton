@@ -166,7 +166,15 @@ def _result(action: str, ok: bool, detail: str = "",
 # OOMKilled: raise the deployment's memory limit, roll it out, verify
 # --------------------------------------------------------------------------- #
 
-def fix_oom(pod_name: str, namespace: str, container: str = "") -> dict:
+def fix_oom(pod_name: str, namespace: str, container: str = "",
+            step: float = 0.25) -> dict:
+    """Raise the Deployment's memory limit and roll it out.
+
+    ``step`` is the *fraction* the limit grows by (0.25 = +25%). It comes
+    from the learned profile (Phase 7) when the same workload kept OOMing
+    after a repair. The value is clamped here as well, so a corrupt profile
+    can never make the bump unbounded.
+    """
     ns_err = _check_namespace(namespace)
     if ns_err:
         return _result("oom_bump_memory", False, ns_err, needs_human=True)
@@ -211,7 +219,14 @@ def fix_oom(pod_name: str, namespace: str, container: str = "") -> dict:
         basis = "no memory limit set; starting from 256Mi"
     else:
         basis = f"current limit {current_raw}"
-    target_bytes = current + max(int(current * 0.25), 32 * 1024 ** 2)
+    # The step is clamped here, not only in the learning module: the
+    # playbook is the last line of defence.
+    try:
+        fraction = float(step)
+    except (TypeError, ValueError):
+        fraction = 0.25
+    fraction = max(0.25, min(1.0, fraction))
+    target_bytes = current + max(int(current * fraction), 32 * 1024 ** 2)
     target_bytes = min(target_bytes, parse_memory(MAX_MEMORY) or 2 * 1024 ** 3)
     if target_bytes <= current:
         return _result(

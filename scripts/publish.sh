@@ -3,7 +3,14 @@
 #
 # The image is pushed to docker.io/<namespace>/auton:<version> (and :latest);
 # the chart is packaged and pushed as an OCI artifact to
-# oci://registry-1.docker.io/<namespace>/charts.
+# oci://registry-1.docker.io/<namespace>.
+#
+# The chart's push target is the *namespace*, because Helm appends the chart
+# name to it: the chart lands in <namespace>/auton-chart. Docker Hub allows
+# exactly two path segments (a target with a path of its own would produce an
+# invalid three-segment repository and the push would be refused with
+# "insufficient_scope"), and the chart cannot share the image's repository
+# because a tag maps to one manifest and both want the version tag.
 #
 # Authentication: export DOCKERHUB_USER and DOCKERHUB_TOKEN (a token, not the
 # account password), or run `docker login` / `helm registry login` yourself
@@ -13,16 +20,16 @@
 #   ./scripts/publish.sh --no-push       # build and package only
 #   ./scripts/publish.sh --image-only
 #   ./scripts/publish.sh --chart-only
-#   ./scripts/publish.sh --version 0.2.0 # must match charts/auton/Chart.yaml
+#   ./scripts/publish.sh --version 0.3.0 # must match charts/auton-chart/Chart.yaml
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-NAMESPACE="${DOCKERHUB_NAMESPACE:-d3vhex}"
+NAMESPACE="${DOCKERHUB_NAMESPACE:-d3vhec}"
 IMAGE_NAME="${IMAGE_NAME:-auton}"
-CHART_DIR="charts/auton"
+CHART_DIR="charts/auton-chart"
 DIST_DIR="dist"
 
 CHART_VERSION="$(awk '/^version:/{print $2; exit}' "$CHART_DIR/Chart.yaml")"
@@ -96,13 +103,18 @@ if [[ "$PUBLISH_CHART" == 1 ]]; then
 
   if [[ "$PUSH" == 1 ]]; then
     login
-    echo "==> pushing oci://registry-1.docker.io/${NAMESPACE}/charts/auton:${VERSION}"
-    "$HELM" push "$DIST_DIR/auton-${VERSION}.tgz" \
-      "oci://registry-1.docker.io/${NAMESPACE}/charts"
+    # Helm appends the chart name to the push target, so the target is the
+    # namespace and the repository becomes <namespace>/<chart-name>. Docker
+    # Hub allows exactly two path segments — a target with a path of its own
+    # ("<namespace>/charts") would produce an invalid three-segment
+    # repository and the push would be refused with "insufficient_scope".
+    echo "==> pushing oci://registry-1.docker.io/${NAMESPACE}/auton-chart:${VERSION}"
+    "$HELM" push "$DIST_DIR/auton-chart-${VERSION}.tgz" \
+      "oci://registry-1.docker.io/${NAMESPACE}"
   fi
 fi
 
 echo
 echo "done. install with:"
-echo "  helm install auton oci://registry-1.docker.io/${NAMESPACE}/charts/auton \\"
+echo "  helm install auton oci://registry-1.docker.io/${NAMESPACE}/auton-chart \\"
 echo "    --version $VERSION --namespace auton --create-namespace"

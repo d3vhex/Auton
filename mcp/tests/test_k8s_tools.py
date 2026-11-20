@@ -1,4 +1,4 @@
-"""Tests for the kubectl wrapper: pinning, validation and the write gate."""
+"""Tests for the Kubernetes tools: pinning, validation and the write gate."""
 from __future__ import annotations
 
 import json

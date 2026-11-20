@@ -1,0 +1,114 @@
+# The k3d lab flavour of the chart — the values that reproduce `yamls/`.
+#
+# `yamls/` is **generated** from this chart (see scripts/sync-yamls.sh), so
+# this file is what makes the two identical. It carries the lab's specifics:
+#
+#   * the local image `auton:local` (the chart's default is the Docker Hub
+#     image, which is right for a published install and wrong for the lab);
+#   * the `local-path` storage class and the PVC sizes of the lab;
+#   * Ollama, n8n and the ingress enabled — the chart keeps them optional so
+#     it also fits a cluster that already has them;
+#   * the resource requests/limits of the lab (the chart's defaults are
+#     deliberately smaller, for a shared cluster).
+#
+# The two Secrets that hold random values — the API token and the queue
+# password — are NOT rendered here: scripts/install.sh creates them, so the
+# generated manifests never carry a value.
+#
+#   helm template auton charts/auton-chart -n auton -f charts/auton-chart/values-k3d.yaml
+#
+image:
+  repository: auton
+  tag: local
+  pullPolicy: IfNotPresent
+
+namespace:
+  create: true
+  name: auton
+
+appsNamespace:
+  create: true
+  name: auton-apps
+
+agent:
+  replicas: 1
+  auth:
+    # scripts/install.sh creates the token (and keeps an existing one).
+    create: false
+  workspace:
+    storageClass: local-path
+    size: 5Gi
+    keep: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+queue:
+  backend: redis
+  redisAuth: true
+  redisSecret:
+    # scripts/install.sh creates the queue password.
+    create: false
+
+redis:
+  enabled: true
+  persistence:
+    storageClass: local-path
+    size: 1Gi
+    keep: true
+
+scanner:
+  enabled: true
+  replicas: 2
+
+worker:
+  enabled: true
+  replicas: 2
+  # The ops reports are fanned out to Slack/Telegram through n8n.
+  n8nWebhook: http://n8n.auton.svc.cluster.local:5678/webhook/auton-ops
+
+ops:
+  enabled: true
+  replicas: 1
+
+ollama:
+  enabled: true
+  pullModel: false          # scripts/install.sh pulls the model itself
+  persistence:
+    storageClass: local-path
+    size: 20Gi
+    keep: true
+
+n8n:
+  enabled: true
+  persistence:
+    storageClass: local-path
+    size: 5Gi
+    keep: true
+
+ingress:
+  enabled: true
+  # k3d ships Traefik, so the lab uses its IngressRoute CRD. Every Service is
+  # ClusterIP; this is the only host-facing entry point.
+  kind: IngressRoute
+  name: auton-routes
+  className: traefik
+  entryPoints:
+    - web
+  hosts:
+    - host: auton.localhost
+      service: auton
+      port: 8080
+    - host: agent.localhost
+      service: auton
+      port: 8080
+    - host: ollama.localhost
+      service: ollama-service
+      port: 11434
+    - host: n8n.localhost
+      service: n8n
+      port: 5678

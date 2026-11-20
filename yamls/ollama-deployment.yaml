@@ -1,91 +1,134 @@
-# Ollama on k3s (k3d) with AMD GPU (RX 6600). Namespace: auton.
-# GPU path is Vulkan (Mesa RADV) in practice — full layer offload; HSA override
-# is kept but is redundant for the Vulkan path. Model persists on a local-path PVC.
----
+# GENERATED — DO NOT EDIT.
+#
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
+#
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/pvc.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: ollama-models
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: [ReadWriteOnce]
   storageClassName: local-path
   resources:
     requests:
       storage: 20Gi
 ---
+# Source: auton-chart/templates/ollama.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ollama
   namespace: auton
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
     app: ollama
 spec:
   replicas: 1
   strategy:
-    type: Recreate          # RWO PVC + RollingUpdate would deadlock on restart
+    type: Recreate          # RWO PVC + RollingUpdate would deadlock
   selector:
     matchLabels:
       app: ollama
   template:
     metadata:
       labels:
+        helm.sh/chart: auton-chart-0.3.0
+        app.kubernetes.io/name: auton
+        app.kubernetes.io/instance: auton
+        app.kubernetes.io/version: "0.3.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: auton
         app: ollama
     spec:
+      securityContext:
+        fsGroup: 0
       containers:
-      - name: ollama
-        image: ollama/ollama:latest
-        ports:
-        - containerPort: 11434
-        env:
-        - name: HSA_OVERRIDE_GFX_VERSION
-          value: "10.3.0"
-        - name: OLLAMA_HOST
-          value: "0.0.0.0:11434"
-        - name: OLLAMA_KEEP_ALIVE
-          value: "30m"
-        # 8 GB card shared with the desktop: an f16 KV cache at 16k context
-        # pushes the model to a 80/20 CPU/GPU split (~5 tok/s). Flash attention
-        # plus a quantised KV cache keeps the whole model on the GPU.
-        - name: OLLAMA_FLASH_ATTENTION
-          value: "1"
-        - name: OLLAMA_KV_CACHE_TYPE
-          value: "q8_0"
-        - name: OLLAMA_NUM_PARALLEL
-          value: "1"
-        resources:
-          requests:
-            cpu: "1"
-            memory: "4Gi"
-          limits:
-            amd.com/gpu: 1
-            memory: "12Gi"
-        volumeMounts:
-        - name: ollama-storage
-          mountPath: /root/.ollama
-        readinessProbe:
-          httpGet: { path: /, port: 11434 }
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        livenessProbe:
-          httpGet: { path: /, port: 11434 }
-          initialDelaySeconds: 15
-          periodSeconds: 30
+        - name: ollama
+          image: ollama/ollama:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_HOST
+              value: 0.0.0.0:11434
+            - name: HSA_OVERRIDE_GFX_VERSION
+              value: "10.3.0"
+            - name: LLAMA_ARG_FIT_TARGET
+              value: "128"
+            - name: OLLAMA_FLASH_ATTENTION
+              value: "1"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "30m"
+            - name: OLLAMA_KV_CACHE_TYPE
+              value: "q8_0"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+          resources:
+            limits:
+              amd.com/gpu: 1
+              memory: 12Gi
+            requests:
+              cpu: "1"
+              memory: 4Gi
+          volumeMounts:
+            - name: ollama-storage
+              mountPath: /root/.ollama
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 15
+            periodSeconds: 30
       volumes:
-      - name: ollama-storage
-        persistentVolumeClaim:
-          claimName: ollama-models
+        - name: ollama-storage
+          persistentVolumeClaim:
+            claimName: ollama-models
 ---
+# Source: auton-chart/templates/ollama.yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: ollama-service
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+    app: ollama
 spec:
   type: ClusterIP
   selector:
     app: ollama
   ports:
-  - port: 11434
-    targetPort: 11434
+    - name: http
+      port: 11434
+      targetPort: 11434

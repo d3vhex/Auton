@@ -145,6 +145,10 @@ class TaskStore:
     def idem_key(self, key: str) -> str:
         return f"{self.prefix}:idem:{key}"
 
+    def watcher_key(self, name: str) -> str:
+        """Where a scanner publishes the health of its watch streams."""
+        return f"{self.prefix}:watcher:{name}"
+
     def lock_key(self, resource: str) -> str:
         return f"{self.prefix}:lock:{resource}"
 
@@ -630,6 +634,7 @@ class TaskStore:
             "active": {queue: self.active_count(queue) for queue in QUEUES},
             "oldest_queued": oldest_queued,
             "workers": workers,
+            "watchers": self.watcher_stats(),
             "budget_used": budget_used,
             "backend": getattr(self.backend, "name", "unknown"),
             "prefix": self.prefix,
@@ -651,6 +656,38 @@ class TaskStore:
                         "age": round(_now() - seen, 1) if seen else None,
                         "alive": bool(value) and (_now() - seen) < 120})
         return sorted(out, key=lambda w: (w["role"], w["name"]))
+
+    # -- watcher health ---------------------------------------------------- #
+    def set_watcher_stats(self, name: str, payload: dict,
+                          ttl: int = 120) -> None:
+        """Publish the health of one watch stream.
+
+        The scanner writes this; the API reads it. It is the answer to "is the
+        platform still watching, or has it silently stopped?".
+        """
+        try:
+            body = json.dumps(payload, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return
+        key = self.watcher_key(name)
+        self.backend.set(key, body)
+        self.backend.expire(key, max(10, int(ttl)) * 1000)
+
+    def watcher_stats(self) -> list[dict]:
+        """The published watch-stream health, newest name first."""
+        out: list[dict] = []
+        for key in self.backend.scan(f"{self.prefix}:watcher:*"):
+            value = self.backend.get(key) or ""
+            if not value:
+                continue
+            try:
+                payload = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payload.setdefault("name", key.rsplit(":", 1)[-1])
+                out.append(payload)
+        return sorted(out, key=lambda item: str(item.get("name")))
 
     # -- coordination ----------------------------------------------------- #
     def active_count(self, queue: str = "") -> int:

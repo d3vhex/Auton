@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Kubernetes tools for the Auton agent (kubectl wrapper).
+"""Kubernetes tools for the Auton agent.
 
 The pod runs with the ``auton-agent`` ServiceAccount; the namespace-scoped Role
 is the security boundary, **not** this module. What this module adds is:
 
   * a pinned namespace allowlist — the model can target ``auton`` and
-    ``auton-apps``; a stray ``-n kube-system`` is rejected before kubectl runs
+    ``auton-apps``; a stray ``-n kube-system`` is rejected before a request
+    is sent
   * argument validation — resource/name go through a whitelist regex, so model
-    output cannot smuggle extra kubectl flags
+    output cannot smuggle extra flags
   * a write gate (``AGENT_K8S_WRITE=0`` makes every mutating tool refuse)
   * a **write-ahead audit**: every mutation records its intent first and is
     refused if that record cannot be written (see ``audit.py``)
@@ -16,11 +17,20 @@ is the security boundary, **not** this module. What this module adds is:
     parsing 200 lines of JSON
   * clipped output — a list of 200 pods must not eat the context window
 
+**How a request is made.** The tools talk to the API server **directly** over
+HTTPS (:mod:`k8s_api` / :mod:`k8s_ops`) — no process is forked, no client is
+started, and the answer arrives in milliseconds instead of a tenth of a
+second. kubectl stays in the image as a **fallback**: if the direct path is
+not available (no credentials, an unreachable API server) or fails, the tool
+falls back to kubectl and says so — in the log and in the counters. The
+fallback is never silent.
+
 Environment:
   AGENT_NAMESPACE   primary namespace (default "auton")
   AGENT_NAMESPACES  comma list the tools may target (default: AGENT_NAMESPACE)
   AGENT_K8S_ENABLED "0" disables every tool (default "1")
   AGENT_K8S_WRITE   "1" enables apply/patch/scale/rollout/delete/exec (default "0")
+  AGENT_K8S_DIRECT  "0" forces the kubectl path (default "1")
 """
 from __future__ import annotations
 
@@ -32,9 +42,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import audit
 import contextvars
+import k8s_api
+import k8s_ops
 
 NAMESPACE = os.environ.get("AGENT_NAMESPACE", "auton")
 NAMESPACES = tuple(dict.fromkeys(
@@ -210,20 +223,116 @@ def _query(args: list[str], namespace: str | None = None,
 
 
 def _require_write(action: str) -> str | None:
+    """Refuse a mutation when this pod is in read-only Kubernetes mode.
+
+    This is the *belt*, not the boundary: RBAC is what actually stops the
+    mutation. The tool refuses first so the model gets a clear answer instead
+    of an RBAC error, and so no audit record is written for an action that
+    was never going to happen.
+    """
     if not WRITE:
         return _err(f"{action} is disabled (read-only Kubernetes mode).",
-                    "Set AGENT_K8S_WRITE=1 in the agent deployment.")
+                    "This pod may only read. An operator can enable the "
+                    "write scope with `scripts/set-agent-writes.sh --enable` "
+                    "(or agent.allowWrites=true in Helm); the repair path "
+                    "through the worker needs no such permission.")
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# The transport: direct HTTPS first, kubectl as the logged fallback
+# --------------------------------------------------------------------------- #
+
+def _log(message: str) -> None:
+    """A line on stdout — the pod log, like every other message."""
+    print(f"[k8s] {message}", flush=True)
+
+
+def _direct(operation: str, call):
+    """Run ``call()`` against the API server, or return ``None``.
+
+    ``None`` means "the direct path cannot answer this" — either there are no
+    credentials, or the API server could not be reached, or the operation is
+    not implemented over direct HTTPS. The caller then falls back to kubectl.
+
+    A *refusal* (404, 403, 409) is **not** a reason to fall back: the API
+    server has given a final answer, and kubectl would give the same one.
+    Those are raised, not swallowed.
+    """
+    if not ENABLED:
+        return None
+    if k8s_api.client() is None:
+        return None
+    try:
+        k8s_api.COUNTERS["direct"] += 1
+        return call()
+    except (k8s_api.ApiNotFound, k8s_api.ApiForbidden, k8s_api.ApiConflict):
+        k8s_api.COUNTERS["direct_error"] += 1
+        raise
+    except (k8s_api.ApiUnavailable, k8s_api.ApiError) as exc:
+        k8s_api.COUNTERS["direct_error"] += 1
+        _log(f"direct {operation} failed ({exc}); falling back to kubectl")
+        return None
+    except Exception as exc:  # a bug in the direct path must not be fatal
+        k8s_api.COUNTERS["direct_error"] += 1
+        _log(f"direct {operation} raised {type(exc).__name__}: {exc}; "
+             "falling back to kubectl")
+        return None
+
+
+def _fallback(operation: str) -> None:
+    """Record that kubectl had to answer. Never silent."""
+    k8s_api.COUNTERS["kubectl"] += 1
+    _log(f"using kubectl for {operation}")
+
+
+def _api_error(exc: Exception) -> str:
+    """Turn an API error into the tool's JSON error shape."""
+    if isinstance(exc, k8s_api.ApiNotFound):
+        return _err(f"not found: {exc}",
+                    "Check the name with k8s_get(); the object does not exist.")
+    if isinstance(exc, k8s_api.ApiForbidden):
+        return _err(f"forbidden: {exc}",
+                    "RBAC denied the verb. The agent may only read here; the "
+                    "repair path through the worker has its own permissions.")
+    if isinstance(exc, k8s_api.ApiConflict):
+        return _err(f"conflict: {exc}",
+                    "The object changed underneath the request; read it "
+                    "again and retry.")
+    return _err(f"the API server refused the request: {exc}")
+
+
+def _direct_json(operation: str, call):
+    """A direct call that returns a parsed document, or ``None``."""
+    try:
+        return _direct(operation, call)
+    except k8s_api.ApiError as exc:
+        return _api_error(exc)
+
+
+def _direct_text(operation: str, call):
+    """A direct call that returns text, or ``None``."""
+    result = _direct(operation, call)
+    if isinstance(result, str):
+        return result
     return None
 
 
 def _audited(action: str, argv: list[str], *, stdin: str | None = None,
              timeout: int = 60, namespace: str | None = None,
              args: dict | None = None, plan: str = "", dry_run: str = "",
-             evidence: str = "", incident_id: str = "") -> str:
+             evidence: str = "", incident_id: str = "",
+             direct: object | None = None) -> str:
     """Run a mutation, but only after its intent is durably recorded.
 
     If the audit log is unavailable the mutation is refused: "nothing without a
     record" has to be enforced in code, not in the prompt.
+
+    ``direct`` is an optional callable that performs the mutation over the
+    direct HTTPS path. When it is given and succeeds, kubectl is not used at
+    all; when it fails, the mutation still goes through kubectl — but the
+    audit record was already written, so there is never a mutation without a
+    record.
     """
     payload = {"argv": argv, **(args or {})}
     incident_id = incident_id or _INCIDENT.get()
@@ -237,7 +346,20 @@ def _audited(action: str, argv: list[str], *, stdin: str | None = None,
             "Mutations are blocked without an audit record. Fix "
             "AGENT_AUDIT_DIR / the workspace volume and retry.",
         )
-    out = _run(argv, stdin=stdin, timeout=timeout, namespace=namespace)
+    out = ""
+    if direct is not None:
+        try:
+            result = _direct(action, direct)
+        except k8s_api.ApiError as exc:
+            out = _api_error(exc)
+        else:
+            if result is not None:
+                out = result if isinstance(result, str) else str(result)
+            else:
+                out = _run(argv, stdin=stdin, timeout=timeout,
+                            namespace=namespace)
+    else:
+        out = _run(argv, stdin=stdin, timeout=timeout, namespace=namespace)
     failed = out.startswith('{"ok": false')
     try:
         audit.finish(audit_id, result=out,
@@ -269,15 +391,135 @@ def k8s_get(resource: str, name: str = "", selector: str = "",
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
+    entry = k8s_api.resolve_resource(resource.strip())
+    if entry is None:
+        return _err(f"unknown resource {resource.strip()!r}",
+                    "Use a plain resource name such as 'pods' or 'deployments'.")
+    if output in ("", "wide", "name"):
+        # The table formats are kubectl's own; the API server returns JSON.
+        # Ask for JSON and render the table here, so the model sees the same
+        # columns either way.
+        document = _direct_json(
+            "k8s_get",
+            lambda: k8s_ops.get_object(entry.plural, name.strip(), ns)
+            if name.strip() else
+            k8s_ops.list_objects(entry.plural, ns, selector.strip()))
+        if document is None:
+            _fallback("k8s_get")
+            args = ["get", resource.strip()]
+            if name.strip():
+                args.append(name.strip())
+            if selector.strip():
+                args += ["--selector", selector.strip()]
+            if _OUTPUTS[output]:
+                args += ["--output", _OUTPUTS[output]]
+            args.append("--request-timeout=20s")
+            return _run(args, namespace=ns)
+        if isinstance(document, str):
+            return document
+        items = _as_items(document)
+        if output == "name":
+            return _clip("\n".join(f"{entry.plural}/"
+                                   f"{(item.get('metadata') or {}).get('name', '')}"
+                                   for item in items))
+        return _clip(_format_table(items, entry.kind))
+    if output == "json":
+        document = _direct_json(
+            "k8s_get",
+            lambda: k8s_ops.get_object(entry.plural, name.strip(), ns)
+            if name.strip() else
+            k8s_ops.list_objects(entry.plural, ns, selector.strip()))
+        if document is None:
+            _fallback("k8s_get")
+            args = ["get", resource.strip()]
+            if name.strip():
+                args.append(name.strip())
+            if selector.strip():
+                args += ["--selector", selector.strip()]
+            args += ["--output", "json", "--request-timeout=20s"]
+            return _run(args, namespace=ns)
+        if isinstance(document, str):
+            return document
+        items = _as_items(document)
+        return _clip(json.dumps({"items": items} if items is not None
+                                 else document, indent=2, default=str))
+    # output == "yaml": the API server renders YAML for a single object, but
+    # not for a list, so kubectl still answers this one.
+    _fallback("k8s_get yaml")
     args = ["get", resource.strip()]
     if name.strip():
         args.append(name.strip())
     if selector.strip():
         args += ["--selector", selector.strip()]
-    if _OUTPUTS[output]:
-        args += ["--output", _OUTPUTS[output]]
-    args.append("--request-timeout=20s")
+    args += ["--output", "yaml", "--request-timeout=20s"]
     return _run(args, namespace=ns)
+
+
+def _as_items(document) -> list[dict]:
+    """The objects of a direct read, whatever shape the operation returned.
+
+    ``list_objects`` returns a list; ``get_object`` returns one document. A
+    list document (``{"items": [...]}``) is unwrapped too, so the caller does
+    not have to know which operation it asked for.
+    """
+    if isinstance(document, list):
+        return document
+    if isinstance(document, dict):
+        items = document.get("items")
+        if isinstance(items, list):
+            return items
+        return [document]
+    return []
+
+
+def _format_table(items: list, kind: str = "") -> str:
+    """A kubectl-like table of the listed objects."""
+    if not items:
+        return "No resources found."
+    rows = []
+    for item in items:
+        metadata = item.get("metadata") or {}
+        status = item.get("status") or {}
+        spec = item.get("spec") or {}
+        name = metadata.get("name") or ""
+        if kind == "Pod" or item.get("kind") == "Pod":
+            phase = status.get("phase") or "Unknown"
+            ready = 0
+            total = 0
+            for container in (spec.get("containers") or []):
+                total += 1
+            for container_status in (status.get("containerStatuses") or []):
+                if container_status.get("ready"):
+                    ready += 1
+            restarts = sum(int(cs.get("restartCount") or 0)
+                           for cs in (status.get("containerStatuses") or []))
+            rows.append([name, f"{ready}/{total}", phase, str(restarts),
+                         _fmt_age(metadata.get("creationTimestamp"))])
+        elif kind == "Deployment" or item.get("kind") == "Deployment":
+            desired = spec.get("replicas")
+            rows.append([name, str(desired or 0),
+                         str(status.get("updatedReplicas") or 0),
+                         str(status.get("readyReplicas") or 0),
+                         str(status.get("availableReplicas") or 0),
+                         _fmt_age(metadata.get("creationTimestamp"))])
+        else:
+            rows.append([name, _fmt_age(metadata.get("creationTimestamp"))])
+    if rows and len(rows[0]) == 5:
+        header = ["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+    elif rows and len(rows[0]) == 6:
+        header = ["NAME", "DESIRED", "UPDATED", "READY", "AVAILABLE", "AGE"]
+    else:
+        header = ["NAME", "AGE"]
+    widths = [len(column) for column in header]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    lines = ["  ".join(column.ljust(widths[index])
+                        for index, column in enumerate(header)).rstrip()]
+    for row in rows:
+        lines.append("  ".join(cell.ljust(widths[index])
+                                for index, cell in enumerate(row)).rstrip())
+    return "\n".join(lines)
 
 
 def k8s_describe(resource: str, name: str = "", namespace: str = "") -> str:
@@ -288,6 +530,19 @@ def k8s_describe(resource: str, name: str = "", namespace: str = "") -> str:
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
+    entry = k8s_api.resolve_resource(resource.strip())
+    if entry is None:
+        return _err(f"unknown resource {resource.strip()!r}",
+                    "Example: k8s_describe('pods', 'auton-abc123').")
+    if not name.strip():
+        return _err("name is required to describe one object.",
+                    "Example: k8s_describe('pods', 'auton-abc123').")
+    text = _direct_text(
+        "k8s_describe",
+        lambda: k8s_ops.describe(entry.plural, name.strip(), ns))
+    if text is not None:
+        return _clip(text)
+    _fallback("k8s_describe")
     args = ["describe", resource.strip()]
     if name.strip():
         args.append(name.strip())
@@ -307,6 +562,13 @@ def k8s_logs(pod: str, container: str = "", tail: int = 100,
     if ns_err:
         return ns_err
     tail = max(1, min(int(tail), 2000))
+    text = _direct_text(
+        "k8s_logs",
+        lambda: k8s_ops.pod_logs(pod.strip(), container.strip(), tail,
+                                  previous, ns))
+    if text is not None:
+        return _clip(text.strip()) if text.strip() else "(no output)"
+    _fallback("k8s_logs")
     args = ["logs", pod.strip(), "--tail", str(tail)]
     if container.strip():
         args += ["--container", container.strip()]
@@ -337,7 +599,16 @@ def k8s_apply(manifest: str, namespace: str = "") -> str:
         namespace=ns, plan="apply manifest",
         args={"manifest_sha256": digest, "manifest_bytes": len(manifest),
               "manifest_head": manifest[:1200]},
+        direct=lambda: _apply_direct(manifest, ns),
     )
+
+
+def _apply_direct(manifest: str, namespace: str) -> str:
+    """Apply a manifest over the direct path (server-side apply)."""
+    document = k8s_ops.apply_manifest(manifest, namespace)
+    metadata = document.get("metadata") or {}
+    return f"{document.get('kind', 'object')}/{metadata.get('name', '?')} " \
+           "applied"
 
 
 def k8s_patch(resource: str, name: str, patch: str,
@@ -363,13 +634,26 @@ def k8s_patch(resource: str, name: str, patch: str,
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
+    entry = k8s_api.resolve_resource(resource.strip())
     return _audited(
         "k8s_patch",
         ["patch", resource.strip(), name.strip(), f"--type={patch_type}", "-p", patch],
         timeout=60, namespace=ns, plan=f"{patch_type} patch {resource}/{name}",
         args={"resource": resource.strip(), "name": name.strip(),
               "patch_type": patch_type, "patch": patch[:2000]},
+        direct=(lambda: _patch_direct(entry, name.strip(), patch, patch_type,
+                                      ns)
+                if entry is not None else None),
     )
+
+
+def _patch_direct(entry, name: str, patch: str, patch_type: str,
+                  namespace: str) -> str:
+    """Patch one object over the direct path."""
+    document = k8s_ops.patch_object(entry.plural, name, patch, patch_type,
+                                    namespace)
+    metadata = document.get("metadata") or {}
+    return f"{entry.kind}/{metadata.get('name', name)} patched"
 
 
 def k8s_scale(deployment: str, replicas: int, namespace: str = "") -> str:
@@ -389,13 +673,24 @@ def k8s_scale(deployment: str, replicas: int, namespace: str = "") -> str:
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
+    entry = k8s_api.resolve_resource(deployment.strip())
     return _audited(
         "k8s_scale",
         ["scale", deployment.strip(), f"--replicas={replicas}",
          "--request-timeout=20s"],
         timeout=60, namespace=ns, plan=f"scale {deployment} to {replicas}",
         args={"deployment": deployment.strip(), "replicas": replicas},
+        direct=(lambda: _scale_direct(entry, deployment.strip(), replicas, ns)
+                if entry is not None else None),
     )
+
+
+def _scale_direct(entry, deployment: str, replicas: int,
+                  namespace: str) -> str:
+    """Scale one workload over the direct path."""
+    name = deployment.split("/")[-1]
+    k8s_ops.scale(entry.plural, name, replicas, namespace)
+    return f"{entry.kind}/{name} scaled to {replicas}"
 
 
 def k8s_rollout(action: str, deployment: str = "", namespace: str = "") -> str:
@@ -415,16 +710,39 @@ def k8s_rollout(action: str, deployment: str = "", namespace: str = "") -> str:
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
-    args = ["rollout", action]
-    if deployment.strip():
-        args.append(deployment.strip())
     if action == "status":
-        args.append("--timeout=120s")
-    if action == "status":
+        entry = k8s_api.resolve_resource(deployment.strip())
+        text = _direct_text(
+            "k8s_rollout status",
+            lambda: k8s_ops.rollout_status(entry.plural,
+                                            deployment.strip().split("/")[-1],
+                                            ns) if entry is not None else None)
+        if text is not None:
+            return _clip(text)
+        _fallback("k8s_rollout status")
+        args = ["rollout", action, deployment.strip(), "--timeout=120s"]
         return _run(args, timeout=150, namespace=ns)
-    return _audited("k8s_rollout", args, timeout=150, namespace=ns,
+    entry = k8s_api.resolve_resource(deployment.strip())
+    name = deployment.strip().split("/")[-1]
+    argv = ["rollout", action]
+    if deployment.strip():
+        argv.append(deployment.strip())
+    return _audited("k8s_rollout", argv, timeout=150, namespace=ns,
                     plan=f"rollout {action} {deployment}",
-                    args={"action": action, "deployment": deployment.strip()})
+                    args={"action": action, "deployment": deployment.strip()},
+                    direct=(lambda: _rollout_direct(entry, action, name, ns)
+                            if entry is not None else None))
+
+
+def _rollout_direct(entry, action: str, name: str, namespace: str) -> str:
+    """Restart or undo a rollout over the direct path."""
+    if action == "restart":
+        k8s_ops.rollout_restart(entry.plural, name, namespace)
+        return f"{entry.kind}/{name} restarted"
+    if action == "undo":
+        k8s_ops.rollout_undo(entry.plural, name, namespace)
+        return f"{entry.kind}/{name} rolled back"
+    raise k8s_api.ApiError(f"unknown rollout action {action!r}")
 
 
 def k8s_delete(resource: str, name: str, confirm: bool = False,
@@ -451,12 +769,21 @@ def k8s_delete(resource: str, name: str, confirm: bool = False,
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
+    entry = k8s_api.resolve_resource(resource.strip())
     return _audited(
         "k8s_delete",
         ["delete", resource.strip(), name.strip(), "--request-timeout=30s"],
         timeout=90, namespace=ns, plan=f"delete {resource}/{name}",
         args={"resource": resource.strip(), "name": name.strip()},
+        direct=(lambda: _delete_direct(entry, name.strip(), ns)
+                if entry is not None else None),
     )
+
+
+def _delete_direct(entry, name: str, namespace: str) -> str:
+    """Delete one object over the direct path."""
+    k8s_ops.delete_object(entry.plural, name, namespace)
+    return f"{entry.kind}/{name} deleted"
 
 
 # --------------------------------------------------------------------------- #
@@ -571,6 +898,17 @@ def _pod_summary(pod: dict) -> dict:
     }
 
 
+def pod_summary(pod: dict) -> dict:
+    """The public name of :func:`_pod_summary`.
+
+    The watcher path receives raw Pod objects from the API server and has to
+    flatten them exactly like the snapshot path does. One implementation, one
+    truth: otherwise the watch path and the poll path could disagree about
+    what "OOMKilled" means.
+    """
+    return _pod_summary(pod)
+
+
 def _deploy_summary(deploy: dict) -> dict:
     meta = deploy.get("metadata") or {}
     status = deploy.get("status") or {}
@@ -613,7 +951,50 @@ def _event_summary(event: dict) -> dict:
 
 
 def _collect(namespace: str) -> tuple[dict | None, str | None]:
-    """Gather the raw snapshot for one namespace (no formatting)."""
+    """Gather the raw snapshot for one namespace (no formatting).
+
+    The direct path reads the five collections over HTTPS; kubectl answers
+    when the direct path is not available. Either way the shape of the
+    snapshot is the same, so everything downstream is unchanged.
+    """
+    snap = _direct_json("snapshot", lambda: _collect_direct(namespace))
+    if snap is None:
+        _fallback("snapshot")
+        snap, error = _collect_kubectl(namespace)
+        return snap, error
+    if isinstance(snap, str):
+        return None, snap
+    return snap, None
+
+
+def _collect_direct(namespace: str) -> dict:
+    """The snapshot, read over the direct HTTPS path."""
+    pods = k8s_ops.list_objects("pods", namespace)
+    deployments = k8s_ops.list_objects("deployments", namespace)
+    statefulsets = k8s_ops.list_objects("statefulsets", namespace)
+    pvcs = k8s_ops.list_objects("persistentvolumeclaims", namespace)
+    events = k8s_ops.list_objects("events", namespace)
+    return {
+        "namespace": namespace,
+        "captured_at": _dt.datetime.now(_dt.timezone.utc).isoformat(
+            timespec="seconds"),
+        "pods": [_pod_summary(p) for p in pods],
+        "deployments": [_deploy_summary(d) for d in deployments],
+        "statefulsets": [_deploy_summary(s) for s in statefulsets],
+        "pvcs": [
+            {
+                "name": (p.get("metadata") or {}).get("name", ""),
+                "phase": (p.get("status") or {}).get("phase", ""),
+                "storage_class": (p.get("spec") or {}).get("storageClassName", ""),
+            }
+            for p in pvcs
+        ],
+        "events": [_event_summary(e) for e in events],
+    }
+
+
+def _collect_kubectl(namespace: str) -> tuple[dict | None, str | None]:
+    """The snapshot, read with kubectl (the fallback path)."""
     pods, error = _query(["get", "pods", "-o", "json", "--request-timeout=20s"],
                          namespace=namespace)
     if error:
@@ -739,15 +1120,21 @@ def k8s_snapshot(namespace: str = "") -> str:
 
 def _pod_logs(pod: str, container: str, *, previous: bool,
               tail: int = 60, namespace: str) -> str:
-    args = ["logs", pod, "--tail", str(tail)]
-    if container:
-        args += ["--container", container]
-    if previous:
-        args.append("--previous")
-    out, error = _execute(args, timeout=30, namespace=namespace)
-    if error:
-        return "  (no logs available)"
-    text = out.strip()
+    text = _direct_text(
+        "pod logs",
+        lambda: k8s_ops.pod_logs(pod, container, tail, previous, namespace))
+    if text is None:
+        _fallback("pod logs")
+        args = ["logs", pod, "--tail", str(tail)]
+        if container:
+            args += ["--container", container]
+        if previous:
+            args.append("--previous")
+        out, error = _execute(args, timeout=30, namespace=namespace)
+        if error:
+            return "  (no logs available)"
+        text = out
+    text = text.strip()
     if not text:
         return "  (empty)"
     return "\n".join("  " + line for line in text.splitlines()[-tail:])
@@ -817,10 +1204,17 @@ def k8s_diagnose(pod: str, namespace: str = "", container: str = "") -> str:
     if ns_err:
         return ns_err
 
-    pod_obj, error = _query(["get", "pods", pod.strip(), "-o", "json",
-                             "--request-timeout=20s"], namespace=ns)
-    if error:
-        return error
+    pod_obj = _direct_json(
+        "k8s_diagnose",
+        lambda: k8s_ops.get_object("pods", pod.strip(), ns))
+    if pod_obj is None:
+        _fallback("k8s_diagnose")
+        pod_obj, error = _query(["get", "pods", pod.strip(), "-o", "json",
+                                 "--request-timeout=20s"], namespace=ns)
+        if error:
+            return error
+    if isinstance(pod_obj, str):
+        return pod_obj
     summary = _pod_summary(pod_obj)
     containers = _pod_containers(pod_obj)
     target = container.strip() or (
@@ -832,10 +1226,19 @@ def k8s_diagnose(pod: str, namespace: str = "", container: str = "") -> str:
                 "memory", "")
             break
 
-    events_obj, _ = _query(
-        ["get", "events", "--field-selector",
-         f"involvedObject.name={pod.strip()}", "-o", "json",
-         "--request-timeout=20s"], namespace=ns)
+    events_obj = _direct_json(
+        "k8s_diagnose events",
+        lambda: k8s_ops.list_objects("events", ns,
+                                     field_selector=f"involvedObject.name="
+                                                    f"{pod.strip()}"))
+    if events_obj is None:
+        _fallback("k8s_diagnose events")
+        events_obj, _ = _query(
+            ["get", "events", "--field-selector",
+             f"involvedObject.name={pod.strip()}", "-o", "json",
+             "--request-timeout=20s"], namespace=ns)
+    if isinstance(events_obj, str):
+        events_obj = {}
     events = [_event_summary(e)
               for e in (events_obj or {}).get("items") or []]
 
@@ -890,14 +1293,23 @@ def k8s_events(since: str = "15m", warnings_only: bool = True,
     ns, ns_err = _target_ns(namespace)
     if ns_err:
         return ns_err
-    args = ["get", "events", "-o", "json", "--request-timeout=20s"]
-    if warnings_only:
-        args[2:2] = ["--field-selector", "type=Warning"]
-    data, error = _query(args, namespace=ns)
-    if error:
-        return error
+    seconds = _parse_since(since)
+    data = _direct_json(
+        "k8s_events",
+        lambda: k8s_ops.events(ns, warning_only=warnings_only,
+                               since_seconds=seconds))
+    if data is None:
+        _fallback("k8s_events")
+        args = ["get", "events", "-o", "json", "--request-timeout=20s"]
+        if warnings_only:
+            args[2:2] = ["--field-selector", "type=Warning"]
+        data, error = _query(args, namespace=ns)
+        if error:
+            return error
+    if isinstance(data, str):
+        return data
     cutoff = (_dt.datetime.now(_dt.timezone.utc)
-              - _dt.timedelta(seconds=_parse_since(since)))
+              - _dt.timedelta(seconds=seconds))
     rows: list[dict] = []
     for event in (data or {}).get("items") or []:
         summary = _event_summary(event)
@@ -950,11 +1362,79 @@ def k8s_wait(resource: str, name: str, condition: str = "ready",
         timeout = max(5, min(int(timeout), 300))
     except (TypeError, ValueError):
         return _err(f"invalid timeout {timeout!r}", "Pass seconds, e.g. 60.")
+    entry = k8s_api.resolve_resource(resource.strip())
+    if entry is not None and condition != "delete":
+        text = _direct_text(
+            "k8s_wait",
+            lambda: _wait_direct(entry, name.strip(), condition, timeout, ns))
+        if text is not None:
+            return _clip(text)
+    _fallback("k8s_wait")
     return _run(
         ["wait", resource.strip(), name.strip(), f"--for={mapping[condition]}",
          f"--timeout={timeout}s"],
         timeout=timeout + 15, namespace=ns,
     )
+
+
+def _wait_direct(entry, name: str, condition: str, timeout: int,
+                 namespace: str) -> str | None:
+    """Poll one object until the condition holds (the direct path).
+
+    The condition alone is not enough: a Deployment's ``Available`` condition
+    can still be ``True`` from *before* a rollout, and it can be ``True``
+    again for a moment while the new pod is starting. So for a workload the
+    desired number of replicas must be ready **and** available as well — the
+    same thing the repair playbooks check before they call a repair a success.
+
+    Returns ``None`` when the object disappeared (the caller falls back to
+    kubectl, which has its own "delete" semantics).
+    """
+    wanted = {"ready": "Ready", "available": "Available",
+              "complete": "Complete"}[condition]
+    started = time.time()
+    deadline = started + timeout
+    while True:
+        try:
+            document = k8s_ops.get_object(entry.plural, name, namespace)
+        except k8s_api.ApiNotFound:
+            return None
+        conditions = ((document.get("status") or {}).get("conditions") or [])
+        met = any(item.get("type") == wanted and item.get("status") == "True"
+                  for item in conditions)
+        if met and _replicas_satisfied(document):
+            elapsed = int(time.time() - started)
+            return (f"{entry.kind}/{name} condition {wanted} is True\n"
+                    f"{document.get('kind', entry.kind)}/{name} met the "
+                    f"condition within {elapsed}s")
+        if time.time() >= deadline:
+            if met:
+                return (f"timed out after {timeout}s waiting for "
+                        f"{entry.kind}/{name} condition {wanted} "
+                        f"(the condition is set but the replicas are not "
+                        f"ready)")
+            return (f"timed out after {timeout}s waiting for "
+                    f"{entry.kind}/{name} condition {wanted}")
+        time.sleep(2)
+
+
+def _replicas_satisfied(document: dict) -> bool:
+    """Are the desired replicas of a workload ready and available?
+
+    An object without ``spec.replicas`` (a Pod, a Job) has no count to check;
+    its condition is the whole answer.
+    """
+    spec = document.get("spec") or {}
+    if "replicas" not in spec:
+        return True
+    status = document.get("status") or {}
+    desired = int(spec.get("replicas") or 0)
+    if desired <= 0:
+        return True
+    ready = int(status.get("readyReplicas") or 0)
+    available = int(status.get("availableReplicas") or 0)
+    updated = int(status.get("updatedReplicas") or 0)
+    return ready >= desired and available >= desired and updated >= desired
 
 
 def k8s_exec(pod: str, command: str, container: str = "",
@@ -992,7 +1472,20 @@ def k8s_exec(pod: str, command: str, container: str = "",
         plan=f"exec in {pod}: {command[:200]}",
         args={"pod": pod.strip(), "container": container.strip(),
               "command": command.strip()[:2000]},
+        direct=lambda: _exec_direct(pod.strip(), command.strip(),
+                                    container.strip(), ns, timeout),
     )
+
+
+def _exec_direct(pod: str, command: str, container: str, namespace: str,
+                 timeout: int) -> str:
+    """Run a command over the v4.channel.k8s.io WebSocket."""
+    out, err = k8s_ops.exec_command(pod, command, container, namespace,
+                                    timeout)
+    text = out.rstrip()
+    if err.strip():
+        text += ("\n" if text else "") + err.rstrip()
+    return text or "(no output)"
 
 
 TOOLS = [k8s_get, k8s_describe, k8s_logs, k8s_snapshot, k8s_diagnose,

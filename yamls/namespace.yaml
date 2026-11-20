@@ -1,7 +1,22 @@
+# GENERATED — DO NOT EDIT.
+#
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
+#
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/namespace.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
   name: auton
   labels:
-    app.kubernetes.io/part-of: auton
+    helm.sh/chart: auton-chart-0.3.0
     app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+  annotations:
+    helm.sh/resource-policy: keep

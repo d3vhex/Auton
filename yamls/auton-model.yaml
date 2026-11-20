@@ -1,24 +1,24 @@
-# Model-provider configuration, mounted into the agent (and later auton-ops).
+# GENERATED — DO NOT EDIT.
 #
-# The agent reads these keys on EVERY request from a projected volume, so a
-# change made through scripts/set-provider.sh takes effect without a restart.
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
 #
-#   provider     ollama | openai | gemini | anthropic | custom
-#   base_url     API base (ollama: http://ollama-service:11434)
-#   model        model name/tag
-#   max_tokens   response cap for remote providers
-#   data_policy  redact (default) | allow | local-only
-#
-# data_policy=redact masks tokens/passwords/keys before anything is sent to a
-# remote provider. local-only refuses remote providers entirely.
-#
-# When provider != ollama the local Ollama model is NOT used (no fallback).
----
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/secrets.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: auton-model-config
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
 data:
   provider: "ollama"
   base_url: "http://ollama-service:11434"
@@ -26,13 +26,19 @@ data:
   max_tokens: "1024"
   data_policy: "redact"
 ---
-# The key is empty until scripts/set-provider.sh writes one. The mount is
-# optional so the pod also starts on a fresh cluster before a key exists.
+# Source: auton-chart/templates/secrets.yaml
 apiVersion: v1
 kind: Secret
 metadata:
   name: auton-model
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
 type: Opaque
 stringData:
   api-key: ""

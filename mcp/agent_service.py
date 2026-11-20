@@ -58,7 +58,9 @@ from agent_core import MODEL, OLLAMA_HOST, run_agent
 import approvals
 import audit
 import incidents
+import learning
 import llm
+import metrics as metrics_module
 import ops_queue
 import policy
 import provider_admin
@@ -91,6 +93,13 @@ AUTH_DISABLED = os.environ.get("AGENT_AUTH_DISABLED", "").strip().lower() in (
     "1", "true", "yes", "on"
 )
 
+# The effective Kubernetes write scope of this pod (Phase 4). The API pod is a
+# producer and never mutates; the executor reports "read-only" unless an
+# operator enabled the write scope (`scripts/set-agent-writes.sh --enable`).
+K8S_WRITE = os.environ.get("AGENT_K8S_WRITE", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
 # Incidents live next to the audit log on the workspace PVC. A broken volume
 # must not stop the API from serving /run: the incident endpoints answer 503
 # instead (same fail-closed-in-one-place rule as /audit).
@@ -109,6 +118,20 @@ try:
 except approvals.ApprovalError as _exc:
     APPROVAL_STORE = None
     APPROVAL_STORE_ERROR = str(_exc)
+
+# The Learn stage (Phase 7): the outcomes and the learned profiles the worker
+# wrote on the workspace PVC. A missing volume must not break the API, so the
+# endpoint answers 503 instead.
+try:
+    LEARNING_STORE: learning.LearningStore | None = learning.LearningStore()
+    LEARNING_STORE_ERROR = ""
+except learning.LearningError as _exc:
+    LEARNING_STORE = None
+    LEARNING_STORE_ERROR = str(_exc)
+
+# Prometheus metrics (D5): a stdlib exposition, no client library.
+HTTP_COUNTER = metrics_module.HttpCounter()
+METRICS_STARTED_AT = time.time()
 
 
 class QueueFull(Exception):
@@ -177,6 +200,23 @@ _WORKER_LOCK = threading.Lock()
 
 def redis_mode() -> bool:
     return QUEUE_KIND == "redis"
+
+
+def queue_auth() -> str:
+    """How the queue client authenticates: "password", "none" or "unreadable".
+
+    Reported by /health so an operator can see *that* the queue is protected
+    without the password ever leaving the pod.
+    """
+    store = AGENT_STORE
+    backend = getattr(store, "backend", None)
+    mode = getattr(backend, "auth", "")
+    if mode:
+        return mode
+    try:
+        return "password" if ops_queue.redis_password() else "none"
+    except ops_queue.QueueError:
+        return "unreadable"
 
 
 def _agent_store() -> "task_store.TaskStore":
@@ -496,10 +536,28 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict,
               headers: dict | None = None) -> None:
         body = json.dumps(obj).encode("utf-8")
+        HTTP_COUNTER.record(code)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _send_text(self, code: int, text: str, content_type: str,
+                   headers: dict | None = None) -> None:
+        """Send a plain-text body (the Prometheus exposition)."""
+        body = text.encode("utf-8")
+        HTTP_COUNTER.record(code)
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -669,6 +727,101 @@ class Handler(BaseHTTPRequestHandler):
                              "approval_id": segments[1]})
             return
         self._send(200, record)
+
+    # -- learning ---------------------------------------------------------- #
+    def _learning_store(self):
+        store = globals().get("LEARNING_STORE")
+        if store is None:
+            self._send(503, {
+                "error": f"learning store unavailable: {LEARNING_STORE_ERROR}",
+                "hint": "check the workspace volume / AGENT_LEARN_DIR",
+            })
+        return store
+
+    def _get_learning(self) -> None:
+        """What the platform has learned: outcomes, profiles and statistics."""
+        store = self._learning_store()
+        if store is None:
+            return
+        _, query = self._route()
+        try:
+            limit = int(query.get("limit", ["50"])[0])
+        except (TypeError, ValueError):
+            limit = 50
+        namespace = query.get("namespace", [""])[0].strip()
+        resource = query.get("resource", [""])[0].strip()
+        cause = query.get("cause", [""])[0].strip()
+        try:
+            outcomes = store.outcomes(limit=limit, namespace=namespace,
+                                      resource=resource, cause=cause)
+            profiles = store.profiles()
+            stats = store.stats()
+        except learning.LearningError as exc:
+            self._send(503, {"error": f"learning store unavailable: {exc}"})
+            return
+        self._send(200, {
+            "enabled": bool(stats.get("enabled", True)),
+            "stats": stats,
+            "outcomes": outcomes,
+            "profiles": profiles,
+            "adaptations": list(learning.ADAPTATIONS),
+            "limits": stats.get("limits", {}),
+        })
+
+    # -- metrics ----------------------------------------------------------- #
+    def _metrics_snapshot(self) -> dict:
+        """Read the real state the metrics are built from.
+
+        Every part is optional: a store that cannot be read is simply absent
+        from the exposition — a metric is never guessed.
+        """
+        snapshot: dict = {
+            "uptime_seconds": round(time.time() - METRICS_STARTED_AT, 3),
+            "jobs": {"running": jobs_running(), "known": jobs_known()},
+            "http": HTTP_COUNTER.snapshot(),
+        }
+        try:
+            snapshot["queue"] = tasks_store().stats()
+        except Exception:
+            pass
+        store = globals().get("INCIDENT_STORE")
+        if store is not None:
+            try:
+                snapshot["incidents"] = store.list(limit=500)
+            except Exception:
+                pass
+        approvals_store = globals().get("APPROVAL_STORE")
+        if approvals_store is not None:
+            try:
+                snapshot["approvals"] = approvals_store.list(limit=500)
+            except Exception:
+                pass
+        learning_store = globals().get("LEARNING_STORE")
+        if learning_store is not None:
+            try:
+                snapshot["learning"] = {
+                    "stats": learning_store.stats(),
+                    "outcomes": learning_store.outcomes(limit=500),
+                    "profiles": learning_store.profiles(),
+                }
+            except Exception:
+                pass
+        try:
+            document, source = policy.load()
+            snapshot["policy"] = {"mode": document.get("mode", "unknown"),
+                                  "source": source}
+        except Exception:
+            pass
+        return snapshot
+
+    def _get_metrics(self) -> None:
+        """The Prometheus exposition (text format, no client library)."""
+        try:
+            text = metrics_module.collect(self._metrics_snapshot())
+        except Exception as exc:
+            self._send(500, {"error": f"metrics collection failed: {exc}"})
+            return
+        self._send_text(200, text, metrics_module.CONTENT_TYPE)
 
     def _post_approval(self, path: str) -> None:
         """Approve or reject a pending repair plan."""
@@ -936,9 +1089,16 @@ class Handler(BaseHTTPRequestHandler):
                 "ollama": OLLAMA_HOST,
                 "queue": QUEUE_KIND,
                 "queue_depth": queue_depth(),
+                "queue_auth": queue_auth(),
                 "jobs_running": jobs_running(),
                 "jobs_known": jobs_known(),
                 "auth": "off" if AUTH_DISABLED else "bearer",
+                # The effective Kubernetes write scope of this pod (Phase 4).
+                # The executor reports "read-only" unless an operator enabled
+                # it with `scripts/set-agent-writes.sh --enable`.
+                "write_scope": "writes-enabled" if K8S_WRITE else "read-only",
+                # The Learn stage (Phase 7): automatic, bounded adaptation.
+                "learning": "enabled" if learning.ENABLED else "disabled",
             })
             return
 
@@ -983,6 +1143,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/approvals" or path.startswith("/approvals/"):
             self._get_approvals(path)
+            return
+
+        if path == "/learning":
+            self._get_learning()
+            return
+
+        if path == "/metrics":
+            self._get_metrics()
             return
 
         if path == "/tasks" or path.startswith("/tasks/"):

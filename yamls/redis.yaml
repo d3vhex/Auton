@@ -1,41 +1,47 @@
-# Redis: the shared queue for the autonomous ops split.
+# GENERATED — DO NOT EDIT.
 #
-# One instance, AOF on a PVC. It holds task records, resource locks, cooldowns,
-# the hourly action budget and worker heartbeats — never a Secret value. The
-# Service is ClusterIP; nothing outside the cluster can reach it.
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
 #
-# `maxmemory-policy noeviction` is deliberate: if Redis is full a write fails
-# and the agent fails closed instead of silently dropping a repair task.
-#
-# A single instance is enough for the single-node lab. Before this becomes a
-# multi-node production system, replace it with Sentinel/Cluster — but that is
-# Phase 7 and intentionally out of scope here.
-#
-# If the cluster is shared, add auth:
-#   kubectl -n auton create secret generic auton-redis --from-literal=password=...
-# and start Redis with `--requirepass $(REDIS_PASSWORD)` plus
-# `AGENT_REDIS_PASSWORD` (or `_FILE`) on every pod that talks to it.
----
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/redis.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: redis-data
   namespace: auton
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
     app: redis
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: [ReadWriteOnce]
   storageClassName: local-path
   resources:
     requests:
       storage: 1Gi
 ---
+# Source: auton-chart/templates/redis.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: redis
   namespace: auton
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
     app: redis
     # Never let a playbook touch the queue itself.
     auton.io/protect: "true"
@@ -49,6 +55,12 @@ spec:
   template:
     metadata:
       labels:
+        helm.sh/chart: auton-chart-0.3.0
+        app.kubernetes.io/name: auton
+        app.kubernetes.io/instance: auton
+        app.kubernetes.io/version: "0.3.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: auton
         app: redis
         auton.io/protect: "true"
     spec:
@@ -60,96 +72,152 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
-      # local-path does not reliably apply fsGroup; fix the data dir once per
-      # pod start (idempotent and fast on an already-owned volume).
-      - name: fix-data-owner
-        image: redis:7-alpine
-        imagePullPolicy: IfNotPresent
-        command: ["sh", "-c", "chown -R 999:999 /data && chmod 0770 /data"]
-        securityContext:
-          runAsUser: 0
-          runAsNonRoot: false
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop: ["ALL"]
-            add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
-        volumeMounts:
-        - name: data
-          mountPath: /data
+        # local-path does not reliably apply fsGroup; fix the data dir once per
+        # pod start (idempotent and fast on an already-owned volume).
+        #
+        # The same init container writes the server configuration, so the
+        # password ends up in a file (mode 0640, owned by the redis user) and
+        # never in the process arguments.
+        - name: fix-data-owner
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              chown -R 999:999 /data
+              chmod 0770 /data
+              pw="$(cat /etc/auton-redis/password)"
+              if [ -z "$pw" ]; then
+                echo "auton: the Redis password (Secret auton-redis, key password) is empty" >&2
+                exit 1
+              fi
+              if [ "${#pw}" -lt 16 ]; then
+                echo "auton: the Redis password must be at least 16 characters" >&2
+                exit 1
+              fi
+              case "$pw" in
+                *[!A-Za-z0-9_-]*)
+                  echo "auton: the Redis password must only use letters, digits, '-' and '_'" >&2
+                  exit 1 ;;
+              esac
+              mkdir -p /tmp/redis
+              cat > /tmp/redis/redis.conf <<REDISCONF
+              dir /data
+              appendonly yes
+              appendfsync everysec
+              aof-use-rdb-preamble yes
+              save ""
+              maxmemory 256mb
+              maxmemory-policy noeviction
+              tcp-keepalive 60
+              requirepass $pw
+              REDISCONF
+              chown 999:999 /tmp/redis/redis.conf
+              chmod 0640 /tmp/redis/redis.conf
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: redis-auth
+              mountPath: /etc/auton-redis
+              readOnly: true
       containers:
-      - name: redis
-        image: redis:7-alpine
-        imagePullPolicy: IfNotPresent
-        command:
-        - redis-server
-        - "--appendonly"
-        - "yes"
-        - "--appendfsync"
-        - "everysec"
-        - "--aof-use-rdb-preamble"
-        - "yes"
-        - "--save"
-        - ""                    # no RDB snapshots; the AOF is the source of truth
-        - "--maxmemory"
-        - "256mb"
-        - "--maxmemory-policy"
-        - "noeviction"
-        - "--tcp-keepalive"
-        - "60"
-        securityContext:
-          runAsUser: 999
-          runAsGroup: 999
-          runAsNonRoot: true
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop: ["ALL"]
-        ports:
         - name: redis
-          containerPort: 6379
-        volumeMounts:
-        - name: data
-          mountPath: /data
-        - name: tmp
-          mountPath: /tmp
-        resources:
-          requests:
-            cpu: "50m"
-            memory: "64Mi"
-          limits:
-            cpu: "500m"
-            memory: "320Mi"
-        readinessProbe:
-          exec:
-            command: ["redis-cli", "ping"]
-          initialDelaySeconds: 3
-          periodSeconds: 10
-        livenessProbe:
-          exec:
-            command: ["redis-cli", "ping"]
-          initialDelaySeconds: 10
-          periodSeconds: 20
-          failureThreshold: 4
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          # The configuration file was written by the init container from the
+          # mounted Secret; the password is not in this argument list.
+          command: ["redis-server", "/tmp/redis/redis.conf"]
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: redis-auth
+              mountPath: /etc/auton-redis
+              readOnly: true
+          resources:
+            limits:
+              cpu: 500m
+              memory: 320Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          # The probes must authenticate: an unauthenticated PING answers
+          # "NOAUTH Authentication required." and redis-cli still exits 0, so
+          # the probe checks the *answer*, not only the exit code.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping 2>/dev/null | grep -qx PONG'
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping 2>/dev/null | grep -qx PONG'
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 4
       volumes:
-      - name: data
-        persistentVolumeClaim:
-          claimName: redis-data
-      - name: tmp
-        emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-data
+        - name: tmp
+          emptyDir: {}
+        - name: redis-auth
+          secret:
+            secretName: auton-redis
+            items:
+              - key: password
+                path: password
+            defaultMode: 0444
 ---
+# Source: auton-chart/templates/redis.yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: redis
   namespace: auton
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
     app: redis
 spec:
   type: ClusterIP
   selector:
     app: redis
   ports:
-  - name: redis
-    port: 6379
-    targetPort: redis
+    - name: redis
+      port: 6379
+      targetPort: redis

@@ -74,7 +74,9 @@ host.
 |---|---|
 | `agent_server.py` | MCP server over stdio: registers the 34 tools below (plus a deprecated `run_command` alias) |
 | `audit.py` | Write-ahead audit log: JSONL + SQLite, fail-closed, `begin`/`finish`/`record` |
-| `k8s_tools.py` | `kubectl` wrapper: 13 Kubernetes tools (diagnosis + audit-gated mutations) |
+| `k8s_api.py` | **The direct Kubernetes API client**: stdlib HTTPS transport, the credential lookup, the closed resource registry, the WebSocket exec channel, the transport counters |
+| `k8s_ops.py` | The Kubernetes **operations** over that transport: get/list/logs/events/apply/patch/scale/delete/rollout/exec/describe |
+| `k8s_tools.py` | The 13 Kubernetes tools: direct HTTPS first, kubectl as the logged fallback, diagnosis + audit-gated mutations |
 | `llm.py` | Provider layer: `ollama`/`openai`/`gemini`/`anthropic`/`custom`, config read per request, redaction, no fallback |
 | `provider_admin.py` | Validated provider writes behind `POST /provider`: ConfigMap/Secret patch (or files), audit without the key, `400` for a config the agent would reject |
 | `n8n_tools.py` | n8n public-API + webhook client: 6 tools, stdlib HTTP only |
@@ -84,18 +86,21 @@ host.
 | `policy.py` | **Policy Engine**: modes (disabled/observe-only/safe-auto/approval-required), risk tiers 0–3, rules, protected targets, fail-closed load |
 | `planner.py` | **Repair Planner**: the `RepairPlan` schema — action, tier, playbook, expected effect, verification, rollback |
 | `approvals.py` | **Approval Store**: atomic JSON requests that park a plan until a human decides (decide-once, expiry, prune) |
+| `learning.py` | **Learn stage**: repair outcomes, per-workload profiles and the bounded, audit-gated auto-adaptation (step, tier, cooldown, budget, quarantine) |
 | `playbooks.py` | Deterministic repairs: OOM memory bump, stuck pod, crashloop recreate, rollout undo, replica restore |
 | `ops_controller.py` | The pipeline: snapshot → finding → evidence → diagnosis → incident state machine → playbook → verify → report |
-| `ops_queue.py` | The queue backends: `memory` (default, local) and `redis` (the cluster manifests) — **no silent fallback** |
+| `ops_queue.py` | The queue backends: `memory` (default, local) and `redis` (the cluster manifests) — **no silent fallback**, **no silent unauthenticated fallback** (Phase 5) |
 | `task_store.py` | Task lifecycle: lease (300 s), retry with the same incident, cooldown, hourly action budget, dead-letter handling |
-| `ops_scanner.py` | The scanner loop (Deployment `auton-scanner`): detect → submit → dedupe |
+| `ops_scanner.py` | The scanner loop (Deployment `auton-scanner`): watch → detect → submit → dedupe |
+| `watcher.py` | **Kubernetes watcher**: real `resourceVersion` watch streams, backoff, 410 → re-list, event cache, health counters |
+| `metrics.py` | **Prometheus exposition**: the text format, written by hand — registry, gauge/counter/histogram, the collectors. Standard library only |
 | `ops_worker.py` | The worker loop (Deployment `auton-worker`): claim → repair → verify |
 | `agent_worker.py` | The executor loop (Deployment `auton-ops`): run the agent for the `agent` queue |
 | `agent_core.py` | Agent loop: dual-path tool calling, observation caps, compaction, corrective retry, cancellation |
 | `agent_client.py` | CLI entry point (`python agent_client.py "task"`) |
-| `agent_service.py` | HTTP front end: bearer auth, sync `POST /run`, async `/jobs`, SSE, cancel, `/audit`, `/incidents` |
+| `agent_service.py` | HTTP front end: bearer auth, sync `POST /run`, async `/jobs`, SSE, cancel, `/audit`, `/incidents`, `/policy`, `/approvals`, `/learning`, `/metrics` |
 | `Dockerfile` | Builds `auton:local` (`python:3.11-slim` + git, ripgrep, bubblewrap, kubectl) |
-| `ui/index.html` | Single-page UI served at `/`: chat, incidents, audit, provider; no bundler or CDN |
+| `ui/index.html` | Single-page UI served at `/`: chat, incidents, approvals, learning, audit, provider; no bundler or CDN |
 | `requirements.txt` | `mcp>=2.0,<3`, `ollama>=0.4.0`, `pathspec>=0.12` |
 | `tests/` | pytest suite (tools, loop helpers, MCP transport, HTTP service, auth, k8s/n8n, incident pipeline) |
 | `eval/run_eval.py` | 8 coding tasks + 4 optional live tasks; needs a live Ollama |
@@ -208,11 +213,21 @@ defence in depth:
   smuggle extra kubectl flags;
 - `AGENT_K8S_WRITE=0` turns every mutating tool into a refusal even if RBAC
   would allow it;
-- every mutation calls `audit.begin()` **before** kubectl and is refused if the
-  record cannot be written (`audit.py`); `audit.finish()` records the outcome;
+- every mutation calls `audit.begin()` **before** the request and is refused if
+  the record cannot be written (`audit.py`); `audit.finish()` records the
+  outcome. The audit gate is **transport-independent**: the record is written
+  first, and only then is the direct path (or kubectl) asked to act;
 - PVC delete is refused in code *and* RBAC, with a hint telling the model to
   report and ask a human;
 - output is clipped (`AGENT_MAX_OUTPUT_CHARS`).
+
+**How a request is made.** The tools talk to the API server **directly over
+HTTPS** (`k8s_api.py` / `k8s_ops.py`). kubectl stays in the image as a
+**fallback**: when the direct path is not available or fails, the tool falls
+back to kubectl and says so — `[k8s] using kubectl for …` in the log and a
+counter in `k8s_api.COUNTERS` (visible in `/tasks/stats` and in
+`auton_k8s_transport_total`). The fallback is never silent. A *refusal*
+(404/403/409) is a final answer and is never retried with kubectl.
 
 `k8s_snapshot` and `k8s_diagnose` do evidence collection in code (status,
 owner, warning events, current + previous logs) and append a deterministic
@@ -240,7 +255,7 @@ having to parse hundreds of lines of raw JSON before it can decide anything.
 kubectl silently drops the implicit in-cluster config when `--request-timeout`
 is non-zero and falls back to `http://localhost:8080` — which inside the agent
 pod is the agent's own authenticated API, producing a baffling 401. Do not
-remove the workaround.
+remove the workaround. It is only used on the **fallback** path now.
 
 ### n8n (`n8n_tools.py`)
 
@@ -455,6 +470,170 @@ OOMKill is useful; a 7B model choosing a kubectl patch is not. The model may
 only *refine* a diagnosis (`AGENT_OPS_LLM_DIAGNOSIS=1`), and even then it may
 not invent a root cause, lower the confidence, or choose an action outside the
 six-item allowlist.
+
+### The Kubernetes watcher (`watcher.py`)
+
+Phase 3 replaced the scanner's blind polling with a real Kubernetes **watch**.
+Before, every scanner asked the API server the same question every 60 seconds
+— "what does this namespace look like right now?" — and parsed a full snapshot
+to answer it. A pod that was OOMKilled at second 3 was noticed at second 60.
+
+Now the API server pushes the changes:
+
+```
+┌──────────┐   list()                    ┌──────────────────┐
+│ watcher  │ ──────────────────────────▶ │ api-server       │
+│  thread  │   watch(rv=12345)            │                  │
+│          │ ◀────────────────────────── │ ADDED/MODIFIED/  │
+└──────────┘   event stream              │ DELETED/BOOKMARK │
+             ▲                           └──────────────────┘
+             │ reconnect with backoff
+             └── 410 Gone ──▶ re-list ──▶ new resourceVersion
+```
+
+Three rules shape it:
+
+**A real resourceVersion.** The watcher never re-lists to "catch up". It keeps
+the last `resourceVersion` it saw and resumes the stream from exactly there.
+The API server may close a watch at any time; that is normal, not an error.
+
+**Failures are counted, not hidden.** Every reconnect, expired
+`resourceVersion` and error is a counter, and `Watcher.stats()` exposes them.
+A watcher that silently stops watching is the worst possible outcome for a
+self-healing platform, so "is it still connected?" must be answerable from the
+outside — it is, at `GET /tasks/stats` under `watchers`.
+
+**Degrade, never crash.** The watcher is an *optimisation*: it makes detection
+faster and cheaper. If the API server is unreachable, if the ServiceAccount
+may not watch, or if `AGENT_WATCH_ENABLED=0`, the scanner falls back to the
+polling loop exactly as before. Detection never stops because a watch stream
+did.
+
+The scanner runs two tiers side by side:
+
+| Tier | Interval | Source | Rules |
+|---|---|---|---|
+| fast | `AGENT_WATCH_FAST_INTERVAL` (60 s) **and immediately on a bad event** | the watch cache — no API call | pod-level (`pod_findings`) |
+| full | `AGENT_WATCH_FULL_INTERVAL` (300 s) | a real snapshot (`k8s_tools._collect`) | every rule, workload-level included |
+
+A pod event whose reasons map to a known incident cause (`ops_controller.REASONS`)
+wakes the scanner up right away; a Deployment event wakes the full
+reconciliation, because the workload-level rules may apply. Both triggers are
+debounced by `AGENT_WATCH_MIN_GAP` (5 s).
+
+**Five streams per namespace (D6).** The watcher covers `pods`,
+`deployments`, `statefulsets`, `persistentvolumeclaims` and `events` — the
+resources the full-tier snapshot needs, so the watch cache and the snapshot
+agree. Events are high churn, so they get a **TTL**
+(`AGENT_WATCH_EVENT_TTL`, 900 s): a stale event is worse than no event, and the
+cache is pruned so it cannot grow without bound. A pod event can trigger the
+fast tier; the other four trigger the full tier.
+
+Only the standard library is used: `urllib` for HTTPS, `ssl` for the cluster
+CA, `json` for the event stream. There is no client-go and no new dependency in
+the image. The HTTP plumbing itself lives in `k8s_api.py` (shared with the
+tools); `watcher.py` re-exports the client, so its public surface did not
+change.
+
+### The executor write scope (`watcher.py`'s sibling: RBAC + `AGENT_K8S_WRITE`)
+
+Phase 4 narrowed the LLM executor. The component that talks to a 7B model may
+**read** every namespace it is allowed to see, but by default it may not
+**change** anything: a hallucinated `kubectl patch` must not become a real
+change.
+
+The scope is enforced by two independent layers:
+
+| Layer | Where | What it does |
+|---|---|---|
+| **RBAC** (the boundary) | `yamls/auton-rbac.yaml` | the `auton-agent` Role grants `get/list/watch` **only** — no write verb, no `pods/exec` |
+| **the tools** (the belt) | `AGENT_K8S_WRITE=0` | `k8s_apply`, `k8s_patch`, `k8s_scale`, `k8s_rollout`, `k8s_delete` and `k8s_exec` refuse before they run |
+
+The important consequence: **the shell cannot bypass it.** The executor pod
+has `kubectl` and its ServiceAccount token, but without a write verb the API
+server answers `Forbidden`:
+
+```
+$ kubectl -n auton exec deploy/auton-ops -- \
+    kubectl -n auton-apps patch deployment api --type merge -p '{...}'
+Error from server (Forbidden): deployments.apps "api" is forbidden:
+User "system:serviceaccount:auton:auton-agent" cannot patch resource
+"deployments" in API group "apps" in the namespace "auton-apps"
+```
+
+RBAC is the security boundary; the tool code is a fast, friendly refusal on
+top of it.
+
+The write half lives in a **separate, opt-in** manifest
+(`yamls/auton-rbac-write.yaml`: Role `auton-agent-write` + bindings in both
+namespaces) and is enabled with one command, which changes both halves at
+once — either half alone would leave a confusing state:
+
+```bash
+scripts/set-agent-writes.sh --status     # report the current scope
+scripts/set-agent-writes.sh --enable     # apply the write Role + AGENT_K8S_WRITE=1
+scripts/set-agent-writes.sh --disable    # delete the write Role + AGENT_K8S_WRITE=0
+```
+
+The Helm equivalent is `agent.allowWrites=true` (default `false`), and
+`scripts/install.sh --allow-writes` does the same during an install.
+
+The **repair path is not affected**: the scanner and the worker keep their own
+identities and their own policy-gated permissions. `auton-worker` remains the
+only component that mutates a workload by default.
+
+### Queue authentication (`ops_queue.py`)
+
+The queue is the one component every pod talks to, so it is the one component
+that must never accept an unauthenticated client. Since Phase 5 **Redis
+requires a password**, and the client **fails closed**.
+
+**Where the password comes from** — `ops_queue.redis_password()`:
+
+1. `AGENT_REDIS_PASSWORD_FILE` (the manifests: `/etc/auton-redis/password`) —
+   a mounted Secret. The file wins over the environment variable, because a
+   value in the environment shows up in every process dump.
+2. `AGENT_REDIS_PASSWORD` — for local runs only.
+
+An **unreadable** or an **empty** file is an error, never an empty password: a
+client that silently connects without auth looks healthy against a
+passwordless server and is refused by a protected one.
+
+**How the client fails closed** — `create_backend()` calls `backend.ping()`,
+and every failure mode raises `QueueError` (the pod refuses to start):
+
+| Situation | Message |
+|---|---|
+| no password, protected server | `Redis authentication failed: Authentication required.` |
+| wrong password | `Redis authentication failed: invalid username-password pair or user is disabled.` |
+| password, passwordless server | `Redis authentication failed: AUTH … called without any password configured…` |
+| the server is down | `Redis is unreachable: …` |
+
+The first three are *authentication* failures and the last one is an outage —
+the distinction matters, because an operator must not go looking at the
+network when the problem is the password. `ops_queue._is_auth_error()` does
+that classification (redis-py maps some of these replies to
+`AuthenticationError` and leaves others as a plain `ResponseError`, so the
+message is inspected too).
+
+There is **no** "retry without a password" path and **no** fallback to the
+in-memory backend: both would look healthy and silently lose repair tasks.
+
+**Where the password lives on the server** — the Redis pod's init container
+reads the mounted Secret and writes a config file:
+
+```yaml
+command: ["redis-server", "/tmp/redis/redis.conf"]     # no password in argv
+```
+
+The password must be ≥ 16 characters from `[A-Za-z0-9_-]`; the init container
+refuses to start otherwise, instead of writing a config Redis cannot parse.
+The probes authenticate (`REDISCLI_AUTH=… redis-cli ping | grep -qx PONG`) —
+an unauthenticated PING answers `NOAUTH …` and redis-cli still exits 0, so the
+probe checks the *answer*, not only the exit code.
+
+`GET /health` reports `queue_auth: password` (or `none` / `unreadable`) — the
+state, never the value.
 
 ### The incident pipeline
 
@@ -694,7 +873,7 @@ policy check ──require_approval──▶ approval request (pending)
 
 | Symptom | Cause | Playbook |
 |---|---|---|
-| `OOMKilled` | `oom` | raise the Deployment memory limit 25% (min 32Mi, cap `AGENT_OPS_MAX_MEMORY`), roll out, verify |
+| `OOMKilled` | `oom` | raise the Deployment memory limit 25% (min 32Mi, cap `AGENT_OPS_MAX_MEMORY`), roll out, verify — the bump comes from the learned profile and is clamped here again |
 | pod stuck `Terminating` beyond `AGENT_OPS_TERMINATION_GRACE` | `stuck` | `delete --grace-period=0 --force`, verify gone |
 | `CrashLoopBackOff` with no config-shaped log evidence | `crashloop` | delete the pod so the ReplicaSet recreates it, verify Deployment Available |
 | `ProgressDeadlineExceeded` / `ReplicaFailure` | `rollout` | `rollout undo`, verify |
@@ -747,6 +926,177 @@ Slack/Telegram templates stay trivial:
  "url": "http://auton.localhost/incidents/inc-…"}
 ```
 
+### The Learn stage (`learning.py`)
+
+The pipeline ends with **verify**, and the result of that verification is fed
+back into the next repair. `learning.py` is the feedback edge:
+
+```
+repair → verify → outcome ─┬─▶ profile (per workload + cause)
+                            └─▶ adaptation (audit-gated) → next plan
+```
+
+**Outcome** — one repair attempt: cause, action, ok/failed, needs_human,
+duration, incident id, the policy mode and the tier. One atomic JSON file per
+outcome under `AGENT_LEARN_DIR` (default `AGENT_AUDIT_DIR/learning`), pruned
+at `AGENT_LEARN_MAX_OUTCOMES`.
+
+**Profile** — what the platform has learned about one *(workload, cause)*:
+`attempts`, `successes`, `failures`, `consecutive_failures`, `recurrences`,
+`memory_step`, `tier`, `cooldown_seconds`, `budget_per_hour`, `quarantined`
+and the bounded adaptation history. The profile belongs to the **workload**,
+not to the pod: an OOM kills a pod, but the repair changes the Deployment and
+the rollout creates a new pod — a profile per pod would forget everything
+after the first repair (`ops_controller._learning_resource()` resolves
+pod → ReplicaSet → Deployment).
+
+**Adaptation** — a named, closed allowlist. There is no free-form learning
+rule and an unknown name is refused:
+
+| Name | Trigger (`MIN_SAMPLES` = 3) | Effect | Cap |
+|---|---|---|---|
+| `raise_oom_step` | the cause was repaired ≥ 3× | the memory bump doubles | `MAX_STEP` (1.0) |
+| `raise_tier` | the cause was repaired ≥ 6× | the next plan gets a higher tier | tier 3 |
+| `raise_cooldown` | 3 failures in a row | the cooldown of that resource grows | `COOLDOWN_MAX` (6 h) |
+| `lower_budget` | 3 failures in a row | fewer actions/hour for that resource | `BUDGET_MIN` (1) |
+| `quarantine` | 3 failures in a row | the resource is not repaired any more → `needs_human` | — |
+
+**The envelope** — learning may only make the platform *more cautious* or tune
+a *bounded number*. It may never lower a tier, change the action of a plan,
+widen what the platform may touch, exceed the caps, bypass the audit gate, or
+run at all when the policy is `disabled`/`observe-only` or
+`AGENT_LEARN_ENABLED=0`. Every clamp is applied twice: in `learning.py` **and**
+in the playbook (`fix_oom(step=…)` clamps the fraction again).
+
+**The audit gate** — an adaptation is written to the audit log
+(`learn_adapt`, a `begin`/`end` pair) *before* it is applied. If the record
+cannot be written, the adaptation is refused and the platform keeps its old
+behaviour. "The platform changed its mind" is as auditable as "the platform
+changed the cluster".
+
+A learning failure never breaks the repair path: every call in the controller
+is guarded, and an unwritable learning directory makes the service inert
+(`NullStore`) instead of fatal.
+
+### The metrics (`metrics.py`)
+
+`GET /metrics` serves a **Prometheus exposition** in the standard text format
+(`text/plain; version=0.0.4`) — written by hand, with the **standard library
+only**. There is no `prometheus_client` dependency and no metrics sidecar: the
+platform must not need a Python package to report that it is alive.
+
+```python
+reg = metrics.Registry()
+reg.gauge("auton_up", "1 when the Auton API is serving metrics.", 1)
+reg.counter("auton_http_responses_total", "HTTP responses sent.", 42)
+reg.histogram("auton_repair_duration_seconds", "How long repairs took.",
+              metrics.REPAIR_BUCKETS, [1.2, 8.0])
+print(reg.render())
+```
+
+The module is three small pieces:
+
+| Piece | What it does |
+|---|---|
+| `Registry` | the metric families of one scrape: `gauge`, `counter`, `histogram` (cumulative `_bucket`/`_sum`/`_count`) and `render()` |
+| `escape_help` / `escape_label_value` / `format_value` | the escaping rules of the format (a raw backslash, quote or newline breaks the parse) |
+| `collect(snapshot)` | the collectors: service, queue, watch, incidents, approvals, learning, policy, jobs, HTTP, process |
+
+**The snapshot is the contract.** `agent_service._metrics_snapshot()` reads the
+real state — the queue in Redis, the incident/approval/learning stores on the
+shared PVC, the watcher health the scanner publishes, the policy document. The
+key distinction:
+
+* the key is **present** → the source was read. An empty store is a fact and
+  is reported as a zero total;
+* the key is **absent** → the source could not be read. The families are left
+  out entirely, because a zero would be a guess.
+
+Three rules the exposition follows:
+
+1. **No invented numbers** — see above.
+2. **No secrets** — counts, states and durations only; never a token, a key, a
+   password or a resource body.
+3. **Bounded cardinality** — the label values come from a closed set (causes,
+   states, roles) plus the learned profiles, which are capped at
+   `MAX_PROFILES` (50).
+
+The endpoint needs the **bearer token**, like every other data endpoint, so a
+scrape that forgets it gets `401` instead of a free status page:
+
+```yaml
+scrape_configs:
+  - job_name: auton
+    scheme: http
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["auton.auton.svc.cluster.local:8080"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/auton-api-token
+```
+
+`AUTON_VERSION` (the chart version) is exposed as the `version` label of
+`auton_build_info`.
+
+### The direct Kubernetes API client (`k8s_api.py` + `k8s_ops.py`)
+
+The platform talks to the API server **directly over HTTPS** — no process is
+forked, no client is started, and the answer arrives in milliseconds instead
+of a tenth of a second. There is **no client library**: `urllib`, `ssl` and
+`json` are enough, and a dependency is a dependency that can break the image.
+
+```python
+import k8s_api, k8s_ops
+
+client = k8s_api.client()               # None outside the cluster
+items, rv = client.list("/api/v1/namespaces/auton-apps/pods")
+document = k8s_ops.get_object("pods", "api-1", "auton")
+```
+
+Two modules, two jobs:
+
+| Module | What it does |
+|---|---|
+| `k8s_api.py` | the **transport**: `ApiConfig`, the credentials the kubelet projects (`/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt}`), `ApiClient` (GET/POST/PATCH/DELETE/list/watch), the resource registry, the WebSocket exec channel and the transport counters |
+| `k8s_ops.py` | the **vocabulary**: `get_object`, `list_objects`, `pod_logs`, `events`, `top_nodes`, `top_pods`, `apply_manifest`, `patch_object`, `scale`, `delete_object`, `rollout_restart`, `rollout_undo`, `rollout_status`, `exec_command`, `describe` |
+
+The **registry is closed**: a resource outside it never reaches the network.
+`resolve_resource()` accepts the kubectl aliases (`po`, `svc`, `pvc`,
+`deploy`, `sts`, …) and ignores a group suffix (`deployments.apps`).
+
+Four rules the client follows:
+
+1. **The RBAC is still the boundary.** The client can do whatever the
+   ServiceAccount may do and nothing else; it grants no extra permission.
+2. **A refusal is a final answer.** `404`, `403` and `409` are raised as
+   `ApiNotFound` / `ApiForbidden` / `ApiConflict` and are **never** retried
+   with kubectl — kubectl would give the same answer.
+3. **kubectl stays as a fallback, and it is never silent.** If the direct path
+   is unavailable (no credentials) or fails (`ApiUnavailable`), the caller
+   falls back to kubectl, logs `[k8s] using kubectl for …` and counts it in
+   `k8s_api.COUNTERS` (`direct`, `direct_error`, `kubectl`, `unavailable`).
+   The counters are published in `/tasks/stats` and in the Prometheus
+   exposition (`auton_k8s_transport_total{transport="direct"|"kubectl"}`).
+4. **Nothing is invented.** An error is reported with the API server's own
+   status and message, not with a guess.
+
+`AGENT_K8S_DIRECT=0` forces the kubectl path (it is how the two are
+compared); the default is `1`.
+
+Two operations need no YAML parser and no SPDY library:
+
+* `k8s_apply` uses **server-side apply** (`application/apply-patch+yaml`) — the
+  API server parses the YAML, so only the kind and the name are read locally
+  (`_manifest_identity`);
+* `k8s_exec` speaks the **`v4.channel.k8s.io` WebSocket** protocol directly —
+  a hand-rolled RFC 6455 frame (`_ws_frame` / `_ws_read`), where the first
+  byte of each frame is the channel (1 = stdout, 2 = stderr, 3 = error).
+
+The watch (`watcher.py`) now uses the same client; its public surface did not
+change (`watcher.ApiClient` is a thin subclass that turns an HTTP status into
+"expired" or "forbidden").
+
 ## HTTP API
 
 `GET /` and `GET /ui` serve the UI (`ui/index.html`, one file, no build step);
@@ -791,6 +1141,13 @@ curl -s "http://localhost:8080/incidents/inc-..." -H "Authorization: Bearer $TOK
 curl -s http://localhost:8080/provider -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://localhost:8080/provider/test -H "Authorization: Bearer $TOKEN"
 
+# what the platform has learned (auth required; 503 if the store is unwritable)
+curl -s "http://localhost:8080/learning?limit=20" -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/learning?cause=oom" -H "Authorization: Bearer $TOKEN"
+
+# the Prometheus exposition (auth required; text/plain, version=0.0.4)
+curl -s http://localhost:8080/metrics -H "Authorization: Bearer $TOKEN"
+
 # change provider settings from the UI/API (partial update; api_key is write-only)
 curl -s -X POST http://localhost:8080/provider -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
@@ -814,6 +1171,9 @@ curl -s -X DELETE http://localhost:8080/provider/key -H "Authorization: Bearer $
 | `GET /approvals/{id}` | One approval request: the plan, the policy decision, the decision timeline |
 | `POST /approvals/{id}/approve` | Approve a pending plan and enqueue the repair (`409` if it was already decided) |
 | `POST /approvals/{id}/reject` | Reject a pending plan; the incident goes to `NEEDS_HUMAN` |
+| `GET /learning?limit=&namespace=&resource=&cause=` | The Learn stage: the outcomes, the learned profiles, the statistics and the caps |
+| `GET /metrics` | The Prometheus exposition (`text/plain; version=0.0.4`) — the queue, the watcher health, the incidents, the approvals, the learning, the policy, the jobs and the process |
+| `GET /tasks/stats` | Queue depth, active counts, workers, the hourly budget and the **watcher health** (`watchers`: one entry per watch stream + a `scanner` summary) |
 
 Response: `{job_id, final, steps, stop_reason, elapsed}`. A missing `task`
 returns `400`; a queue overflow `429`; a failed job `500`; a sync wait that times
@@ -939,8 +1299,9 @@ python -m pytest tests -q
 The suite covers workspace escape, unique-match editing, atomic patches,
 gitignore-aware search, background jobs, git tools, context compaction, the real
 MCP stdio transport (all 34 tools), the HTTP jobs API, bearer auth (401/503 and
-fail-closed startup), the kubectl wrapper (namespace allowlist, validation,
-write gate, snapshot/diagnose/events/wait/exec), the write-ahead audit log
+fail-closed startup), the Kubernetes tools (direct HTTPS first with the kubectl
+fallback, namespace allowlist, validation, write gate,
+snapshot/diagnose/events/wait/exec), the write-ahead audit log
 (fail-closed, begin/end pairing, SQLite index), the provider layer
 (config precedence, both remote adapters, redaction, no fallback), the n8n
 client (mocked HTTP, generated agent/ops pipelines), the **Incident Manager v2**
@@ -957,12 +1318,20 @@ executed), the **incident pipeline** (detect →
 diagnose → repair → verify, report-only, dry run, retry-reuses-the-incident),
 the playbooks (OOM math, owner-chain and protect/namespace guards, report-only
 causes), the ops controller (rule table, cooldown, hourly budget, dry-run,
-report payload), the queue backends (`memory`/`redis`, no silent fallback) and
+report payload), the **Kubernetes watcher** (the URLs and headers, the event
+parsing, the 410-Gone re-list, the backoff, the counters, the event cache, the
+fast path and the polling fallback), the **executor write scope** (the RBAC
+split, the read-only default, the opt-in manifest and the tool gate), the
+**queue authentication** (the password source, the fail-closed client, the
+server config and the manifest checks), the queue backends (`memory`/`redis`,
+no silent fallback) and
 the RBAC manifests (`tests/test_rbac.py` fails if a Role ever grants secrets or
-PVC delete, and checks the ops identity is read-only in `auton`).
+PVC delete, and checks the ops identity is read-only in `auton`) and the
+**manifest drift** (`tests/test_manifests.py` fails when `yamls/` no longer
+matches the Helm chart it was generated from).
 
 The suite is the only automated check in this repository — there is no build
-system, linter or CI. Expect **495 passed**.
+system, linter or CI. Expect **746 passed**.
 
 ### Eval harness
 
@@ -1130,14 +1499,20 @@ delete it and recreate it.
 | `AGENT_OPS_LLM_DIAGNOSIS` | `0` | diagnosis | `1` lets the model *refine* a diagnosis (advisory only) |
 | `AGENT_QUEUE` | `memory` | queue | `memory` (local) or `redis` (the cluster manifests) — **no silent fallback** |
 | `AGENT_REDIS_URL` | `redis://redis:6379/0` | queue | Redis endpoint for the queue backend |
-| `AGENT_REDIS_PASSWORD` | *(none)* | queue | Redis password (Phase 5 turns auth on by default) |
-| `AGENT_REDIS_PASSWORD_FILE` | *(none)* | queue | File the Redis password is read from |
+| `AGENT_REDIS_PASSWORD` | *(none)* | queue | Redis password — local runs only; the manifests mount the Secret instead |
+| `AGENT_REDIS_PASSWORD_FILE` | *(none)* | queue | File the Redis password is read from (the manifests: `/etc/auton-redis/password`) |
 | `AGENT_QUEUE_PREFIX` | `auton` | queue | Redis key prefix |
 | `AGENT_QUEUE_MAX` | *(queue-dependent)* | queue | Maximum queued tasks |
 | `AGENT_SCAN_INTERVAL` | `60` | scanner | Scan interval, seconds |
 | `AGENT_SCAN_DEDUPE_WINDOW` | `300` | scanner | Window in which the same finding is not resubmitted, seconds |
+| `AGENT_WATCH_ENABLED` | `1` | watcher | `0` keeps the old polling behaviour |
+| `AGENT_WATCH_FAST_INTERVAL` | `60` | watcher | Fast tier: reads the watch cache (pod-level rules), seconds |
+| `AGENT_WATCH_FULL_INTERVAL` | `300` | watcher | Full tier: takes a real snapshot (every rule), seconds |
+| `AGENT_WATCH_TIMEOUT` | `300` | watcher | How long the API server keeps one watch stream open, seconds |
+| `AGENT_WATCH_MIN_GAP` | `5` | watcher | Smallest gap between two event-triggered scans, seconds |
+| `AGENT_K8S_API` | *(in-cluster)* | watcher | API server base URL; `AGENT_K8S_TOKEN`/`AGENT_K8S_CA_FILE` override the projected ServiceAccount |
 | `AGENT_K8S_ENABLED` | `1` | k8s | `0` disables the Kubernetes tools |
-| `AGENT_K8S_WRITE` | `0` (image) / `1` (deployment) | k8s | Allows apply/patch/scale/rollout/delete/exec |
+| `AGENT_K8S_WRITE` | `0` (read-only) / `1` (worker, opt-in executor) | k8s | Allows apply/patch/scale/rollout/delete/exec |
 | `N8N_API_URL` | `http://n8n:5678/api/v1` | n8n | n8n public API base |
 | `N8N_WEBHOOK_BASE` | `http://n8n:5678/webhook` | n8n | Webhook base |
 | `N8N_API_KEY_FILE` | `/etc/n8n-api/api-key` | n8n | Key file, read on every call |
@@ -1151,13 +1526,21 @@ delete it and recreate it.
 
 ## Safety and limitations
 
-- **The agent can change its own namespace.** `AGENT_K8S_WRITE=1` plus the
-  `auton-agent` Role allow CRUD on workloads, services, configmaps, PVCs and jobs
-  in `auton` and `auton-apps`. The Role deliberately denies secrets,
-  serviceaccounts, roles/rolebindings, PVC delete and namespace delete;
-  cluster-scoped access is read-only. Creating pods is still powerful (a pod
-  spec can reference a Secret by name), so keep long-lived credentials out of
-  these namespaces.
+- **The LLM executor is read-only by default.** Since Phase 4 the
+  `auton-agent` identity has no write verb at all: it may `get/list/watch`
+  pods, workloads, events and logs in `auton` and `auton-apps`, and nothing
+  more. The write half lives in a separate opt-in manifest
+  (`yamls/auton-rbac-write.yaml`) and is enabled with
+  `scripts/set-agent-writes.sh --enable` (`agent.allowWrites=true` in Helm).
+  Even with `kubectl` and its token in the pod, a shell command that tries to
+  patch a Deployment is refused by the API server. The repair path is
+  unaffected: `auton-worker` remains the only component that mutates a
+  workload by default.
+- **The queue requires a password.** Since Phase 5 Redis answers an
+  unauthenticated client with `NOAUTH Authentication required.`, and every pod
+  authenticates with the Secret `auton-redis`. The password is not in any
+  manifest, pod spec, environment variable or command line. The clients fail
+  closed on an auth mismatch rather than retrying without a password.
 - **Every mutation is audited before it runs.** `audit.py` appends and fsyncs a
   `begin` record to `$AGENT_AUDIT_DIR/audit.jsonl`; if that write fails the
   kubectl call is skipped. `GET /audit` exposes the records (auth required).

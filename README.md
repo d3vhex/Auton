@@ -41,7 +41,8 @@ Installer options (all steps check first, so re-running is safe):
 | `--skip-build` | Do not build/import `auton:local`; use the image already in the cluster |
 | `--skip-model-pull` | Do not pull the Ollama model |
 | `--no-ingress` | Skip the Traefik Ingress |
-| `--verify` | Only run the verification checks (token, RBAC, provider, incidents) |
+| `--sync` | Regenerate `yamls/` from the Helm chart before installing |
+| `--verify` | Only run the verification checks (token, RBAC, provider, incidents, policy, learning, metrics) |
 | `--dry-run` | Print the commands without changing anything |
 | `--show-token` | Print the bearer token at the end |
 
@@ -51,6 +52,10 @@ Environment: `AUTON_IMAGE` (deploy a registry image instead of building
 prints the same list.
 
 If you prefer to see every step, the manual sequence is:
+
+> `yamls/` is **generated** from the Helm chart (`charts/auton-chart`) — see
+> [The chart is the source of truth](#the-chart-is-the-source-of-truth). Edit
+> the chart, not the manifests.
 
 ```bash
 # 1. Cluster with GPU passthrough (80:80 is only needed for ingress)
@@ -126,24 +131,57 @@ curl -s http://localhost:8080/run \
 
 ---
 
+## The chart is the source of truth
+
+`charts/auton-chart` describes every Kubernetes object; `yamls/` is the **generated**
+artifact that `kubectl apply` consumes. There is no second, hand-maintained
+copy of a Deployment — that is exactly how the raw manifests and the chart
+used to drift apart.
+
+```bash
+# change charts/auton-chart/templates/*.yaml (or values.yaml), then:
+./scripts/sync-yamls.sh          # rewrite yamls/ from the chart (needs helm)
+./scripts/sync-yamls.sh --check  # fail if yamls/ drifted from the chart
+```
+
+Each generated file starts with a `GENERATED — DO NOT EDIT` banner, and
+`yamls/.chart-stamp` records the checksum of the chart inputs and of every
+generated file. Three things keep the two in sync:
+
+* `mcp/tests/test_manifests.py` fails the test suite when the chart changed
+  without a regeneration, when a generated file was edited by hand, or when a
+  new resource has no home in the layout;
+* `scripts/install.sh` refuses to install manifests that drifted from the
+  chart (`--sync` regenerates them first);
+* the layout is a single source of truth in `scripts/sync-yamls.py`, so the
+  installer, the test and the generator cannot disagree.
+
+`charts/auton-chart/values-k3d.yaml` is the overlay that reproduces this lab
+(`auton:local`, `local-path`, Ollama/n8n/ingress enabled, the lab's resource
+requests). Two files in `yamls/` are **not** generated — they belong to the
+cluster, not to the chart: `k8s-ds-amdgpu-dp.yaml` (the AMD GPU device
+plugin) and `gpu-test.yaml` (the one-shot `rocminfo` smoke test).
+
+---
+
 ## Helm (Docker Hub images)
 
 The same stack is packaged as a chart so it can be installed without this
-repository. Images and the chart are published under `d3vhex` on Docker Hub by
-`scripts/publish.sh` (`docker.io/d3vhex/auton`, plus
-`oci://registry-1.docker.io/d3vhex/charts/auton`):
+repository. Images and the chart are published under `d3vhec` on Docker Hub by
+`scripts/publish.sh` (`docker.io/d3vhec/auton`, plus
+`oci://registry-1.docker.io/d3vhec/auton-chart`):
 
 ```bash
-helm install auton oci://registry-1.docker.io/d3vhex/charts/auton \
-  --version 0.2.0 --namespace auton --create-namespace \
+helm install auton oci://registry-1.docker.io/d3vhec/auton-chart \
+  --version 0.3.0 --namespace auton --create-namespace \
   --set agent.auth.token="$(openssl rand -hex 24)"
 ```
 
-From a checkout, `helm install auton ./charts/auton ...` works the same way.
+From a checkout, `helm install auton ./charts/auton-chart ...` works the same way.
 The chart creates the `auton`/`auton-apps` namespaces, RBAC, the audit PVC, the
 queue, the API, the scanners, the repair workers and the LLM executor, and
 optionally Ollama (with a model-pull Job), n8n and ingress.
-`charts/auton/README.md` documents every value, remote-provider examples,
+`charts/auton-chart/README.md` documents every value, remote-provider examples,
 multi-node claims and `--take-ownership` adoption of an existing k3d install.
 
 To publish your own build:
@@ -176,12 +214,13 @@ DOCKERHUB_USER=<user> DOCKERHUB_TOKEN=<token> ./scripts/publish.sh
   │                               │ auton :8080  (ClusterIP)          │  │
   │                               │   API + UI, producer only         │  │
   │                               │   SA auton-api (patch 3 objects)  │  │
+  │                               │   GET /metrics (Prometheus)       │  │
   │                               │        │ enqueue                 │  │
   │                               │        ▼                          │  │
   │                               │  2× auton-scanner  SA: read-only  │  │
   │                               │     findings ─▶ repair queue      │  │
   │                               │  2× auton-worker   SA: playbooks  │  │
-  │                               │     claim ─▶ audit ─▶ kubectl     │  │
+  │                               │     claim ─▶ audit ─▶ API (HTTPS) │  │
   │                               │  1× auton-ops      SA auton-agent │  │
   │                               │     agent_worker ─▶ agent_core    │  │
   │                               │       └─ MCP stdio ─▶ agent_server│  │
@@ -200,11 +239,11 @@ dependency on the agent, so the GPU stack can be tested on its own. The queue is
 the only thing the pod roles share:
 
 - **`auton`** validates a request and, with `AGENT_QUEUE=redis`, enqueues an
-  `agent` task and answers `202`. It never runs the model and never runs
-  `kubectl`.
-- **`auton-scanner`** snapshots `auton-apps` read-only every 60 s and enqueues a
-  `repair` task per finding. Two replicas collapse duplicate findings on the
-  queue's idempotency key.
+  `agent` task and answers `202`. It never runs the model and never changes a
+  Kubernetes object.
+- **`auton-scanner`** watches `auton-apps` (5 streams per namespace) and
+  enqueues a `repair` task per finding. Two replicas collapse duplicate
+  findings on the queue's idempotency key.
 - **`auton-worker`** claims repair tasks. Two workers repair *different*
   workloads in parallel; a per-resource lock serialises the same workload. Each
   task is **planned** and **policy-checked** before anything is changed: a plan
@@ -212,6 +251,15 @@ the only thing the pod roles share:
   the incident waits in `AWAITING_APPROVAL` until a human decides.
 - **`auton-ops`** claims `agent` tasks and runs the LLM loop. One replica, and a
   global GPU slot in Redis keeps two model calls from overlapping.
+
+Every pod talks to the Kubernetes API server **directly over HTTPS**
+(`mcp/k8s_api.py`, standard library only) — no `kubectl` fork per read or
+write. kubectl stays in the image as a **logged, counted fallback**: if the
+direct path is unavailable or fails, the call falls back to kubectl and says so
+(`[k8s] using kubectl for …` in the pod log, and a counter in
+`/tasks/stats` → `watchers[].transport` and in `auton_k8s_transport_total`).
+The fallback is never silent, and an RBAC refusal is never retried with
+kubectl — the API server's own message is the answer.
 
 Four identities, one per pod role (`yamls/auton-rbac.yaml`):
 
@@ -236,11 +284,12 @@ manage `serviceaccounts`, touch Roles/RoleBindings or delete PVCs/namespaces.
 | `namespace.yaml` | — | `auton` namespace | — | — |
 | `auton-apps.yaml` | — | `auton-apps` namespace + quota + LimitRange | — | — |
 | `auton-rbac.yaml` | `auton`, `auton-apps` | SAs `auton-agent`/`auton-api`/`auton-scanner`/`auton-worker` + Roles/Bindings + cluster read-only | — | — |
+| `auton-rbac-write.yaml` | `auton`, `auton-apps` | The executor's write Role + bindings — **opt-in** (`scripts/set-agent-writes.sh --enable`) | — | — |
 | `auton-policy.yaml` | `auton` | The repair policy ConfigMap `auton-policy` (mode + `policy.json`), mounted into the API and the workers | — | — |
 | `ollama-deployment.yaml` | `auton` | Ollama Deployment + PVC + **ClusterIP** | `ollama/ollama:latest` | `ollama-service:11434` |
-| `redis.yaml` | `auton` | Queue Deployment + AOF PVC + **ClusterIP** | `redis:7-alpine` | `redis:6379` |
+| `redis.yaml` | `auton` | Queue Deployment (password required) + AOF PVC + **ClusterIP** | `redis:7-alpine` | `redis:6379` |
 | `agent-deployment.yaml` | `auton` | API + UI Deployment (producer) + workspace PVC + **ClusterIP** | `auton:local` (built from `mcp/`) | `auton:8080` |
-| `auton-scanner-deployment.yaml` | `auton` | 2 read-only scanners | `auton:local` | — |
+| `auton-scanner-deployment.yaml` | `auton` | 2 read-only scanners (Kubernetes watch + polling fallback) | `auton:local` | — |
 | `auton-worker-deployment.yaml` | `auton` | 2 repair workers (shares `agent-workspace`) | `auton:local` | — |
 | `auton-ops-deployment.yaml` | `auton` | LLM executor `agent_worker.py` (shares `agent-workspace`) | `auton:local` | — |
 | `n8n-deployment.yaml` | `auton` | n8n Deployment + PVC + **ClusterIP** | `docker.n8n.io/n8nio/n8n:latest` | `n8n:5678` |
@@ -255,7 +304,7 @@ would deadlock trying to mount the same volume in two pods).
 
 | Secret | Key | Used by | Notes |
 |---|---|---|---|
-| `auton-api-token` | `token` | API, scanners (none), workers, executor, n8n | Bearer token for `/run`, `/jobs*`, `/tasks*`, `/audit`, `/provider*`, `/incidents*`, `/policy`, `/approvals*`; also passed to n8n, the workers and the executor |
+| `auton-api-token` | `token` | API, scanners (none), workers, executor, n8n | Bearer token for `/run`, `/jobs*`, `/tasks*`, `/audit`, `/provider*`, `/incidents*`, `/policy`, `/approvals*`, `/learning`, `/metrics`; also passed to n8n, the workers and the executor |
 | `n8n-api` | `api-key` | Executor (and a local memory-mode API) | n8n public-API key; mounted at `/etc/n8n-api/api-key` and read **per call**, so rotation needs no restart (projected volume lags up to ~1 min; use `scripts/rotate-n8n-api-key.sh`) |
 | `auton-model` | `api-key` | Executor (and the API for `/provider/test`) | Key for the active remote model provider (empty for local Ollama). Written by `scripts/set-provider.sh`, read per call |
 
@@ -273,17 +322,18 @@ provider settings.
 .
 ├── README.md                  ← you are here (overview + full runbook)
 ├── AGENTS.md                  short operating notes for coding agents
-├── yamls/
+├── yamls/                     GENERATED from charts/auton-chart (scripts/sync-yamls.sh)
 │   ├── namespace.yaml         auton namespace
 │   ├── auton-apps.yaml        autonomous-repair namespace + quota + LimitRange
 │   ├── auton-rbac.yaml        SA + Roles (auton, auton-apps) + cluster read-only
+│   ├── auton-rbac-write.yaml  the executor's write Role (opt-in, Phase 4)
 │   ├── auton-model.yaml       provider ConfigMap (ollama/openai/…) + API-key Secret
 │   ├── auton-policy.yaml      repair-policy ConfigMap (mode + policy.json)
-│   ├── k8s-ds-amdgpu-dp.yaml  AMD GPU device plugin (kube-system)
-│   ├── gpu-test.yaml          rocminfo smoke-test pod
+│   ├── k8s-ds-amdgpu-dp.yaml  AMD GPU device plugin (kube-system) — hand-written
+│   ├── gpu-test.yaml          rocminfo smoke-test pod — hand-written
 │   ├── ollama-deployment.yaml Ollama + GPU + model PVC + ClusterIP
 │   ├── ollama-deployment.yaml.orig  legacy pre-PVC version — do not apply
-│   ├── redis.yaml             queue + AOF PVC + ClusterIP
+│   ├── redis.yaml             queue + AOF PVC + ClusterIP (password required)
 │   ├── agent-deployment.yaml  Auton API/UI pod + workspace PVC + ClusterIP
 │   ├── auton-scanner-deployment.yaml  read-only detection ×2
 │   ├── auton-worker-deployment.yaml   repair playbooks ×2 (the writers)
@@ -294,15 +344,23 @@ provider settings.
 │   ├── install.sh             idempotent bootstrap + verification
 │   ├── publish.sh             build/push the Docker Hub image and chart
 │   ├── rotate-n8n-api-key.sh  Secret update + projected-volume wait + verify
+│   ├── rotate-redis-password.sh rotate the queue password (server + clients)
 │   ├── set-provider.sh        switch model provider + verify (no restart)
-│   └── set-policy.sh          switch the repair policy (mode/tiers/rules)
-├── charts/auton/              Helm chart (API + scanner + worker + executor)
+│   ├── set-policy.sh          switch the repair policy (mode/tiers/rules)
+│   ├── set-agent-writes.sh    enable/disable the executor write scope
+│   ├── sync-yamls.sh          regenerate yamls/ from the chart (--check: drift)
+│   └── sync-yamls.py          the file layout + the checksum stamp
+├── charts/auton-chart/              Helm chart — the source of truth for yamls/
+│   ├── values.yaml            defaults (published install)
+│   ├── values-k3d.yaml        the lab overlay that produces yamls/
 ├── mcp/                       container for auton:local  (see mcp/README.md)
 │   ├── agent_server.py        MCP stdio server (fs/shell/git/k8s/n8n/queue)
 │   ├── audit.py               write-ahead audit log (JSONL + SQLite)
 │   ├── llm.py                 provider layer (ollama/openai/gemini/anthropic/custom)
 │   ├── provider_admin.py      validated provider writes (UI -> ConfigMap/Secret)
-│   ├── k8s_tools.py           kubectl wrapper (13 tools, audit-gated)
+│   ├── k8s_api.py             the direct Kubernetes API client (stdlib HTTPS)
+│   ├── k8s_ops.py             the Kubernetes operations over that transport
+│   ├── k8s_tools.py           the 13 Kubernetes tools (direct first, kubectl fallback)
 │   ├── n8n_tools.py           n8n REST client (6 tools)
 │   ├── ops_queue.py           memory/Redis queue backends
 │   ├── task_store.py          task lifecycle, locks, cooldown, budget, GPU slot
@@ -312,9 +370,12 @@ provider settings.
 │   ├── policy.py              policy engine (modes, tiers, rules, fail closed)
 │   ├── planner.py             repair planner (the RepairPlan schema)
 │   ├── approvals.py           approval store (plans waiting for a human)
+│   ├── learning.py            learn stage (outcomes, profiles, bounded adaptation)
 │   ├── playbooks.py           deterministic repairs (OOM/stuck/rollout/replicas)
 │   ├── ops_controller.py      detection rules + scan_once/execute_task
 │   ├── ops_scanner.py         scanner entry point (read-only, enqueues)
+│   ├── watcher.py             Kubernetes watch streams (events, backoff, cache)
+│   ├── metrics.py             Prometheus exposition (stdlib only, no client lib)
 │   ├── ops_worker.py          worker entry point (claims repair tasks)
 │   ├── agent_worker.py        LLM executor entry point (claims agent tasks)
 │   ├── agent_core.py          dual-path tool loop, context budget, cancellation
@@ -421,9 +482,13 @@ kubectl get nodes -o jsonpath='{.items[0].status.capacity.amd\.com/gpu}{"\n"}'
 # expected: 1
 ```
 
-Then prove the GPU is actually usable from a pod:
+Then prove the GPU is actually usable from a pod. `gpu-test.yaml` runs in the
+`auton` namespace, so create it first — step 3 fills in the rest of the
+namespace set and is idempotent:
 
 ```bash
+kubectl apply -f yamls/namespace.yaml
+
 kubectl apply -f yamls/gpu-test.yaml
 kubectl -n auton wait --for=jsonpath='{.status.phase}'=Succeeded pod/rocm-test-pod --timeout=120s
 kubectl -n auton logs rocm-test-pod | head -40
@@ -432,7 +497,9 @@ kubectl -n auton delete pod rocm-test-pod --ignore-not-found
 
 `gpu-test.yaml` creates `rocm-test-pod` (restartPolicy `Never`) that runs
 `rocminfo`. If it stays `Pending` with `0/1 nodes are available: ... amd.com/gpu`,
-the plugin did not register — see [Troubleshooting](#troubleshooting).
+the plugin did not register — see [Troubleshooting](#troubleshooting). If the
+apply fails with `namespaces "auton" not found`, the namespace above was
+skipped.
 
 ### 3. Namespaces, tokens and RBAC
 
@@ -500,6 +567,10 @@ kubectl -n auton rollout status deploy/auton
 
 # The queue must exist before the API: with AGENT_QUEUE=redis and no
 # reachable Redis the service refuses to start (there is no memory fallback).
+# The queue requires a password (Phase 5), and it lives in the Secret
+# `auton-redis` — create it first, then apply the Deployment.
+kubectl -n auton create secret generic auton-redis \
+  --from-literal=password="$(openssl rand -hex 24)"
 kubectl apply -f yamls/redis.yaml
 kubectl -n auton rollout status deploy/redis
 
@@ -800,7 +871,8 @@ remote provider.
 ### HTTP API (`agent_service.py`)
 
 `GET /` and `GET /ui` serve the bundled UI; `GET /health` is the open JSON
-probe. Everything below needs the bearer token.
+probe. Everything below needs the bearer token — including `GET /metrics`, the
+Prometheus exposition (see [Prometheus metrics](#prometheus-metrics-get-metrics)).
 
 Synchronous (default — this is what the n8n workflows call):
 
@@ -900,7 +972,7 @@ the LLM is not in this path:
 
 | Symptom | Cause | Action |
 |---|---|---|
-| `OOMKilled` (last state) on a Deployment pod | `oom` | raise the memory limit by 25% (min 32Mi, cap `AGENT_OPS_MAX_MEMORY=2Gi`), roll out, verify Available |
+| `OOMKilled` (last state) on a Deployment pod | `oom` | raise the memory limit by 25% (min 32Mi, cap `AGENT_OPS_MAX_MEMORY=2Gi`), roll out, verify Available — the bump grows when the workload keeps OOMing (see *Learning from the repairs*) |
 | pod stuck `Terminating` for more than `AGENT_OPS_TERMINATION_GRACE` | `stuck` | one forced delete with grace 0 |
 | `CrashLoopBackOff`, no config-shaped log evidence | `crashloop` | delete the pod so its ReplicaSet recreates it, verify |
 | `ProgressDeadlineExceeded` / `ReplicaFailure` | `rollout` | `kubectl rollout undo`, verify |
@@ -989,6 +1061,237 @@ An approval can be decided **once**: a second click answers `409` instead of
 running the repair twice. The UI has an **Approvals** tab with the same
 buttons and the policy view next to it.
 
+### Learning from the repairs (`/learning`)
+
+The pipeline ends with **verify** — and the result of that verification is fed
+back into the next repair. Every repair attempt writes an *outcome* (cause →
+action → ok/failed → duration), and the outcomes change **how the next repair
+of the same workload is done**.
+
+The learning is automatic (no proposal, no human click), so it lives inside a
+closed envelope: it may only make the platform **more cautious** or tune a
+**bounded number**.
+
+| Adaptation | Trigger | Effect |
+|---|---|---|
+| `raise_oom_step` | the same workload was repaired for an OOM 3× | the memory bump grows 25% → 50% → 100% (cap) |
+| `raise_tier` | the same fault was repaired 6× | the next plan gets a higher tier, so a human has to approve it |
+| `raise_cooldown` | 3 repairs failed in a row | the cooldown for that resource grows (cap 6 h) |
+| `lower_budget` | 3 repairs failed in a row | fewer actions per hour for that resource (floor 1) |
+| `quarantine` | 3 repairs failed in a row | the resource is **not repaired any more** — the incident goes to `needs_human` |
+
+What learning may **never** do: lower a tier, change the action of a plan,
+widen what the platform may touch, exceed the caps, bypass the audit gate, or
+run at all when the policy is `disabled`/`observe-only` or
+`AGENT_LEARN_ENABLED=0`. Every adaptation is written to the audit log
+(`learn_adapt`, begin/end pair) **before** it is applied — no audit record, no
+adaptation.
+
+The profile belongs to the **workload**, not to the pod: an OOM kills a pod,
+but the repair changes the Deployment, and the rollout creates a new pod. A
+profile per pod would forget everything after the first repair.
+
+```bash
+# the outcomes, the profiles and the statistics
+curl -s http://localhost:8080/learning -H "Authorization: Bearer $TOKEN"
+
+# one workload only
+curl -s "http://localhost:8080/learning?cause=oom" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "enabled": true,
+  "stats": {"outcomes": 4, "profiles": 1, "causes": [
+    {"cause": "oom", "attempts": 4, "successes": 4, "failures": 0}]},
+  "profiles": [
+    {"id": "lp-b887a71f9842", "resource": "deployment/learner", "cause": "oom",
+     "attempts": 4, "memory_step": 1.0, "tier": 0, "quarantined": false,
+     "cooldown_seconds": 1800, "budget_per_hour": 6,
+     "adaptations": [{"name": "raise_oom_step", "from": 0.25, "to": 0.5,
+                      "reason": "the workload was repaired for an OOM 3 time(s) ..."}]}
+  ]
+}
+```
+
+The UI has a **Learning** tab with the same data. The store lives on the shared
+workspace PVC (`AGENT_LEARN_DIR`, default `/workspace/.ops/learning`), so the
+API reads exactly what the worker learned.
+
+### Prometheus metrics (`GET /metrics`)
+
+The API pod serves a **Prometheus exposition** in the standard text format
+(`text/plain; version=0.0.4`) — written by hand, with the **standard library
+only**. There is no `prometheus_client` dependency and no metrics sidecar: the
+platform must not need a Python package to report that it is alive.
+
+```bash
+TOKEN=$(kubectl -n auton get secret auton-api-token -o jsonpath='{.data.token}' | base64 -d)
+
+curl -s http://localhost:8080/metrics -H "Authorization: Bearer $TOKEN"
+```
+
+```
+# HELP auton_up 1 when the Auton API is serving metrics.
+# TYPE auton_up gauge
+auton_up 1
+# HELP auton_queue_depth Queued items per stream (claimed/dead are not work).
+# TYPE auton_queue_depth gauge
+auton_queue_depth{queue="repair_critical"} 0
+auton_queue_depth{queue="repair_normal"} 0
+...
+```
+
+The endpoint **needs the bearer token** (like every other data endpoint), so a
+scrape that forgets it gets `401` instead of a free status page. Prometheus
+reads the token from a file:
+
+```yaml
+scrape_configs:
+  - job_name: auton
+    scheme: http
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["auton.auton.svc.cluster.local:8080"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/auton-api-token
+```
+
+What is exposed:
+
+| Family | Type | What it says |
+|---|---|---|
+| `auton_build_info` | gauge | the running version (`AUTON_VERSION`) |
+| `auton_up`, `auton_uptime_seconds` | gauge | the API is serving |
+| `auton_queue_depth`, `auton_queue_active`, `auton_queue_tasks` | gauge | the queue, per stream / status |
+| `auton_queue_oldest_queued_seconds`, `auton_queue_budget_used` | gauge | queue age and the hourly repair budget |
+| `auton_worker_alive`, `auton_worker_heartbeat_age_seconds` | gauge | every worker/scanner/executor heartbeat |
+| `auton_watch_available`, `auton_watch_connected`, `auton_watch_resource_version`, `auton_watch_last_event_age_seconds` | gauge | the Kubernetes watch health |
+| `auton_watch_events_total`, `auton_watch_errors_total`, `auton_watch_reconnects_total`, `auton_watch_expired_total`, `auton_watch_lists_total`, `auton_watch_forbidden_total` | counter | the watch counters |
+| `auton_incidents`, `auton_incidents_total` | gauge | incidents per state/severity/cause |
+| `auton_approvals`, `auton_approvals_total` | gauge | approval requests per status |
+| `auton_repairs_recorded`, `auton_repairs_recorded_total` | gauge | the recorded repairs per cause/result |
+| `auton_repair_duration_seconds` | histogram | how long the repairs took, per cause |
+| `auton_learning_profiles`, `auton_learning_memory_step`, `auton_learning_tier`, `auton_learning_adaptations_total`, `auton_learning_limit` | gauge/counter | what the Learn stage learned and its caps |
+| `auton_policy_info` | gauge | the effective policy mode and where it came from |
+| `auton_jobs_running`, `auton_jobs_known` | gauge | the agent jobs |
+| `auton_http_responses_total`, `auton_http_responses_by_class_total` | counter | the HTTP responses of this process |
+| `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_start_time_seconds` | gauge/counter | the standard process metrics |
+
+Three rules the exposition follows:
+
+1. **No invented numbers.** A metric that could not be read is **absent**, not
+   zero. A source that *was* read and is empty reports a zero total — a zero
+   is a fact, an absent family is "we could not look".
+2. **No secrets.** Counts, states and durations only — never a token, a key, a
+   password or a resource body.
+3. **Bounded cardinality.** The label values come from a closed set (causes,
+   states, roles) plus the learned profiles, which are capped at 50.
+
+### The executor write scope (read-only by default)
+
+The LLM executor (`auton-ops`) is the component that talks to a 7B model. By
+default it may **read** every namespace it is allowed to see, but it may not
+**change** anything — a hallucinated `kubectl patch` must not become a real
+change.
+
+The scope is enforced by two independent layers:
+
+| Layer | Where | What it does |
+|---|---|---|
+| **RBAC** (the boundary) | `yamls/auton-rbac.yaml` | the `auton-agent` Role grants `get/list/watch` **only** — no write verb, no `pods/exec` |
+| **the tools** (the belt) | `AGENT_K8S_WRITE=0` | `k8s_apply`, `k8s_patch`, `k8s_scale`, `k8s_rollout`, `k8s_delete`, `k8s_exec` refuse before they run |
+
+The important consequence: **the shell cannot bypass it.** The executor pod
+has `kubectl` and its ServiceAccount token, but without a write verb the API
+server answers `Forbidden`:
+
+```
+$ kubectl -n auton exec deploy/auton-ops -- \
+    kubectl -n auton-apps patch deployment api --type merge -p '{...}'
+Error from server (Forbidden): deployments.apps "api" is forbidden:
+User "system:serviceaccount:auton:auton-agent" cannot patch resource
+"deployments" in API group "apps" in the namespace "auton-apps"
+```
+
+RBAC is the security boundary; the tool code is a fast, friendly refusal on
+top of it.
+
+The write half lives in a **separate, opt-in** manifest
+(`yamls/auton-rbac-write.yaml`) and is enabled with one command, which changes
+both halves at once — either half alone would leave a confusing state:
+
+```bash
+scripts/set-agent-writes.sh --status     # report the current scope
+scripts/set-agent-writes.sh --enable     # apply the write Role + AGENT_K8S_WRITE=1
+scripts/set-agent-writes.sh --disable    # delete the write Role + AGENT_K8S_WRITE=0
+```
+
+The Helm equivalent is `agent.allowWrites=true` (default `false`), and
+`scripts/install.sh --allow-writes` does the same during an install.
+
+The **repair path is not affected**: the scanner and the worker keep their own
+identities and their own policy-gated permissions. `auton-worker` remains the
+only component that mutates a workload by default.
+
+### Queue authentication (Redis requires a password)
+
+Every pod talks to the queue, so the queue is the one component that must never
+accept an unauthenticated client. Since Phase 5 **Redis requires a password**:
+
+```
+$ kubectl -n auton exec deploy/redis -- redis-cli ping
+NOAUTH Authentication required.
+
+$ kubectl -n auton exec deploy/redis -- sh -c \
+    'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping'
+PONG
+```
+
+The password lives in the Secret `auton-redis` (key `password`), which
+`scripts/install.sh` creates and keeps across installs. It is:
+
+* **never in a manifest** — the Secret holds it, not the YAML;
+* **never in the pod spec** — the clients point at the file
+  `/etc/auton-redis/password` (`AGENT_REDIS_PASSWORD_FILE`), they do not
+  carry the value;
+* **never in `argv`** — the Redis pod's init container reads the Secret and
+  writes a server config file, so `ps` inside the pod shows only
+  `redis-server *:6379`.
+
+It must be at least 16 characters from `[A-Za-z0-9_-]`. The server refuses to
+start with a clear message otherwise, rather than write a config it cannot
+parse.
+
+**The clients fail closed.** There is no "connect without auth to be nice":
+
+| Situation | What the client does |
+|---|---|
+| no password, protected server | `QueueError: Redis authentication failed: Authentication required.` |
+| wrong password | `QueueError: Redis authentication failed: invalid username-password pair…` |
+| password, passwordless server | `QueueError: Redis authentication failed: AUTH … called without any password configured…` |
+| unreadable / empty password file | `QueueError: cannot read AGENT_REDIS_PASSWORD_FILE…` / `…is empty` |
+
+In every case the pod refuses to start — the API, the scanners, the workers and
+the executor all fail the same way, and the queue never silently loses a
+repair task. `GET /health` reports `queue_auth: password`.
+
+Rotating the password is one command. It changes the Secret, restarts the
+server and every client (both read the password only at startup), and verifies
+that the old password no longer works:
+
+```bash
+scripts/rotate-redis-password.sh              # generate a new one
+scripts/rotate-redis-password.sh --stdin      # use your own
+scripts/rotate-redis-password.sh --status     # report the state
+```
+
+The Helm equivalent is `queue.redisPassword` (inline), `queue.redisExistingSecret`
+(a Secret you manage) or nothing at all — the chart then generates one and
+keeps it in the Secret `auton-redis`.
+
 ### Task queue (`/tasks`)
 
 Both queues are one view. `/jobs` is the n8n-facing view of *agent* runs;
@@ -999,7 +1302,7 @@ manual repairs and agent jobs, with their status, attempts, worker and log tail.
 # everything, newest first (filter with ?queue= and ?status=)
 curl -s "http://localhost:8080/tasks?limit=20" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# queue depth, active counts, worker heartbeats, hourly budget
+# queue depth, active counts, worker heartbeats, hourly budget, watcher health
 curl -s "http://localhost:8080/tasks/stats" -H "Authorization: Bearer $TOKEN"
 # one task with its log tail
 curl -s "http://localhost:8080/tasks/tsk-1a2b3c4d5e6f" \
@@ -1024,6 +1327,88 @@ cooldown; the budget still applies.
 In `AGENT_QUEUE=memory` mode (local development) `/tasks` shows only
 store-backed repair tasks, because the agent job queue lives in the API process
 and is exposed under `/jobs`.
+
+### Event-driven detection (the Kubernetes watcher)
+
+The scanners do not poll for problems. They hold a **watch** on the API server
+and the server pushes the changes:
+
+```
+scanner → list() → watch(rv=12345) ← ADDED/MODIFIED/DELETED/BOOKMARK
+                          │
+                          └── 410 Gone → re-list → new resourceVersion
+```
+
+A pod that is OOMKilled is therefore noticed in seconds instead of at the next
+60-second tick, and the API server no longer serves a full snapshot per replica
+per minute. Two tiers run side by side:
+
+| Tier | Interval | Source | Rules |
+|---|---|---|---|
+| fast | `AGENT_WATCH_FAST_INTERVAL` (60 s) **and immediately on a bad event** | the watch cache — no API call | pod-level |
+| full | `AGENT_WATCH_FULL_INTERVAL` (300 s) | a real snapshot | every rule, workload-level included |
+
+The watch is an *optimisation*, never a dependency. If the API server is
+unreachable, if the ServiceAccount may not watch, or if `AGENT_WATCH_ENABLED=0`,
+the scanner falls back to the old polling loop. Detection never stops because a
+watch stream did.
+
+Every stream publishes its health — reconnects, expired `resourceVersion`s,
+errors, the last event age — to `GET /tasks/stats` under `watchers`, so "is the
+platform still watching?" is answerable without reading pod logs:
+
+```bash
+curl -s "http://localhost:8080/tasks/stats" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["watchers"],indent=2))'
+```
+
+### Direct Kubernetes access (no kubectl fork)
+
+Every pod talks to the Kubernetes API server **directly over HTTPS**, with the
+standard library only (`urllib`, `ssl`, `json`) — no `kubernetes` client, no
+new dependency, no process forked per call:
+
+```bash
+# inside any pod: the direct client is there and it works
+kubectl -n auton exec deploy/auton-scanner -- python -c \
+  'import k8s_api
+c = k8s_api.client()
+items, rv = c.list("/api/v1/namespaces/auton-apps/pods")
+print(len(items), "pods, resourceVersion", rv)'
+
+# the transport counters: how many calls went direct, how many fell back
+kubectl -n auton logs deploy/auton-scanner --tail=50 | grep "using kubectl"
+```
+
+The difference is measurable: a `kubectl get pods` costs ~0.10 s (a fork plus
+a client start-up); the same read over HTTPS costs ~0.002 s.
+
+**kubectl is still in the image, as a fallback.** If the direct path is not
+available (no credentials) or fails (the API server is unreachable), the call
+falls back to kubectl — and says so: `[k8s] using kubectl for …` in the pod
+log, and a counter in `k8s_api.COUNTERS` (visible at `GET /tasks/stats` under
+`watchers[].transport` and in `auton_k8s_transport_total`). The fallback is
+never silent.
+
+**A refusal is never retried.** A `404`, `403` or `409` from the API server is
+the final answer — kubectl would say the same thing, so the tool reports the
+server's own message instead of paying for a second round trip.
+
+| Environment | Effect |
+|---|---|
+| `AGENT_K8S_DIRECT=1` (default) | the direct HTTPS client is primary; kubectl is the fallback |
+| `AGENT_K8S_DIRECT=0` | kubectl only — useful to compare the two |
+
+Two operations that normally need extra machinery are done without it:
+
+* **apply** uses server-side apply (`application/apply-patch+yaml`), so the
+  API server parses the YAML and no YAML parser is needed on this side;
+* **exec** speaks the `v4.channel.k8s.io` WebSocket protocol directly — a
+  hand-rolled RFC 6455 frame, where the first byte of each frame is the
+  channel (stdout / stderr / error).
+
+The audit gate is unchanged: the record is written **before** the request, on
+both transports, and a mutation without a record is still refused.
 
 ### Jobs API (long tasks)
 
@@ -1062,6 +1447,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:8080/jobs/$J
 | `GET /approvals`, `GET /approvals/{id}` | Approval requests for repair plans the policy parked |
 | `POST /approvals/{id}/approve` | Approve a pending plan and enqueue the repair (`409` if already decided) |
 | `POST /approvals/{id}/reject` | Reject a pending plan; the incident goes to `NEEDS_HUMAN` |
+| `GET /learning` | The Learn stage: the outcomes, the learned profiles, the statistics and the caps |
+| `GET /metrics` | The Prometheus exposition (`text/plain; version=0.0.4`) — see [Prometheus metrics](#prometheus-metrics-get-metrics) |
 | `GET /tasks`, `GET /tasks/{id}`, `GET /tasks/stats` | Both queues (repair + agent) |
 | `POST /tasks` | Queue a manual repair, or an agent job (`queue="agent"`) |
 | `POST /tasks/{id}/cancel` | Cancel a queued task |
@@ -1135,11 +1522,15 @@ confused model cannot target `kube-system`. Resource/name arguments are
 regex-validated, and `AGENT_K8S_WRITE=0` turns every mutating tool into a
 refusal even if RBAC would allow it.
 
+Every tool talks to the API server **directly over HTTPS** (see *Direct
+Kubernetes access* above); kubectl is the logged, counted fallback.
+
 Every mutation (`apply`, `patch`, `scale`, `rollout`, `delete`, `exec`) goes
 through the write-ahead audit first: `audit.begin()` appends and fsyncs a
 `begin` record to `$AGENT_AUDIT_DIR/audit.jsonl` (plus a SQLite index), then
-kubectl runs, then `audit.finish()` records the result. If the record cannot be
-written, **the mutation is refused and kubectl never runs** — "nothing without
+the request is sent (direct or kubectl — the transport does not change the
+rule), then `audit.finish()` records the result. If the record cannot be
+written, **the mutation is refused and nothing runs** — "nothing without
 a record" is enforced by code, not by the prompt. `GET /audit` exposes the same
 records.
 
@@ -1242,6 +1633,7 @@ Enable the workflow first (toggle **Active** in the n8n UI, or use
 | `AGENT_POLICY_MODE` | *(none)* | Mode override when no policy document is present |
 | `AGENT_K8S_ENABLED` | `1` | `0` disables the Kubernetes tools |
 | `AGENT_K8S_WRITE` | `0` (image) / `1` (deployment) | Allows apply/patch/scale/rollout/delete/exec |
+| `AGENT_K8S_DIRECT` | `1` | `0` forces the kubectl path; `1` (default) uses the direct HTTPS client and keeps kubectl as the logged fallback |
 | `N8N_API_URL` | `http://n8n:5678/api/v1` | n8n public API base |
 | `N8N_WEBHOOK_BASE` | `http://n8n:5678/webhook` | Webhook base |
 | `N8N_API_KEY_FILE` | `/etc/n8n-api/api-key` | Key file, read on every call |
@@ -1258,15 +1650,22 @@ Every pod except Ollama/n8n reads some of these.
 |---|---|---|
 | `AGENT_QUEUE` | `redis` | `redis` (cluster) or `memory` (local). No silent fallback |
 | `AGENT_REDIS_URL` | `redis://redis.auton.svc.cluster.local:6379/0` | Queue endpoint |
-| `AGENT_REDIS_PASSWORD` / `_FILE` | *(none)* | Optional auth; the manifest relies on ClusterIP only |
+| `AGENT_REDIS_PASSWORD_FILE` | `/etc/auton-redis/password` | The mounted Secret the queue password is read from (Phase 5) |
+| `AGENT_REDIS_PASSWORD` | *(none)* | The queue password itself — only for local runs; the manifests never use it |
 | `AGENT_QUEUE_PREFIX` | `auton` | Key prefix (`auton:q:*`, `auton:task:*`, …) |
 | `AGENT_TASK_LEASE` | `300` | Seconds before a crashed worker's task is requeued |
 | `AGENT_TASK_MAX_ATTEMPTS` | `3` | Repair retries (agent jobs are attempted once) |
 | `AGENT_TASK_BACKOFF` | `30,120,300` | Seconds between repair attempts |
 | `AGENT_GPU_LOCK_TTL` | `900` | TTL of the single global LLM slot |
 | `AGENT_QUEUE_MAX` | `500` | Refuse new work above this depth |
-| `AGENT_SCAN_INTERVAL` | `60` | Scanner pass interval |
+| `AGENT_SCAN_INTERVAL` | `60` | Scanner pass interval (the polling fallback) |
 | `AGENT_SCAN_DEDUPE_WINDOW` | `300` | Concurrent duplicate suppression window |
+| `AGENT_WATCH_ENABLED` | `1` | `0` keeps the old polling behaviour |
+| `AGENT_WATCH_FAST_INTERVAL` | `60` | Fast tier: reads the watch cache (pod-level rules) |
+| `AGENT_WATCH_FULL_INTERVAL` | `300` | Full tier: takes a real snapshot (every rule) |
+| `AGENT_WATCH_TIMEOUT` | `300` | Seconds one watch stream stays open |
+| `AGENT_WATCH_MIN_GAP` | `5` | Smallest gap between two event-triggered scans |
+| `AGENT_WATCH_EVENT_TTL` | `900` | Seconds a watched Event stays in the cache (events are high churn) |
 | `AGENT_WORKER_POLL` | `5` | Seconds between `claim()` attempts |
 | `AGENT_OPS_NAMESPACES` | `auton-apps` | Namespaces a playbook may **repair** (all others are read-only) |
 | `AGENT_OPS_COOLDOWN` | `1800` | Seconds before the same resource+cause is acted on again |
@@ -1286,6 +1685,14 @@ Every pod except Ollama/n8n reads some of these.
 | `N8N_OPS_TOKEN` | `AGENT_API_TOKEN` | Bearer header sent to the webhook |
 | `AGENT_NAMESPACES` | `auton,auton-apps` | `k8s_tools` allowlist |
 | `AGENT_K8S_WRITE` | `1` (workers/executor) / `0` (scanner) | `0` makes every playbook refuse to mutate |
+| `AGENT_LEARN_ENABLED` | `1` | `0` makes the Learn stage inert (no outcomes, no adaptations) |
+| `AGENT_LEARN_DIR` | `/workspace/.ops/learning` | Outcomes + profiles (shared PVC, read by the API) |
+| `AGENT_LEARN_MIN_SAMPLES` | `3` | Repairs of the same cause before anything is adapted |
+| `AGENT_LEARN_MAX_STEP` | `1.0` | Hard cap of the learned memory bump (the limit may at most double) |
+| `AGENT_LEARN_COOLDOWN_MAX` | `21600` | Hard cap of a learned cooldown (6 h) |
+| `AGENT_LEARN_BUDGET_MIN` | `1` | Floor of a learned per-resource action budget (per hour) |
+| `AGENT_LEARN_MAX_ESCALATIONS` | `3` | Consecutive failures before a resource is quarantined |
+| `AGENT_LEARN_MAX_OUTCOMES` | `500` | Outcome records kept (the oldest are pruned) |
 
 The scanner never mounts the workspace: it needs no incident history, and the
 task store plus the cooldown already suppress a duplicate. It keeps its private
@@ -1302,6 +1709,7 @@ only by the pods that write the shared audit log.
 | `OLLAMA_FLASH_ATTENTION` | `1` | Cuts attention memory, keeps a 16k context on the GPU |
 | `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Quantised KV cache (~half the memory of f16) |
 | `OLLAMA_NUM_PARALLEL` | `1` | One request at a time: no duplicated KV cache |
+| `LLAMA_ARG_FIT_TARGET` | `128` | Free VRAM margin (MiB) that llama.cpp's automatic fit must leave on the card |
 
 An 8 GB card is shared with the desktop, so an f16 KV cache at 16k context
 does **not** fit: Ollama silently splits the model to `80%/20% CPU/GPU` and
@@ -1311,6 +1719,23 @@ whole model resident. Verify after loading a model:
 ```bash
 kubectl -n auton exec deploy/ollama -- ollama ps
 # PROCESSOR should say 100% GPU, not "80%/20% CPU/GPU"
+```
+
+`LLAMA_ARG_FIT_TARGET` matters on a shared card. llama.cpp's automatic fit
+computes the free VRAM it may use, but the Vulkan backend reports the
+*desktop's* allocations as "unaccounted" memory. The fit then gets
+over-conservative and keeps ~4 of 29 layers on the CPU (`19%/81% CPU/GPU`)
+**even though the model does fit**. The margin is the number of MiB the fit
+must leave free; lowering it to 128 lets the whole model stay on the GPU (at
+both the 4k default and the agent's 16k context) while still leaving the
+compositor room. On an 8 GiB card shared with a ~3 GiB desktop, full offload at
+16k leaves ~290 MiB of headroom — raise the value to `256` if the host's GPU
+clients grow and you would rather have headroom than a full offload. Check the
+pod log for the decision:
+
+```bash
+kubectl -n auton logs deploy/ollama | grep -E "offloaded|layers"
+# load_tensors: offloaded 29/29 layers to GPU
 ```
 
 ### n8n
@@ -1383,9 +1808,10 @@ python -m pytest tests -q
 
 The suite covers workspace escape, unique-match editing, atomic patches,
 gitignore-aware search, background jobs, git tools, the context-compaction
-helpers, the HTTP jobs API, bearer auth, the kubectl wrapper (namespace pinning,
-validation, write gate) and the n8n client (mocked HTTP). If `import mcp` fails,
-the local `.venv` is stale after a Python upgrade — delete it and recreate it.
+helpers, the HTTP jobs API, bearer auth, the Kubernetes tools (direct HTTPS,
+namespace pinning, validation, write gate) and the n8n client (mocked HTTP). If
+`import mcp` fails, the local `.venv` is stale after a Python upgrade — delete
+it and recreate it.
 
 ### Eval harness
 
@@ -1454,6 +1880,7 @@ ingress hosts.
 | Ollama pod `Pending`, `0/1 nodes ... amd.com/gpu` | Node has no GPU resource, or another Ollama holds it | Complete the device-plugin step; scale down the other Ollama (`kubectl -n <old-ns> scale deploy/ollama --replicas=0`) |
 | `ollama ps` shows `CPU` | Vulkan/ROCm not available in the container | Confirm `-v /dev/dri` passthrough and host Mesa/RADV; check `kubectl logs deploy/ollama` |
 | `ollama ps` shows `80%/20% CPU/GPU`, ~5 tok/s | 16k context + f16 KV cache does not fit in 8 GB shared with the desktop | Keep `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0`, or lower `AGENT_NUM_CTX` |
+| `ollama ps` shows `19%/81% CPU/GPU` although flash attention + q8 KV cache are set | llama.cpp's automatic fit counts the desktop's VRAM as "unaccounted" and keeps ~4 of 29 layers on the CPU even though the model fits | The chart sets `LLAMA_ARG_FIT_TARGET=128` (free-VRAM margin in MiB); check `kubectl -n auton logs deploy/ollama \| grep offloaded` for `29/29 layers to GPU` |
 | Agent repeats the same tool call until `max_steps` | Model loop (small models do this) | The loop guard nudges then stops with `stop_reason=repeat`; lower `AGENT_REPEAT_LIMIT` to stop sooner |
 | Agent rewrites a test assertion instead of the bug | 7B models "fix" red output by editing the test | The edit tools refuse to remove/change assertions in test files (`AGENT_ALLOW_TEST_EDITS=1` disables it); fix the implementation |
 | `401 unauthorized` from `/run` | Missing/wrong bearer token | Send `Authorization: Bearer <token>`; read it from Secret `auton-api-token` |
@@ -1484,7 +1911,9 @@ ingress hosts.
 | The same OOM deployment is bumped every 30 min | The app leaks or allocates more than the cap | Raise `AGENT_OPS_MAX_MEMORY` or fix the app; the cooldown is per resource+cause |
 | `auton-scanner`/`auton-worker`/`auton-ops` restart / liveness fails | A pass is wedged or the heartbeat file is not writable | `kubectl -n auton logs deploy/<name> --tail=100`; `/tmp` must be writable (it is an emptyDir) |
 | The API CrashLoopBackOffs with `Redis is unreachable` | `AGENT_QUEUE=redis` and no Redis, and there is no memory fallback | `kubectl apply -f yamls/redis.yaml`; check `kubectl -n auton get pods,pvc` |
-| `/tasks` answers `503` | The queue backend is down or unwritable | `kubectl -n auton exec deploy/redis -- redis-cli ping`; `maxmemory-policy noeviction` refuses writes when full |
+| The API CrashLoopBackOffs with `Redis authentication failed` | The client and the server disagree about the password (a rotation that missed a client, or a stale Secret) | `scripts/rotate-redis-password.sh` restarts the server and every client; check that Secret `auton-redis` exists |
+| `redis-cli ping` answers `NOAUTH Authentication required.` | **This is correct** — the queue requires a password (Phase 5) | Use `kubectl -n auton exec deploy/redis -- sh -c 'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping'` |
+| `/tasks` answers `503` | The queue backend is down or unwritable | `kubectl -n auton exec deploy/redis -- sh -c 'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping'`; `maxmemory-policy noeviction` refuses writes when full |
 | A task stays `claimed` after a worker died | The lease has not expired yet | Wait `AGENT_TASK_LEASE` (300 s); `recover()` requeues it automatically |
 | A repair task ends `skipped` | Dry run, cooldown or the hourly budget | Check the log line and `/tasks/stats` (`budget_used`) |
 | Two scanners report the same finding twice | Dedupe window shorter than the restart interval | Raise `AGENT_SCAN_DEDUPE_WINDOW` (default 300 s) |
@@ -1501,7 +1930,10 @@ kubectl -n auton logs deploy/auton-scanner --tail=100
 kubectl -n auton logs deploy/auton-worker --tail=100
 kubectl -n auton logs deploy/auton-ops --tail=100
 kubectl -n auton logs deploy/ollama --tail=100
-kubectl -n auton exec deploy/redis -- redis-cli ping
+# the queue requires a password (Phase 5)
+kubectl -n auton exec deploy/redis -- redis-cli ping                        # NOAUTH — correct
+kubectl -n auton exec deploy/redis -- sh -c \
+  'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping'          # PONG
 kubectl get nodes -o jsonpath='{.items[0].status.capacity}{"\n"}'
 ```
 
@@ -1524,21 +1956,24 @@ kubectl -n auton exec deploy/auton-worker -- \
 
 ## Safety and limitations
 
-- **The agent can change its own namespace.** `AGENT_K8S_WRITE=1` plus the
-  `auton-agent` Role allow CRUD on workloads, services, configmaps, PVCs and
-  jobs in `auton` and `auton-apps`. That is deliberate ("Auton controls
-  Auton"). The Role does **not** grant secrets, serviceaccounts,
-  roles/rolebindings or PVC delete, and cluster-scoped access is read-only;
-  ingresses can be created/updated but not deleted. Note that creating pods is
-  inherently powerful: a pod spec can reference a Secret by name, so do not put
-  long-lived credentials in these namespaces that the agent should never see.
+- **The LLM executor is read-only by default.** Since Phase 4 the
+  `auton-agent` identity has no write verb at all: it may `get/list/watch`
+  pods, workloads, events and logs in `auton` and `auton-apps`, and nothing
+  more. The write half lives in a separate opt-in manifest
+  (`yamls/auton-rbac-write.yaml`) and is enabled with
+  `scripts/set-agent-writes.sh --enable` (`agent.allowWrites=true` in Helm).
+  Even with `kubectl` and its token in the pod, a shell command that tries to
+  patch a Deployment is refused by the API server. The repair path is
+  unaffected: `auton-worker` remains the only component that mutates a
+  workload by default.
 - **Four identities, one per pod role.** The API (`auton-api`) can only
   `patch` the provider ConfigMap, the repair-policy ConfigMap and the provider
   Secret; the scanners (`auton-scanner`) are
   read-only; the workers (`auton-worker`) may delete pods and patch/scale
-  Deployments only in `auton-apps`; the LLM executor (`auton-agent`) has repair
-  rights in `auton` and `auton-apps` plus the read-only cluster view its
-  `kubectl` tools need. None of them can read secrets, manage serviceaccounts
+  Deployments only in `auton-apps`; the LLM executor (`auton-agent`) is
+  read-only unless an operator opts into the write scope, and it always has
+  the read-only cluster view its `kubectl` tools need. None of them can read
+  secrets, manage serviceaccounts
   or Roles/RoleBindings, delete a PVC or a namespace, and cluster scope is
   read-only. RBAC is the boundary, not the Python code. Image, config,
   scheduling, PVC and StatefulSet problems stay report-only.
@@ -1569,6 +2004,11 @@ kubectl -n auton exec deploy/auton-worker -- \
   counters and heartbeats — never a provider key or a token. `noeviction` means
   a full Redis refuses the write and the worker fails closed instead of
   dropping a repair.
+- **The queue requires a password.** Since Phase 5 Redis answers an
+  unauthenticated client with `NOAUTH Authentication required.`, and every
+  Auton pod authenticates with the Secret `auton-redis`. The password is not
+  in any manifest, pod spec, environment variable or command line. The clients
+  fail closed on an auth mismatch rather than retrying without a password.
 - **The shared workspace is the audit trail.** The workers and the executor
   mount the same `ReadWriteOnce` PVC on single-node k3d, which is what makes
   `/audit` and `/incidents` show every mutation. On a multi-node cluster, give

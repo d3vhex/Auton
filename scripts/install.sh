@@ -10,6 +10,8 @@
 #   ./scripts/install.sh --skip-build    # use an already imported image
 #   ./scripts/install.sh --skip-model-pull
 #   ./scripts/install.sh --no-ingress
+#   ./scripts/install.sh --allow-writes  # give the LLM executor write rights
+#   ./scripts/install.sh --sync          # regenerate yamls/ from the chart first
 #   ./scripts/install.sh --verify        # only run the checks
 #   ./scripts/install.sh --dry-run       # print the commands, change nothing
 #   ./scripts/install.sh --show-token    # print the bearer token at the end
@@ -20,6 +22,15 @@
 #                      value (e.g. docker.io/you/auton:0.1.0) is pulled.
 #   AUTON_CLUSTER      k3d cluster name (default ai-cluster)
 #   AUTON_TOKEN        bearer token to install instead of generating one
+#
+# The LLM executor is READ-ONLY by default (Phase 4): its RBAC grants
+# get/list/watch only. --allow-writes adds the write Role and flips the
+# executor's AGENT_K8S_WRITE flag; without it the flag is cleared and the
+# write Role is removed, so re-running the installer is enough to revoke.
+#
+# Phase 6: charts/auton-chart is the source of truth and yamls/ is generated from
+# it. The installer refuses to apply manifests that drifted from the chart;
+# --sync regenerates them first (it needs helm).
 #
 set -euo pipefail
 
@@ -37,9 +48,11 @@ WITH_INGRESS=1
 DRY_RUN=0
 VERIFY_ONLY=0
 SHOW_TOKEN=0
+ALLOW_WRITES=0
+SYNC=0
 
 usage() {
-  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -49,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     --skip-build)     SKIP_BUILD=1 ;;
     --skip-model-pull) SKIP_MODEL_PULL=1 ;;
     --no-ingress)     WITH_INGRESS=0 ;;
+    --allow-writes)   ALLOW_WRITES=1 ;;
+    --sync)           SYNC=1 ;;
     --verify)         VERIFY_ONLY=1 ;;
     --dry-run)        DRY_RUN=1 ;;
     --show-token)     SHOW_TOKEN=1 ;;
@@ -80,7 +95,27 @@ need k3d
 # --------------------------------------------------------------------------- #
 # 0. Cluster
 # --------------------------------------------------------------------------- #
+if [[ "$SYNC" == 1 ]]; then
+  step "Regenerating yamls/ from charts/auton-chart (Phase 6)"
+  run "$ROOT/scripts/sync-yamls.sh"
+fi
+
 if [[ "$VERIFY_ONLY" == 0 ]]; then
+  # Phase 6: the chart is the source of truth. Installing manifests that
+  # drifted from it would deploy something nobody reviewed.
+  step "Checking that yamls/ matches the chart"
+  if command -v python3 >/dev/null 2>&1 \
+     && python3 -c 'import yaml' >/dev/null 2>&1; then
+    if ! python3 "$ROOT/scripts/sync-yamls.py" --check; then
+      echo
+      echo "yamls/ is out of date. Run: scripts/sync-yamls.sh" >&2
+      exit 1
+    fi
+    info "yamls/ is in sync with charts/auton-chart"
+  else
+    warn "PyYAML is not installed: the yamls/ drift check was skipped"
+  fi
+
   if [[ "$CREATE_CLUSTER" == 1 ]]; then
     if k3d cluster list "$CLUSTER" >/dev/null 2>&1; then
       info "cluster $CLUSTER already exists"
@@ -138,6 +173,16 @@ EOF
 
   step "RBAC (auton-agent, auton-api, auton-scanner, auton-worker, cluster read-only)"
   run kubectl apply -f yamls/auton-rbac.yaml
+  # Phase 4: the executor's write scope is opt-in. Applying the read-only
+  # Role above already removed the write verbs from the `auton-agent`
+  # identity, so the extra file is only needed when it was asked for.
+  if [[ "$ALLOW_WRITES" == 1 ]]; then
+    step "Executor write scope (opt-in): auton-agent-write"
+    run kubectl apply -f yamls/auton-rbac-write.yaml
+  else
+    info "executor write scope: read-only (default; --allow-writes to enable)"
+    run kubectl delete -f yamls/auton-rbac-write.yaml --ignore-not-found
+  fi
   # Do not reset a provider someone switched with scripts/set-provider.sh.
   if kubectl -n "$NS" get configmap auton-model-config >/dev/null 2>&1; then
     info "provider config exists; keeping it (set-provider.sh changes it)"
@@ -201,7 +246,33 @@ EOF
   # ------------------------------------------------------------------------- #
   # Redis first: the API refuses to start with AGENT_QUEUE=redis and no backend
   # (no silent memory fallback), so applying it later would crash-loop the API.
-  step "Redis queue (single instance, AOF on a PVC)"
+  step "Redis queue (single instance, AOF on a PVC, password protected)"
+  # The queue password lives in a Secret and is never written in a manifest.
+  # An existing Secret is kept: re-running the installer must not lock the
+  # running clients out. Rotate it with scripts/rotate-redis-password.sh.
+  if kubectl -n "$NS" get secret auton-redis >/dev/null 2>&1; then
+    info "Secret auton-redis exists; keeping the current password"
+  else
+    pw="${AUTON_REDIS_PASSWORD:-}"
+    if [[ -z "$pw" ]]; then
+      if command -v openssl >/dev/null 2>&1; then
+        pw="$(openssl rand -hex 24)"
+      else
+        pw="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+      fi
+    fi
+    if ! printf '%s' "$pw" | grep -Eq '^[A-Za-z0-9_-]{16,}$'; then
+      echo "the Redis password must be at least 16 characters from [A-Za-z0-9_-]" >&2
+      exit 1
+    fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+      info "[dry-run] would create Secret auton-redis"
+    else
+      kubectl -n "$NS" create secret generic auton-redis \
+        --from-literal=password="$pw" >/dev/null
+      info "created (rotate it with: scripts/rotate-redis-password.sh)"
+    fi
+  fi
   run kubectl apply -f yamls/redis.yaml
   run kubectl -n "$NS" rollout status deploy/redis --timeout=300s
 
@@ -216,6 +287,12 @@ EOF
   run kubectl apply -f yamls/auton-ops-deployment.yaml
   if [[ "$IMAGE" != "auton:local" && "$DRY_RUN" == 0 ]]; then
     kubectl -n "$NS" set image deploy/auton-ops "ops=$IMAGE" >/dev/null
+  fi
+  # The write scope has two halves; keep them in step (Phase 4).
+  if [[ "$ALLOW_WRITES" == 1 ]]; then
+    run kubectl -n "$NS" set env deploy/auton-ops AGENT_K8S_WRITE=1
+  else
+    run kubectl -n "$NS" set env deploy/auton-ops AGENT_K8S_WRITE=0
   fi
   run kubectl -n "$NS" rollout status deploy/auton-ops --timeout=300s
 
@@ -269,8 +346,13 @@ if [[ "$SHOW_TOKEN" == 1 && -n "$token" ]]; then
   info "token: $token"
 fi
 
-check "Redis answers PING" \
-  kubectl -n "$NS" exec deploy/redis -- redis-cli ping
+check "Redis answers PING (authenticated)" \
+  kubectl -n "$NS" exec deploy/redis -- sh -c \
+  'REDISCLI_AUTH="$(cat /etc/auton-redis/password)" redis-cli ping | grep -qx PONG'
+
+check "Redis rejects an unauthenticated client" \
+  kubectl -n "$NS" exec deploy/redis -- sh -c \
+  'redis-cli ping 2>&1 | grep -q NOAUTH'
 
 check "API /health answers" \
   kubectl -n "$NS" exec deploy/auton -- python -c \
@@ -281,6 +363,12 @@ check "API uses the redis queue" \
   'import json,urllib.request,sys
 h=json.load(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5))
 sys.exit(0 if h.get("queue") == "redis" else 1)'
+
+check "API authenticates to the queue (Phase 5)" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+  'import json,urllib.request,sys
+h=json.load(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5))
+sys.exit(0 if h.get("queue_auth") == "password" else 1)'
 
 check "API serves /tasks with the token" \
   kubectl -n "$NS" exec deploy/auton -- python -c \
@@ -308,6 +396,42 @@ d=json.load(urllib.request.urlopen(r, timeout=5))
 assert d["ok"] is True, d.get("error")
 print(d["policy"]["mode"])'
 
+check "API serves /learning with the token (Phase 7)" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import json,os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/learning?limit=1",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+d=json.load(urllib.request.urlopen(r, timeout=5))
+assert d.get("enabled") is True, d.get("error")
+print(d["stats"]["outcomes"])'
+
+check "the worker and the API share the learning store (Phase 7)" \
+  bash -c 'kubectl -n "$0" exec deploy/auton-worker -- test -d /workspace/.ops/learning &&
+            kubectl -n "$0" exec deploy/auton -- test -d /workspace/.ops/learning' "$NS"
+
+# D5: the Prometheus exposition must be served, in the right content type,
+# and it must need the token.
+check "API serves the Prometheus exposition (D5)" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/metrics",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+with urllib.request.urlopen(r, timeout=10) as resp:
+    body=resp.read().decode()
+    assert resp.headers.get("Content-Type","").startswith("text/plain"), resp.headers.get("Content-Type")
+for family in ("auton_up","auton_queue_depth","auton_watch_available","auton_incidents","auton_policy_info","process_resident_memory_bytes"):
+    assert family in body, family
+print(len(body.splitlines()), "lines")'
+
+check "the metrics endpoint needs the token (D5)" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import urllib.request,urllib.error
+try:
+    urllib.request.urlopen("http://127.0.0.1:8080/metrics", timeout=10)
+except urllib.error.HTTPError as exc:
+    assert exc.code == 401, exc.code
+    print("401")
+else:
+    raise SystemExit("the exposition was served without a token")'
+
 check "the repair policy is mounted in the workers" \
   kubectl -n "$NS" exec deploy/auton-worker -- test -f /etc/auton-policy/policy.json
 
@@ -332,6 +456,85 @@ check "worker cannot patch auton (RBAC)" \
 check "worker can patch auton-apps (RBAC)" \
   bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-worker | grep -qx yes' "$APPS_NS"
 
+check "scanner may watch pods (RBAC)" \
+  bash -c 'kubectl -n "$0" auth can-i watch pods --as=system:serviceaccount:auton:auton-scanner | grep -qx yes' "$APPS_NS"
+
+if [[ "$ALLOW_WRITES" == 1 ]]; then
+  check "executor may write (RBAC, Phase 4 --allow-writes)" \
+    bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-agent | grep -qx yes' "$APPS_NS"
+else
+  check "executor is read-only (RBAC, Phase 4)" \
+    bash -c 'kubectl -n "$0" auth can-i patch deployments --as=system:serviceaccount:auton:auton-agent | grep -qx no' "$APPS_NS"
+fi
+
+check "executor may still read (RBAC, Phase 4)" \
+  bash -c 'kubectl -n "$0" auth can-i get pods --as=system:serviceaccount:auton:auton-agent | grep -qx yes' "$APPS_NS"
+
+check "the scanner watches the API server" \
+  bash -c 'for _ in $(seq 1 30); do
+  if kubectl -n "$0" exec deploy/auton -- python -c \
+    "import json,os,urllib.request
+r=urllib.request.Request(\"http://127.0.0.1:8080/tasks/stats\",headers={\"Authorization\":\"Bearer \"+os.environ[\"AGENT_API_TOKEN\"]})
+d=json.load(urllib.request.urlopen(r, timeout=5))
+streams=[w for w in d.get(\"watchers\",[]) if w.get(\"resource\") in (\"pods\",\"deployments\")]
+assert streams, \"no watcher stream is published\"
+assert any(w.get(\"available\") for w in streams), \"no watcher is available\"
+print(len(streams))" >/dev/null 2>&1; then exit 0; fi
+  sleep 2
+done; exit 1' "$NS"
+
+# D6: the platform talks to the API server directly over HTTPS. The checks
+# below prove that the direct client is present and used, and that the watch
+# covers every resource the snapshot needs.
+check "the direct API client reaches the API server (D6)" \
+  kubectl -n "$NS" exec deploy/auton-scanner -- python -c \
+    'import k8s_api
+c = k8s_api.client()
+assert c is not None, k8s_api.client_error()
+items, rv = c.list("/api/v1/namespaces/auton-apps/pods")
+assert rv, "no resourceVersion"
+print(len(items), "pods, rv=" + rv)'
+
+check "the k8s tools use the direct path, not kubectl (D6)" \
+  kubectl -n "$NS" exec deploy/auton-worker -- python -c \
+    'import k8s_api, k8s_tools
+before = dict(k8s_api.COUNTERS)
+out = k8s_tools.k8s_get("pods", namespace="auton-apps")
+assert "ok" in out or "NAME" in out or "No resources" in out, out[:200]
+after = k8s_api.COUNTERS
+assert after["kubectl"] == before["kubectl"], "kubectl was used"
+assert after["direct"] > before["direct"], "the direct path was not used"
+print("direct=" + str(after["direct"]), "kubectl=" + str(after["kubectl"]))'
+
+check "the watch covers the snapshot resources (D6)" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import json,os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/tasks/stats",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+d=json.load(urllib.request.urlopen(r, timeout=5))
+resources={w.get("resource") for w in d.get("watchers",[])}
+missing={"pods","deployments","statefulsets","persistentvolumeclaims","events"} - resources
+assert not missing, "not watched: " + ",".join(sorted(missing))
+print(",".join(sorted(resources)))'
+
+check "the scanner publishes the transport counters (D6)" \
+  kubectl -n "$NS" exec deploy/auton -- python -c \
+    'import json,os,urllib.request
+r=urllib.request.Request("http://127.0.0.1:8080/tasks/stats",headers={"Authorization":"Bearer "+os.environ["AGENT_API_TOKEN"]})
+d=json.load(urllib.request.urlopen(r, timeout=5))
+scanner=[w for w in d.get("watchers",[]) if w.get("resource")=="summary"]
+assert scanner, "no scanner summary"
+transport=scanner[0].get("transport") or {}
+assert "direct" in transport and "kubectl" in transport, transport
+print(transport)'
+
+if command -v python3 >/dev/null 2>&1 \
+   && python3 -c 'import yaml' >/dev/null 2>&1; then
+  check "yamls/ is in sync with charts/auton-chart (Phase 6)" \
+    python3 "$ROOT/scripts/sync-yamls.py" --check
+else
+  info "skipped the yamls/ drift check (PyYAML is not installed)"
+fi
+
 if [[ "$fail" -gt 0 ]]; then
   echo
   echo "verification failed ($fail check(s)). See README Troubleshooting." >&2
@@ -348,7 +551,9 @@ Auton is installed.
   Ops logs   kubectl -n $NS logs deploy/auton-ops --tail=50      (LLM executor)
   Scanner    kubectl -n $NS logs deploy/auton-scanner --tail=50  (read-only)
   Workers    kubectl -n $NS logs deploy/auton-worker --tail=50   (playbooks)
-  Queue      kubectl -n $NS exec deploy/redis -- redis-cli xlen auton:q:repair:normal
+  Queue      kubectl -n $NS exec deploy/redis -- sh -c \\
+               'REDISCLI_AUTH="\$(cat /etc/auton-redis/password)" redis-cli xlen auton:q:repair:normal'
+  Rotate it  scripts/rotate-redis-password.sh --status
   Provider   scripts/set-provider.sh --provider ollama   (or openai|gemini|anthropic|custom)
   n8n        scripts/rotate-n8n-api-key.sh --help
 

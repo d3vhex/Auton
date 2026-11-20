@@ -19,15 +19,28 @@ manifests, trust the code/manifests.
 - Five pod roles, four ServiceAccounts (`yamls/auton-rbac.yaml`):
   - `auton` — HTTP API + UI, **producer only** under `auton-api` (may only
     `patch` the named ConfigMap `auton-model-config` and Secret `auton-model`).
-  - `auton-scanner` ×2 — read-only detection under `auton-scanner`; snapshots
-    `auton-apps` and submits repair tasks to the queue.
+  - `auton-scanner` ×2 — read-only detection under `auton-scanner`; **watches**
+    `auton-apps` (with a polling fallback) and submits repair tasks to the queue.
   - `auton-worker` ×2 — the playbooks, the only writers, under `auton-worker`
     (read + pod delete + Deployment patch/scale in `auton-apps` only).
   - `auton-ops` ×1 — the LLM executor (`agent_worker.py`) under `auton-agent`
-    (repair in both namespaces + cluster read-only).
-  - `redis` ×1 — one instance, AOF on `redis-data`, no ServiceAccount, no
-    password by default (ClusterIP only). It holds task hashes, streams, locks,
+    (read-only by default since Phase 4; `agent.allowWrites=true` / 
+    `scripts/set-agent-writes.sh --enable` adds the write Role + binding).
+  - `redis` ×1 — one instance, AOF on `redis-data`, no ServiceAccount,
+    **password required** (ClusterIP only). It holds task hashes, streams, locks,
     cooldowns, the hourly budget and the GPU slot — never a Secret value.
+- **Queue authentication (Phase 5):** Redis requires a password by default.
+  It lives in the Secret `auton-redis` (key `password`), which
+  `scripts/install.sh` creates and keeps; `scripts/rotate-redis-password.sh`
+  changes it. The server's init container writes the password into a config
+  file, so it is never in `argv`, never in a manifest and never in an
+  environment variable; every client reads the same Secret through
+  `AGENT_REDIS_PASSWORD_FILE=/etc/auton-redis/password`. The password must be
+  ≥ 16 characters from `[A-Za-z0-9_-]` — the server refuses to start
+  otherwise, rather than write a config it cannot parse. The clients **fail
+  closed**: no password, a wrong password and a password against a
+  passwordless server all raise `QueueError` and the pod refuses to start.
+  `GET /health` reports `queue_auth: password`.
 - `AGENT_QUEUE` selects the backend: `memory` (default for local runs/tests) or
   `redis` (the cluster manifests). **No silent fallback** — with `redis` and an
   unreachable server the API refuses to start. The scanners/workers/executor
@@ -40,7 +53,15 @@ manifests, trust the code/manifests.
 - `auton-worker`/`auton-ops` share the `agent-workspace` PVC (single-node RWO)
   so their audit log and incident files are the ones the API reads. The scanner
   deliberately does **not** mount it (`/tmp` emptyDir + a private incident dir).
-- Manifests live in `yamls/` (not the repo root).
+- Manifests live in `yamls/` (not the repo root) — and they are **generated**
+  from the Helm chart (`charts/auton-chart` + `charts/auton-chart/values-k3d.yaml`) by
+  `scripts/sync-yamls.sh`. The chart is the source of truth: edit the chart,
+  then re-run the script. `yamls/.chart-stamp` carries the checksum of the
+  chart inputs and of every generated file, `scripts/sync-yamls.sh --check`
+  reports drift, `scripts/install.sh` refuses to install drifted manifests,
+  and `mcp/tests/test_manifests.py` fails the suite when the two disagree.
+  Only `yamls/k8s-ds-amdgpu-dp.yaml` and `yamls/gpu-test.yaml` are
+  hand-written (they belong to the cluster, not to the chart).
 - PVCs use `local-path`: data survives pod restarts and a `k3d cluster
   stop`/`start` but **not** `k3d cluster delete`. The model is pulled onto the
   PVC, not baked into an image.
@@ -58,11 +79,23 @@ manifests, trust the code/manifests.
 - If `kubectl` tries `localhost:8080`, the k3d context is not merged:
   `k3d kubeconfig merge ai-cluster --kubeconfig-merge-default --kubeconfig-switch-context`.
 - The agent runs as ServiceAccount `auton-agent` with a Role in **both**
-  `auton` and `auton-apps` (`yamls/auton-rbac.yaml`). RBAC, not the tool code,
-  is the security boundary: no secrets, serviceaccounts, roles/rolebindings,
-  no PVC delete, no namespace delete. Cluster scope is read-only via the
-  `auton-cluster-reader` ClusterRole (nodes, PVs, CRDs, storage classes,
-  apiservices, metrics). `pods/exec` is granted because diagnosis needs it.
+  `auton` and `auton-apps` (`yamls/auton-rbac.yaml`), plus cluster read-only
+  via the `auton-cluster-reader` ClusterRole (nodes, PVs, CRDs, storage
+  classes, apiservices, metrics). RBAC, not the tool code, is the security
+  boundary: no secrets, serviceaccounts, roles/rolebindings, no PVC delete, no
+  namespace delete.
+- **Executor write scope (Phase 4):** the `auton-agent` Role is **read-only**
+  (get/list/watch only, no `pods/exec`). The write verbs live in
+  `yamls/auton-rbac-write.yaml` (Role `auton-agent-write` + bindings in both
+  namespaces) and are applied **only** by an explicit opt-in:
+  `scripts/set-agent-writes.sh --enable` (Helm: `agent.allowWrites=true`).
+  The script changes both halves at once — the RBAC *and*
+  `AGENT_K8S_WRITE` on `deploy/auton-ops` — because either half alone leaves
+  a confusing state. With the RBAC absent, even a shell `kubectl patch` from
+  the executor pod is **Forbidden** by the API server; `AGENT_K8S_WRITE=0`
+  makes the tools refuse before they run. `--disable` revokes both. The
+  repair path (scanner → worker) is **not** affected by this scope: the worker
+  keeps its own identity and its own policy-gated permissions.
 - `auton-api` is the API pod's *narrow* identity (patch only ConfigMap
   `auton-model-config` and Secret `auton-model`, by `resourceNames`). The API
   Deployment now uses it: tool execution moved to `deployment/auton-ops`, so a
@@ -77,11 +110,14 @@ manifests, trust the code/manifests.
 - Bootstrap order: `namespace.yaml` → `auton-apps.yaml` → Secret
   `auton-api-token` → `auton-rbac.yaml` → `auton-model.yaml` →
   `ollama-deployment.yaml` → pull the model → build/import `auton:local` →
-  `redis.yaml` → `agent-deployment.yaml` → `auton-ops-deployment.yaml` →
+  Secret `auton-redis` → `redis.yaml` → `agent-deployment.yaml` →
+  `auton-ops-deployment.yaml` →
   `auton-scanner-deployment.yaml` → `auton-worker-deployment.yaml` →
   `n8n-deployment.yaml` → `ingress.yaml`.
   Redis comes **before** the API: `AGENT_QUEUE=redis` with no reachable Redis
-  makes the service refuse to start.
+  makes the service refuse to start. The Secret `auton-redis` comes before
+  `redis.yaml`: the server and every client mount it, and a missing Secret
+  leaves the pods in `ContainerCreating`.
 - The agent image is local-only, not from a registry:
   ```bash
   docker build -t auton:local ./mcp
@@ -96,18 +132,22 @@ manifests, trust the code/manifests.
 - `scripts/install.sh` is the executable runbook (cluster → GPU plugin → Ollama
   → model → image → Redis → API/executor/scanners/workers → n8n → ingress, then
   a verification pass). It is idempotent, keeps an existing token/PVC, and
-  `--verify` re-runs only the checks (14 of them). Use `AUTON_IMAGE` to deploy a
-  registry image instead of `auton:local`.
+  `--verify` re-runs only the checks (29 of them). Use `AUTON_IMAGE` to deploy a
+  registry image instead of `auton:local`. `--sync` regenerates `yamls/` from
+  the chart first.
 - `mcp/Dockerfile` explicitly `COPY`s the Python modules (currently
   `agent_core.py agent_server.py agent_client.py agent_service.py
   agent_worker.py approvals.py audit.py diagnosis.py evidence.py
-  incidents.py k8s_tools.py llm.py n8n_tools.py ops_controller.py
-  ops_queue.py ops_scanner.py ops_worker.py planner.py playbooks.py
-  policy.py provider_admin.py task_store.py`) **and** the `ui/` directory. Any
+  incidents.py k8s_api.py k8s_ops.py k8s_tools.py learning.py llm.py
+  metrics.py n8n_tools.py ops_controller.py ops_queue.py ops_scanner.py
+  ops_worker.py planner.py playbooks.py policy.py provider_admin.py
+  task_store.py watcher.py`) **and** the
+  `ui/` directory. Any
   new module/page must be added there or it will be missing inside the pod.
   The image also installs `git`, `ripgrep`, `bubblewrap` and **kubectl
-  v1.35.5** (matches the server minor); `tests/` and `.venv/` are excluded via
-  `.dockerignore`.
+  v1.35.5** (matches the server minor) — kubectl is the **fallback** for the
+  direct API client (D6), not the primary transport; `tests/` and `.venv/` are
+  excluded via `.dockerignore`.
 - Never apply `yamls/ollama-deployment.yaml.orig`; it creates a second Ollama in
   the `default` namespace that competes for the GPU.
 - Do not change the Deployments' `strategy: Recreate` while PVCs are
@@ -127,19 +167,23 @@ manifests, trust the code/manifests.
   `audit.begin("provider_update", …)` before the write, key value never in the
   audit record, `400` for anything the agent would refuse at request time
   (remote without key, `local-only` + remote, `custom` without base_url).
-- `charts/auton` is the Helm equivalent of `yamls/` (API + scanner + worker +
-  LLM executor + Redis + RBAC + PVCs, optional Ollama/n8n/ingress). Resource
+- `charts/auton-chart` is the **source of truth** for every Kubernetes object (API +
+  scanner + worker + LLM executor + Redis + RBAC + PVCs, optional
+  Ollama/n8n/ingress); `yamls/` is generated from it. Resource
   names are intentionally fixed (`auton`, `auton-ops`, `auton-scanner`,
   `auton-worker`, `redis`) because docs and generated n8n workflows use
   `auton:8080`; do not add a release-name prefix without changing them. The
   chart's `validate.yaml` fails the render on `queue.backend=redis` without
-  Redis. `scripts/publish.sh` builds/pushes `docker.io/d3vhex/auton` and the OCI
-  chart (`oci://registry-1.docker.io/d3vhex/charts/auton`); `--no-push` is the
+  Redis. `scripts/publish.sh` builds/pushes `docker.io/d3vhec/auton` and the OCI
+  chart (`oci://registry-1.docker.io/d3vhec/auton-chart`); `--no-push` is the
   local check. PVCs and the API-token Secret carry
   `helm.sh/resource-policy: keep`. On this k3d cluster adopt the existing
   install with `--take-ownership` and
   `--set agent.workspace.existingClaim=agent-workspace` (the bound PVC's
-  `storageClassName` is immutable).
+  `storageClassName` is immutable). `charts/auton-chart/values-k3d.yaml` is the lab
+  overlay that produces `yamls/` (`auton:local`, `local-path`, Ollama/n8n/
+  ingress on, the lab's resource requests); the two Secrets with random values
+  are *not* rendered there — `scripts/install.sh` creates them.
 - `yamls/gpu-test.yaml` is a one-shot `rocminfo` smoke test. Delete the pod after
   use.
 - The model is not shipped in the Ollama image. After a fresh PVC or cluster
@@ -148,6 +192,13 @@ manifests, trust the code/manifests.
 - Secrets:
   - `auton-api-token` key `token` — bearer token for the agent API; n8n gets the
     same value via its own `AGENT_API_TOKEN` env var.
+  - `auton-redis` key `password` — the queue password (Phase 5). Mounted
+    read-only at `/etc/auton-redis/password` by the Redis server and by every
+    client (API, scanner, worker, executor), and read through
+    `AGENT_REDIS_PASSWORD_FILE`. It is **not** in `argv` and **not** in an
+    environment variable. Created and kept by `scripts/install.sh`; rotate
+    with `scripts/rotate-redis-password.sh` (it restarts the server and every
+    client, because both read the password only at startup).
   - `n8n-api` key `api-key` — n8n public-API key, mounted read-only at
     `/etc/n8n-api/api-key` (volume is `optional: true`). It is read per call, so
     rotating the Secret needs no pod restart — but the mount is a *projected*
@@ -258,6 +309,47 @@ manifests, trust the code/manifests.
   labelled `auton.io/protect=true` are never touched. Detection rules are in
   `ops_controller.REASONS` / `REPORT_ONLY`; add a playbook and a test before
   adding a cause there.
+- **Kubernetes watcher (Phase 3)** (`watcher.py`, `ops_scanner.py`): the
+  scanners hold a real Kubernetes **watch** (one stream per resource and
+  namespace: `pods`, `deployments`, `statefulsets`, `persistentvolumeclaims`,
+  `events` — D6 widened it) instead of polling. `watcher.py` is
+  stdlib-only (`urllib` + `ssl` + `json`): `list()` gives the starting
+  `resourceVersion`, `watch(rv=…)` streams `ADDED/MODIFIED/DELETED/BOOKMARK`,
+  a `410 Gone` re-lists (the only correct answer), a normal close reconnects
+  from the last version, and every reconnect/error/expiry is counted.
+  `Watcher.stats()` exposes `available`, `connected`, `resource_version`,
+  `last_event_age_seconds` and the counters; `TaskStore.set_watcher_stats()`
+  publishes them and `GET /tasks/stats` shows them under `watchers`. **Never
+  let the watcher swallow an error** — a silently stopped watch is the worst
+  outcome for a self-healing platform. The scanner runs a **fast tier**
+  (`AGENT_WATCH_FAST_INTERVAL`, 60 s, plus immediately on a bad pod event)
+  that reads the event cache with `ops_controller.pod_findings` (no API call)
+  and a **full tier** (`AGENT_WATCH_FULL_INTERVAL`, 300 s) that takes a real
+  snapshot. A Deployment event triggers the full tier. The watch is an
+  optimisation, never a dependency: no credentials, `403`, an unreachable API
+  server or `AGENT_WATCH_ENABLED=0` falls back to the old polling loop.
+  `ObjectCache` is keyed by `(resource, namespace, name)` — a Pod and a
+  Deployment share a name all the time — and carries a per-resource **TTL**
+  (`AGENT_WATCH_EVENT_TTL`, 900 s for events): a stale event is worse than no
+  event, and the cache is pruned so it cannot grow without bound.
+- **Direct Kubernetes access (D6)** (`k8s_api.py`, `k8s_ops.py`): every pod
+  talks to the API server **directly over HTTPS**, standard library only
+  (`urllib` + `ssl` + `json`) — no `kubernetes` client, no new dependency, no
+  forked process per call. `k8s_api.py` is the transport (`ApiConfig`, the
+  projected SA credentials, `ApiClient` with get/post/patch/delete/list/watch,
+  the closed resource registry, the `v4.channel.k8s.io` WebSocket exec
+  channel, the transport counters); `k8s_ops.py` is the vocabulary
+  (get/list/logs/events/apply/patch/scale/delete/rollout/exec/describe).
+  `watcher.py` re-exports the client, so its public surface did not change.
+  Four rules: the **RBAC is still the boundary**; a **refusal**
+  (`404`/`403`/`409`) is a final answer and is **never** retried with kubectl;
+  kubectl stays as a **fallback** that is **logged** (`[k8s] using kubectl
+  for …`) and **counted** (`k8s_api.COUNTERS` → `watchers[].transport` and
+  `auton_k8s_transport_total`) — never silent; and the audit gate is
+  **transport-independent** (the record is written before the request on both
+  transports). `AGENT_K8S_DIRECT=0` forces the kubectl path. `k8s_apply` uses
+  server-side apply (`application/apply-patch+yaml`, so no YAML parser is
+  needed) and `k8s_exec` speaks the Kubernetes exec WebSocket directly.
 - **Incident Manager v2** (`incidents.py`): one atomic JSON file per incident
   under `AGENT_INCIDENTS_DIR` (default `AGENT_AUDIT_DIR/incidents`, shared
   with the API), plus an optional Redis index. The record carries a
@@ -328,6 +420,38 @@ manifests, trust the code/manifests.
   incident as `suppressed`; `deny` closes it as `needs_human`. The plan is
   persisted **before** the state walk, because the walk reloads the record
   from disk and would otherwise drop it.
+- **Learn stage** (`learning.py`, Phase 7): every verified repair writes an
+  **outcome**; the outcomes build a **profile** per *(workload, cause)* and
+  drive a bounded, **audit-gated** adaptation. The allowlist is closed:
+  `raise_oom_step`, `raise_tier`, `raise_cooldown`, `lower_budget`,
+  `quarantine` — an unknown name is refused. Learning may only make the
+  platform *more cautious* or tune a bounded number: it never lowers a tier,
+  never changes the action, never widens the scope, never exceeds
+  `AGENT_LEARN_MAX_STEP`/`COOLDOWN_MAX`/`BUDGET_MIN`, never runs without an
+  audit record (`learn_adapt`, begin/end, write-ahead) and never runs when
+  the policy is `disabled`/`observe-only` or `AGENT_LEARN_ENABLED=0`. The
+  profile belongs to the **workload** (`_learning_resource()` resolves
+  pod → ReplicaSet → Deployment), because an OOM kills a pod but the repair
+  changes the Deployment and the rollout creates a new pod. A quarantined
+  resource is never repaired again (the incident goes to `needs_human`). The
+  store is `AGENT_LEARN_DIR` (default `AGENT_AUDIT_DIR/learning`, shared PVC
+  with the API); `GET /learning` reads it, the UI has a **Learning** tab.
+- **Metrics** (`metrics.py`, D5): `GET /metrics` serves a Prometheus exposition
+  in the **text format** (`text/plain; version=0.0.4`) — written by hand, with
+  the **standard library only**. There is no `prometheus_client` dependency and
+  no sidecar: the platform must not need a Python package to report that it is
+  alive. The registry has three types (`gauge`/`counter`/`histogram`) and the
+  collectors read the queue (Redis), the incident/approval/learning stores (the
+  shared PVC), the watcher health the scanner publishes, the policy document,
+  the jobs and the process (`resource`). Three rules: **no invented numbers** —
+  a source that could not be read leaves its families *absent* (a zero would be
+  a guess), while a source that *was* read and is empty reports a zero total;
+  **no secrets** — counts, states and durations only; **bounded cardinality** —
+  the label values come from a closed set plus the learned profiles, capped at
+  `MAX_PROFILES` (50). The endpoint **needs the bearer token** (like every
+  other data endpoint); Prometheus uses `authorization.credentials_file`.
+  `AUTON_VERSION` (the chart version) is the `version` label of
+  `auton_build_info`.
 - **CPython 3.14 f-string compiler bug**: an f-string whose expression
   contains a nested string literal (e.g. `f"{', '.join(x)}"`) can compile a
   local as `LOAD_GLOBAL`, causing `NameError: name 'x' is not defined`.
@@ -400,8 +524,10 @@ point at the system Python, so a Python upgrade leaves it broken.
 
 - Run the agent test suite before rebuilding the image:
   `cd mcp && python -m pytest tests -q` (no cluster or GPU needed; expect
-  `495 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
-  grants secrets or PVC delete.
+  `746 passed`). `tests/test_rbac.py` parses `yamls/` and fails if a Role ever
+  grants secrets or PVC delete. `tests/test_manifests.py` fails when `yamls/`
+  drifted from `charts/auton-chart` (run `scripts/sync-yamls.sh`); the two helm
+  checks there are skipped when helm is not on `PATH`.
 - To measure real model behaviour, run the eval harness against a live Ollama:
   `cd mcp && python eval/run_eval.py` (or `--list`, `--only N`, `--verbose`).
   It wipes `eval-workspace/` per task; exit code 0 means every task passed.
@@ -414,7 +540,12 @@ point at the system Python, so a Python upgrade leaves it broken.
 - GPU check after loading a model: `ollama ps` must say `100% GPU`. If it says
   `80%/20% CPU/GPU`, `OLLAMA_FLASH_ATTENTION=1` and
   `OLLAMA_KV_CACHE_TYPE=q8_0` are missing (see
-  `yamls/ollama-deployment.yaml`).
+  `yamls/ollama-deployment.yaml`). If it says something like `19%/81% CPU/GPU`
+  while both are set, the card is shared with the host desktop and llama.cpp's
+  automatic fit was over-conservative: the chart sets
+  `LLAMA_ARG_FIT_TARGET=128` (free-VRAM margin in MiB) for exactly that case.
+  Confirm with `kubectl -n auton logs deploy/ollama | grep -E "offloaded|layers"`
+  — `offloaded 29/29 layers to GPU` is full offload.
 - After a manifest change, run `kubectl -n auton rollout status deploy/<name>`
   and inspect `kubectl -n auton get pods,pvc,svc`.
 - Agent: `curl -s <endpoint>/health` (open); `POST /run` with
@@ -429,13 +560,15 @@ point at the system Python, so a Python upgrade leaves it broken.
   Approvals tab lists the pending repair plans with their tier, expected
   effect, verification and rollback, and has the Approve / Reject buttons;
   the policy view under it shows the effective mode.
-- Helm: `helm lint charts/auton` and
-  `helm template auton charts/auton -n auton | kubectl apply --dry-run=server -f -`.
+- Helm: `helm lint charts/auton-chart` and
+  `helm template auton charts/auton-chart -n auton | kubectl apply --dry-run=server -f -`.
   On an existing install **both** PVCs must be adopted or the dry run fails on
   the immutable `storageClassName`:
   `--set agent.workspace.existingClaim=agent-workspace --set redis.persistence.existingClaim=redis-data`.
+  The lab overlay is `charts/auton-chart/values-k3d.yaml`; its render must be
+  identical to `yamls/` (`scripts/sync-yamls.sh --check`).
 - `scripts/install.sh --verify` runs the token/RBAC/provider/incidents/policy
-  checks and must print fourteen `ok` lines on a healthy install.
+  checks and must print twenty-nine `ok` lines on a healthy install.
 - Provider: `GET /provider` (auth) returns the active provider with a masked
   key; `POST /provider/test` sends one tiny completion and returns `ok`/`502`.
   `scripts/set-provider.sh --provider <name> ...` switches without a restart —
@@ -482,6 +615,40 @@ point at the system Python, so a Python upgrade leaves it broken.
   VERIFYING → RESOLVED`. `GET /incidents?severity=&cause=&namespace=&resource=&fingerprint=`
   filters (each a comma list) must work, and an unauthenticated call must
   answer `401`.
+- Phase 3 (watcher): `kubectl -n auton logs deploy/auton-scanner` must show
+  `watch started: 5 streams` and never `watch unavailable`. `GET /tasks/stats`
+  must list a `watchers` entry per stream with `available: true`, a
+  `resource_version` that advances, and a `scanner` summary. The live check:
+  create an OOM Deployment in `auton-apps` and the incident must appear
+  **well before the 60 s tick** (the watch trigger fires in seconds) — check
+  the `watch trigger (fast)` log line and the incident's `first_seen`.
+  `AGENT_WATCH_ENABLED=0` on the scanner must fall back to polling
+  (`watch disabled`), and the `watch` verb must still be allowed by RBAC
+  (`kubectl auth can-i watch pods -n auton-apps` → `yes`).
+- Phase 4 (executor write scope): the default install must leave the executor
+  **read-only**: `kubectl auth can-i patch deployments -n auton-apps
+  --as=system:serviceaccount:auton:auton-agent` → `no`, while
+  `get pods` → `yes`. The same `kubectl patch` executed **inside the
+  executor pod** must answer `Forbidden` (the shell must not bypass RBAC).
+  `k8s_tools.WRITE` must be `False` there and `k8s_patch` must return
+  `{"ok": false, "error": "k8s_patch is disabled (read-only Kubernetes mode)."}`.
+  `GET /health` must report `write_scope: read-only`. The repair path must be
+  unaffected: an OOM Deployment in `auton-apps` is still detected and repaired
+  by the worker. `scripts/set-agent-writes.sh --enable` must flip both halves
+  (RBAC + `AGENT_K8S_WRITE=1`, audited), `--disable` must revoke both again.
+- Phase 5 (queue authentication): Redis must **require** a password.
+  `kubectl -n auton exec deploy/redis -- redis-cli ping` must answer
+  `NOAUTH Authentication required.`, while the same command with
+  `REDISCLI_AUTH="$(cat /etc/auton-redis/password)"` must answer `PONG`.
+  The password must not appear in the pod spec, in an environment variable or
+  in `ps` inside the Redis pod. `GET /health` must report
+  `queue_auth: password`. The clients must fail closed: with no password, a
+  wrong password, or a password against a passwordless server,
+  `ops_queue.create_backend("redis")` must raise `QueueError` (not connect).
+  The repair path must be unaffected: an OOM Deployment in `auton-apps` is
+  still detected and repaired by the worker. `scripts/rotate-redis-password.sh`
+  must change the password, restart the server and every client, and verify
+  that the old password is rejected.
 - Phase 2 (policy + approvals): `GET /policy` must report the effective mode
   (`safe-auto` by default) and `source: configmap`. Set the policy to require
   an approval for tier 2
@@ -493,6 +660,50 @@ point at the system Python, so a Python upgrade leaves it broken.
   (`{"by":"<name>"}`) must enqueue a repair, raise the limit, resolve the
   same incident and mark the request `executed`; a second approve must answer
   `409`. Restore `safe-auto` and re-verify the automatic OOM self-heal.
+- Phase 7 (the Learn stage): `GET /health` must report `learning: enabled`
+  and `GET /learning` (auth) must return the outcomes, the profiles and the
+  caps; an unauthenticated call must answer `401`. The live check: create an
+  OOM Deployment in `auton-apps` that keeps OOMing and expect the memory bump
+  to grow 25% → 50% → 100% (the profile of `deployment/<name>` shows
+  `memory_step` and the adaptation history), each adaptation with a
+  `learn_adapt` begin/end pair in `/workspace/.ops/audit.jsonl`. The profile
+  belongs to the **Deployment**, not to the pod (a rollout creates a new pod).
+  For the quarantine: write three failed outcomes for a workload
+  (`kubectl -n auton exec deploy/auton-worker -- python -c 'import learning;
+  s=learning.LearningService(); [s.record_outcome({"namespace":"auton-apps",
+  "resource":"deployment/x","cause":"oom","ok":False}) for _ in range(3)];
+  print(s.adapt("auton-apps","deployment/x","oom"))'`), then create the bad
+  workload: the task must end `needs_human` with the action `quarantined`,
+  the Deployment must stay **unchanged** and `/audit?incident_id=` must be
+  **empty**.
+- D5 (the metrics): `GET /metrics` with the bearer token must answer `200`
+  with `Content-Type: text/plain; version=0.0.4` and a valid Prometheus
+  exposition; without the token it must answer `401`. The exposition must
+  contain `auton_up`, `auton_build_info`, `auton_queue_depth`,
+  `auton_watch_available`, `auton_incidents`, `auton_approvals`,
+  `auton_learning_profiles`, `auton_policy_info`, `auton_jobs_running`,
+  `auton_http_responses_total` and the `process_*` metrics. Validate the format
+  with Prometheus' own parser
+  (`prometheus_client.parser.text_string_to_metric_families` — a **dev-time**
+  check only; `prometheus_client` must never become a project dependency). The
+  numbers must be the real ones: `auton_worker_alive{role="worker"} 1` for every
+  live worker, `auton_watch_available{resource="pods"} 1`, and the queue depth
+  must match `GET /tasks/stats`. The exposition must never contain a token, a
+  key, a password or a resource body.
+- D6 (direct Kubernetes access): the pods must talk to the API server over
+  HTTPS, not through a forked kubectl. `kubectl -n auton exec
+  deploy/auton-scanner -- python -c 'import k8s_api; c = k8s_api.client();
+  print(c is not None)'` must print `True`, and a direct list must return a
+  `resourceVersion`. The 13 MCP tools must not fork kubectl when the direct
+  path works (`k8s_api.COUNTERS["kubectl"]` must not grow). The pod logs must
+  contain **no** `[k8s] using kubectl for …` line on a healthy cluster — that
+  line is the fallback and it is never silent. `GET /tasks/stats` must show
+  **five** watcher streams per namespace (`pods`, `deployments`,
+  `statefulsets`, `persistentvolumeclaims`, `events`) and the `transport`
+  counters. `scripts/install.sh --verify` runs four D6 checks. A refusal
+  (`403`) must be reported with the API server's own message and must **not**
+  be retried with kubectl. `AGENT_K8S_DIRECT=0` must force the kubectl path
+  (the counters must show it).
 - n8n ops reports: `n8n_create_ops_pipeline(kind="both")` creates and activates
   `/webhook/auton-ops`. Set `SLACK_OPS_WEBHOOK` and/or
   `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in n8n; POSTing the notification

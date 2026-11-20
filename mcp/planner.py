@@ -149,11 +149,16 @@ def _rollback(action: str, evidence: dict) -> dict:
 
 
 def build(item: dict, namespace: str, result: dict, evidence: dict,
-          *, incident_id: str = "", labels: dict | None = None) -> dict:
+          *, incident_id: str = "", labels: dict | None = None,
+          learned: dict | None = None) -> dict:
     """Build the repair plan for one finding.
 
     ``item`` is the scanner's finding (``kind``/``name``/``cause``/…), ``result``
     is the diagnosis, ``evidence`` is the structured evidence document.
+
+    ``learned`` is the learned profile of the resource (Phase 7). It may only
+    make the plan **more** cautious: the tier is raised (never lowered) and the
+    memory bump may grow. It can never change the action.
     """
     result = result or {}
     action = str(result.get("recommended_action") or diagnosis.NONE).upper()
@@ -172,6 +177,37 @@ def build(item: dict, namespace: str, result: dict, evidence: dict,
     resource_labels = labels if labels else (document.get("resource") or {}).get(
         "labels") or {}
 
+    params: dict = {"container": str(item.get("container") or "")}
+    learned_note = ""
+    if isinstance(learned, dict) and learned:
+        # The learned tier may only raise the tier of the action.
+        learned_tier = learned.get("tier")
+        if learned_tier is not None:
+            try:
+                raised = max(tier, int(learned_tier))
+            except (TypeError, ValueError):
+                raised = tier
+            if raised != tier:
+                learned_note = (f"the tier was raised from {tier} to {raised} "
+                                f"because this resource failed before")
+                tier = raised
+        step = learned.get("memory_step")
+        if step is not None and action == diagnosis.INCREASE_MEMORY_LIMIT:
+            try:
+                fraction = float(step)
+            except (TypeError, ValueError):
+                fraction = 0.25
+            fraction = max(0.25, min(1.0, fraction))
+            params["memory_step"] = fraction
+            if fraction > 0.25:
+                learned_note = (learned_note + " " if learned_note else "") + (
+                    f"the memory bump is {int(fraction * 100)}% because this "
+                    f"workload kept OOMing after a repair")
+        if learned.get("quarantined"):
+            learned_note = (learned_note + " " if learned_note else "") + (
+                "the resource is quarantined after repeated failures")
+            params["quarantined"] = True
+
     return {
         "plan_id": plan_id(namespace, resource, action, root_cause),
         "incident_id": incident_id or "",
@@ -185,7 +221,7 @@ def build(item: dict, namespace: str, result: dict, evidence: dict,
         "action": action,
         "playbook": playbook,
         "tier": tier,
-        "params": {"container": str(item.get("container") or "")},
+        "params": params,
         "expected_effect": _expected_effect(action, cause, document),
         "verification": _verification(action, namespace, name, document),
         "reversible": bool(action in (diagnosis.RESTART_POD,
@@ -197,6 +233,7 @@ def build(item: dict, namespace: str, result: dict, evidence: dict,
                                or action in (diagnosis.REPORT_ONLY,
                                              diagnosis.NONE)),
         "labels": dict(resource_labels),
+        "learned": learned_note,
         "created_at": round(time.time(), 3),
     }
 

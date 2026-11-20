@@ -1,132 +1,173 @@
-# n8n workflow automation in the auton namespace.
-# k8s translation of:
-#   docker volume create n8n_data
-#   docker run -p 5678:5678 -v n8n_data:/home/node/.n8n docker.n8n.io/n8nio/n8n
-# Inside the cluster it can call our services by DNS:
-#   http://auton:8080/run            (trigger the coding agent)
-#   http://ollama-service:11434/api  (talk to the model directly)
----
+# GENERATED — DO NOT EDIT.
+#
+# Source of truth: charts/auton-chart (Helm chart) with charts/auton-chart/values-k3d.yaml
+# Regenerate:      scripts/sync-yamls.sh
+#
+# Edit the chart and re-run the script: a hand edit here is overwritten and
+# fails the drift test in mcp/tests/test_manifests.py.
+
+# Source: auton-chart/templates/pvc.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: n8n-data
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: [ReadWriteOnce]
   storageClassName: local-path
   resources:
     requests:
       storage: 5Gi
 ---
+# Source: auton-chart/templates/n8n.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: n8n
   namespace: auton
   labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
     app: n8n
 spec:
   replicas: 1
   strategy:
-    type: Recreate          # RWO PVC + SQLite: only one writer at a time
+    type: Recreate          # RWO PVC + SQLite: one writer
   selector:
     matchLabels:
       app: n8n
   template:
     metadata:
       labels:
+        helm.sh/chart: auton-chart-0.3.0
+        app.kubernetes.io/name: auton
+        app.kubernetes.io/instance: auton
+        app.kubernetes.io/version: "0.3.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: auton
         app: n8n
     spec:
       securityContext:
-        fsGroup: 1000       # n8n runs as uid/gid 1000 (node); make the PVC writable
+        fsGroup: 1000       # n8n runs as uid/gid 1000
       containers:
-      - name: n8n
-        image: docker.n8n.io/n8nio/n8n:latest
-        ports:
-        - containerPort: 5678
-        env:
-        - name: N8N_PORT
-          value: "5678"
-        - name: N8N_PROTOCOL
-          value: "http"
-        - name: N8N_SECURE_COOKIE
-          value: "false"    # allow the UI over plain HTTP (ingress / port-forward)
-        - name: N8N_RUNNERS_ENABLED
-          value: "true"
-        - name: GENERIC_TIMEZONE
-          value: "Europe/Istanbul"
-        - name: TZ
-          value: "Europe/Istanbul"
-        # Webhooks are emitted with this base URL. Inside the cluster the agent
-        # calls http://n8n.auton.svc.cluster.local:5678/webhook directly; the
-        # host-facing URL goes through Traefik.
-        - name: N8N_HOST
-          value: "n8n.localhost"
-        - name: WEBHOOK_URL
-          value: "http://n8n.localhost/"
-        - name: N8N_EDITOR_BASE_URL
-          value: "http://n8n.localhost/"
-        # The agent pipeline workflow sends its bearer token as
-        # {{$env.AGENT_API_TOKEN}}; n8n blocks $env in expressions by default.
-        - name: N8N_BLOCK_ENV_ACCESS_IN_NODE
-          value: "false"
-        - name: AGENT_API_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: auton-api-token
-              key: token
-        # Optional targets for the generated ops reporting workflow. Create the
-        # Secret `n8n-notify` with only the keys you use; `optional: true`
-        # leaves the others empty instead of blocking the n8n pod.
-        - name: SLACK_OPS_WEBHOOK
-          valueFrom:
-            secretKeyRef:
-              name: n8n-notify
-              key: slack-webhook
-              optional: true
-        - name: TELEGRAM_BOT_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: n8n-notify
-              key: telegram-bot-token
-              optional: true
-        - name: TELEGRAM_CHAT_ID
-          valueFrom:
-            secretKeyRef:
-              name: n8n-notify
-              key: telegram-chat-id
-              optional: true
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "256Mi"
-          limits:
-            memory: "1Gi"
-        volumeMounts:
-        - name: n8n-data
-          mountPath: /home/node/.n8n
-        readinessProbe:
-          httpGet: { path: /healthz, port: 5678 }
-          initialDelaySeconds: 20
-          periodSeconds: 10
-        livenessProbe:
-          httpGet: { path: /healthz, port: 5678 }
-          initialDelaySeconds: 40
-          periodSeconds: 30
+        - name: n8n
+          image: docker.n8n.io/n8nio/n8n:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5678
+          env:
+            - name: N8N_PORT
+              value: "5678"
+            - name: N8N_PROTOCOL
+              value: http
+            - name: N8N_SECURE_COOKIE
+              value: "false"
+            - name: N8N_RUNNERS_ENABLED
+              value: "true"
+            - name: N8N_HOST
+              value: "n8n.localhost"
+            - name: WEBHOOK_URL
+              value: "http://n8n.localhost/"
+            - name: N8N_EDITOR_BASE_URL
+              value: "http://n8n.localhost/"
+            # Expressions in generated workflows read $env.
+            - name: N8N_BLOCK_ENV_ACCESS_IN_NODE
+              value: "false"
+            - name: AGENT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: auton-api-token
+                  key: token
+            - name: GENERIC_TIMEZONE
+              value: "Europe/Istanbul"
+            - name: TZ
+              value: "Europe/Istanbul"
+            # Optional notification targets.
+            - name: SLACK_OPS_WEBHOOK
+              valueFrom:
+                secretKeyRef:
+                  name: n8n-notify
+                  key: slack-webhook
+                  optional: true
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: n8n-notify
+                  key: telegram-bot-token
+                  optional: true
+            - name: TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: n8n-notify
+                  key: telegram-chat-id
+                  optional: true
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: n8n-data
+              mountPath: /home/node/.n8n
+            - name: n8n-api
+              mountPath: /etc/n8n-api
+              readOnly: true
+          # n8n answers /healthz once its database is ready.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 5678
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5678
+            initialDelaySeconds: 40
+            periodSeconds: 30
       volumes:
-      - name: n8n-data
-        persistentVolumeClaim:
-          claimName: n8n-data
+        - name: n8n-data
+          persistentVolumeClaim:
+            claimName: n8n-data
+        - name: n8n-api
+          secret:
+            secretName: n8n-api
+            optional: true
 ---
+# Source: auton-chart/templates/n8n.yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: n8n
   namespace: auton
+  labels:
+    helm.sh/chart: auton-chart-0.3.0
+    app.kubernetes.io/name: auton
+    app.kubernetes.io/instance: auton
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: auton
+    app: n8n
 spec:
   type: ClusterIP
   selector:
     app: n8n
   ports:
-  - port: 5678
-    targetPort: 5678
+    - name: http
+      port: 5678
+      targetPort: 5678
