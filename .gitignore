@@ -13,5 +13,6 @@ mcp/workspace/
 mcp/.agent/
 
 # Local tooling
+.opencode/
 .DS_Store
 *.swp
